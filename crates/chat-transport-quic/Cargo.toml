@@ -1,0 +1,21 @@
+[package]
+name = "chat-transport-quic"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+chat-proto.workspace = true
+chat-core.workspace = true
+
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "logging"] }
+rcgen = "0.14.10"
+sha2 = "0.10"
+
+[dev-dependencies]
+chat-server.workspace = true
+chat-client.workspace = true

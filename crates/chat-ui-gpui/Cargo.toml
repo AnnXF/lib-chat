@@ -1,0 +1,22 @@
+[package]
+name = "chat-ui-gpui"
+edition = "2024"
+version.workspace = true
+
+[[bin]]
+name = "libchat-ui"
+path = "src/main.rs"
+
+[dependencies]
+chat-proto.workspace = true
+chat-core.workspace = true
+chat-server.workspace = true
+chat-client.workspace = true
+chat-discovery.workspace = true
+chat-transport-quic.workspace = true
+
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+gpui = "0.2.2"
+unicode-segmentation = "1.13.3"
+flume = "0.12.0"
+if-addrs = "0.15.0"

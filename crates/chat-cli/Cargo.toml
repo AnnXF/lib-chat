@@ -1,0 +1,19 @@
+[package]
+name = "chat-cli"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "libchat"
+path = "src/main.rs"
+
+[dependencies]
+chat-proto.workspace = true
+chat-core.workspace = true
+chat-server.workspace = true
+chat-client.workspace = true
+chat-discovery.workspace = true
+chat-transport-quic.workspace = true
+
+tokio.workspace = true
+if-addrs = "0.15.0"

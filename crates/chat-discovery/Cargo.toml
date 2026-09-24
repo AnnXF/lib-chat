@@ -1,0 +1,15 @@
+[package]
+name = "chat-discovery"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+chat-proto.workspace = true
+chat-core.workspace = true
+
+tokio.workspace = true
+if-addrs = "0.15"
+mdns-sd = "0.21"
+serde.workspace = true
+serde_json.workspace = true
+socket2 = "0.6"
