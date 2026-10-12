@@ -1,10 +1,9 @@
-//! 服务端：房间状态、成员与在线管理、消息落库与扇出。
+//! 服务端：房间状态、在线人数、消息落库与扇出。
 //!
-//! 两条关键规则：
-//! - **连接按 `ConnId` 记账**：同一设备可以有多个连接（多窗口、探测连接），互不覆盖。
-//! - **成员按昵称归并**：加入时若已存在同名且离线的成员则复用其身份，避免重连把同一个人算成多个成员。
+//! 房间没有「总人数」的概念：**连接断开即离开**，在线人数完全由当前连接派生。
+//! 这样切换房间、掉线、重连都不会留下任何残留计数。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,8 +14,8 @@ use chat_core::{
     Result,
 };
 use chat_proto::{
-    ClientRequest, DeviceId, ErrorCode, LobbyInfo, MemberInfo, Message, MessageKind, RoomId,
-    RoomInfo, Seq, ServerEvent, UserId,
+    ClientRequest, DeviceId, ErrorCode, LobbyInfo, Message, MessageKind, RoomId, RoomInfo, Seq,
+    ServerEvent, UserId,
 };
 use tokio::sync::{mpsc, Mutex, RwLock};
 
@@ -100,22 +99,22 @@ impl MessageStore for InMemoryStore {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ConnId(u64);
 
+/// 说到说话时挂在连接上的身份，断开即消失。
 struct Member {
+    user: UserId,
     name: String,
 }
 
 struct Conn {
     device: DeviceId,
     tx: mpsc::UnboundedSender<ServerEvent>,
-    user: Option<UserId>,
-    name: String,
+    member: Option<Member>,
 }
 
 pub struct Server {
     room: RoomId,
     name: String,
     store: Arc<dyn MessageStore>,
-    members: RwLock<HashMap<UserId, Member>>,
     conns: RwLock<HashMap<ConnId, Conn>>,
     next_conn: AtomicU64,
 }
@@ -130,7 +129,6 @@ impl Server {
             room: RoomId::new(),
             name: name.into(),
             store,
-            members: RwLock::new(HashMap::new()),
             conns: RwLock::new(HashMap::new()),
             next_conn: AtomicU64::new(1),
         })
@@ -145,11 +143,12 @@ impl Server {
     }
 
     pub async fn online_count(&self) -> u32 {
-        self.online_users().await.len() as u32
-    }
-
-    pub async fn member_count(&self) -> u32 {
-        self.members.read().await.len() as u32
+        self.conns
+            .read()
+            .await
+            .values()
+            .filter(|c| c.member.is_some())
+            .count() as u32
     }
 
     /// 注册一条连接，返回请求入口与事件出口。
@@ -166,8 +165,7 @@ impl Server {
             Conn {
                 device,
                 tx,
-                user: None,
-                name: String::new(),
+                member: None,
             },
         );
         (
@@ -191,41 +189,16 @@ impl Server {
     }
 
     async fn disconnect(&self, conn: ConnId) {
-        let was_joined = self
+        let was_member = self
             .conns
             .write()
             .await
             .remove(&conn)
-            .map(|c| c.user.is_some())
+            .map(|c| c.member.is_some())
             .unwrap_or(false);
-        if was_joined {
+        if was_member {
             self.broadcast_presence().await;
         }
-    }
-
-    /// 当前在线身份：已加入且连接仍在。
-    async fn online_users(&self) -> HashSet<UserId> {
-        self.conns
-            .read()
-            .await
-            .values()
-            .filter_map(|c| c.user)
-            .collect()
-    }
-
-    async fn member_list(&self) -> Vec<MemberInfo> {
-        let online = self.online_users().await;
-        let members = self.members.read().await;
-        let mut list: Vec<MemberInfo> = members
-            .iter()
-            .map(|(user, m)| MemberInfo {
-                user: *user,
-                name: m.name.clone(),
-                online: online.contains(user),
-            })
-            .collect();
-        list.sort_by(|a, b| a.name.cmp(&b.name));
-        list
     }
 
     async fn lobby_info(&self) -> LobbyInfo {
@@ -233,7 +206,6 @@ impl Server {
             room: self.room,
             name: self.name.clone(),
             online_count: self.online_count().await,
-            member_count: self.member_count().await,
         }
     }
 
@@ -255,56 +227,45 @@ impl Server {
         .await;
     }
 
-    async fn broadcast_joined(&self, ev: ServerEvent) {
-        let targets: Vec<mpsc::UnboundedSender<ServerEvent>> = self
-            .conns
+    /// 该连接已加入时的身份信息。
+    async fn member_of(&self, conn: ConnId) -> Option<(UserId, String)> {
+        self.conns
             .read()
             .await
-            .values()
-            .filter(|c| c.user.is_some())
-            .map(|c| c.tx.clone())
-            .collect();
-        for tx in targets {
-            let _ = tx.send(ev.clone());
-        }
-    }
-
-    async fn broadcast_presence(&self) {
-        let info = self.lobby_info().await;
-        self.broadcast_joined(ServerEvent::Presence {
-            room: info.room,
-            online_count: info.online_count,
-            member_count: info.member_count,
-        })
-        .await;
-    }
-
-    /// 该连接已加入时的展示名。
-    async fn joined_name(&self, conn: ConnId) -> Option<String> {
-        let conns = self.conns.read().await;
-        match conns.get(&conn) {
-            Some(c) if c.user.is_some() => Some(c.name.clone()),
-            _ => None,
-        }
+            .get(&conn)
+            .and_then(|c| c.member.as_ref())
+            .map(|m| (m.user, m.name.clone()))
     }
 
     async fn conn_device(&self, conn: ConnId) -> Option<DeviceId> {
         self.conns.read().await.get(&conn).map(|c| c.device)
     }
 
-    /// 加入时的身份分配：同名且当前离线的成员直接复用，否则新建。
+    /// 把在线人数推给**所有**连接。
     ///
-    /// 这样重复加入（换房间再回来、断线重连）不会把同一个人算成多个成员。
-    async fn user_for_join(&self, name: &str) -> UserId {
-        let online = self.online_users().await;
-        let existing = {
-            let members = self.members.read().await;
-            members
-                .iter()
-                .find(|(user, member)| member.name == name && !online.contains(user))
-                .map(|(user, _)| *user)
-        };
-        existing.unwrap_or_default()
+    /// 已加入者收到 `Presence`，未加入者只收到摘要 `Lobby`——人数本来就是公开的，
+    /// 而消息内容只给已加入者。若只推给已加入者，停留在房间外的人会一直停在旧数字上。
+    async fn broadcast_presence(&self) {
+        let info = self.lobby_info().await;
+        let targets: Vec<(mpsc::UnboundedSender<ServerEvent>, bool)> = self
+            .conns
+            .read()
+            .await
+            .values()
+            .map(|c| (c.tx.clone(), c.member.is_some()))
+            .collect();
+
+        for (tx, joined) in targets {
+            let event = if joined {
+                ServerEvent::Presence {
+                    room: info.room,
+                    online_count: info.online_count,
+                }
+            } else {
+                ServerEvent::Lobby { info: info.clone() }
+            };
+            let _ = tx.send(event);
+        }
     }
 
     async fn handle(&self, conn: ConnId, req: ClientRequest) -> Result<()> {
@@ -323,33 +284,38 @@ impl Server {
                     self.error_to(conn, ErrorCode::RoomMismatch, "房间不存在").await;
                     return Ok(());
                 }
-                if self.joined_name(conn).await.is_some() {
-                    self.error_to(conn, ErrorCode::AlreadyJoined, "已在房间中").await;
-                    return Ok(());
-                }
                 let Some(device) = self.conn_device(conn).await else {
                     return Ok(());
                 };
                 let name = sanitize_name(&profile.name, device);
-                let user = self.user_for_join(&name).await;
 
-                self.members
-                    .write()
-                    .await
-                    .insert(user, Member { name: name.clone() });
-                if let Some(existing) = self.conns.write().await.get_mut(&conn) {
-                    existing.user = Some(user);
-                    existing.name = name;
-                }
+                let user = {
+                    let mut conns = self.conns.write().await;
+                    match conns.get_mut(&conn) {
+                        Some(existing) if existing.member.is_none() => {
+                            let user = UserId::new();
+                            existing.member = Some(Member {
+                                user,
+                                name: name.clone(),
+                            });
+                            Some(user)
+                        }
+                        _ => None,
+                    }
+                };
+                let Some(user) = user else {
+                    self.error_to(conn, ErrorCode::AlreadyJoined, "已在房间中").await;
+                    return Ok(());
+                };
 
-                let members = self.member_list().await;
+                let online_count = self.online_count().await;
                 let latest_seq = self.store.latest_seq(self.room).await?;
                 self.send_to(
                     conn,
                     ServerEvent::Joined {
                         room: self.room,
                         you: user,
-                        members,
+                        online_count,
                         latest_seq,
                     },
                 )
@@ -362,18 +328,20 @@ impl Server {
                     self.error_to(conn, ErrorCode::RoomMismatch, "房间不存在").await;
                     return Ok(());
                 }
-                let user = {
+                let was_member = {
                     let mut conns = self.conns.write().await;
                     match conns.get_mut(&conn) {
-                        Some(existing) if existing.user.is_some() => existing.user.take(),
-                        _ => None,
+                        Some(existing) if existing.member.is_some() => {
+                            existing.member = None;
+                            true
+                        }
+                        _ => false,
                     }
                 };
-                let Some(user) = user else {
+                if !was_member {
                     self.error_to(conn, ErrorCode::NotJoined, "未加入房间").await;
                     return Ok(());
-                };
-                self.members.write().await.remove(&user);
+                }
                 self.send_to(conn, ServerEvent::Left { room: self.room }).await;
                 self.broadcast_presence().await;
             }
@@ -387,13 +355,7 @@ impl Server {
                     self.error_to(conn, ErrorCode::RoomMismatch, "房间不存在").await;
                     return Ok(());
                 }
-                let sender = {
-                    let conns = self.conns.read().await;
-                    conns
-                        .get(&conn)
-                        .and_then(|c| c.user.map(|user| (c.name.clone(), user)))
-                };
-                let Some((name, user)) = sender else {
+                let Some((user, name)) = self.member_of(conn).await else {
                     self.error_to(conn, ErrorCode::NotJoined, "未加入房间").await;
                     return Ok(());
                 };
@@ -415,7 +377,7 @@ impl Server {
                         },
                     )
                     .await?;
-                self.broadcast_joined(ServerEvent::Message { message: stored })
+                self.broadcast_to_members(ServerEvent::Message { message: stored })
                     .await;
             }
 
@@ -424,7 +386,7 @@ impl Server {
                     self.error_to(conn, ErrorCode::RoomMismatch, "房间不存在").await;
                     return Ok(());
                 }
-                if self.joined_name(conn).await.is_none() {
+                if self.member_of(conn).await.is_none() {
                     self.error_to(conn, ErrorCode::NotJoined, "未加入房间").await;
                     return Ok(());
                 }
@@ -443,6 +405,21 @@ impl Server {
             }
         }
         Ok(())
+    }
+
+    /// 只发给已加入的连接——消息内容不对房间外的人可见。
+    async fn broadcast_to_members(&self, ev: ServerEvent) {
+        let targets: Vec<mpsc::UnboundedSender<ServerEvent>> = self
+            .conns
+            .read()
+            .await
+            .values()
+            .filter(|c| c.member.is_some())
+            .map(|c| c.tx.clone())
+            .collect();
+        for tx in targets {
+            let _ = tx.send(ev.clone());
+        }
     }
 }
 

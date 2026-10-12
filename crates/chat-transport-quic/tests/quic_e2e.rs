@@ -61,7 +61,7 @@ async fn remote_clients_chat_over_quic() {
 
     a.join(room, "Alice").await.unwrap();
     match wait_for(&a, |e| matches!(e, ServerEvent::Joined { .. })).await {
-        ServerEvent::Joined { members, .. } => assert_eq!(members[0].name, "Alice"),
+        ServerEvent::Joined { online_count, .. } => assert_eq!(online_count, 1),
         _ => unreachable!(),
     }
 
@@ -79,7 +79,6 @@ async fn remote_clients_chat_over_quic() {
     }
 
     assert_eq!(server.online_count().await, 2);
-    assert_eq!(server.member_count().await, 2);
 
     a.close().await.unwrap();
     let _ = b.close().await;

@@ -18,8 +18,11 @@ use tokio::sync::mpsc;
 
 use crate::{RoomAnnouncement, PROTOCOL_VERSION};
 
-/// 广播探测使用的固定 UDP 端口。
-pub const BEACON_PORT: u16 = 52100;
+/// 广播探测使用的默认 UDP 端口。
+///
+/// 需要同机跑互不干扰的多套实例（例如并行测试）时，把端口作为参数传入即可，
+/// 不要用环境变量：`set_var` 与并发 `getenv` 是未定义行为，读写可能不一致。
+pub const DEFAULT_BEACON_PORT: u16 = 52100;
 
 /// 报文魔数，用于丢弃无关流量。
 const MAGIC: u32 = 0x4C43_4841;
@@ -51,6 +54,23 @@ struct Reply {
     fp: String,
 }
 
+/// 绑定探测用的临时端口。
+///
+/// 系统分配的临时端口可能正好落在广播端口上：两个套接字都设了 `SO_REUSEPORT`，
+/// 内核会把报文哈希分流，探测报文会被自己的接收队列吃掉，房主永远收不到，
+/// 发现就静默失效了。所以拿到端口后要检查一次，撞上就换。
+fn bind_probe_socket(reserved: u16) -> Result<UdpSocket> {
+    for _ in 0..16 {
+        let socket = bind_reusable(0)?;
+        let assigned = socket.local_addr().map(|addr| addr.port()).unwrap_or(0);
+        if assigned != reserved {
+            return Ok(socket);
+        }
+        drop(socket);
+    }
+    Err(ChatError::Transport("无法为广播探测分配端口".into()))
+}
+
 /// 绑定可复用的 UDP 套接字，使同机多个实例都能收到广播。
 fn bind_reusable(port: u16) -> Result<UdpSocket> {
     let socket =
@@ -72,8 +92,14 @@ pub struct BeaconResponder {
 }
 
 impl BeaconResponder {
-    pub fn start(room: RoomId, name: String, port: u16, fingerprint: String) -> Result<Self> {
-        let socket = bind_reusable(BEACON_PORT)?;
+    pub fn start(
+        beacon_port: u16,
+        room: RoomId,
+        name: String,
+        port: u16,
+        fingerprint: String,
+    ) -> Result<Self> {
+        let socket = bind_reusable(beacon_port)?;
         socket
             .set_read_timeout(Some(Duration::from_millis(400)))
             .map_err(transport_err)?;
@@ -129,8 +155,8 @@ pub struct BeaconProbe {
 }
 
 impl BeaconProbe {
-    pub fn start(tx: mpsc::UnboundedSender<RoomAnnouncement>) -> Result<Self> {
-        let socket = bind_reusable(0)?;
+    pub fn start(beacon_port: u16, tx: mpsc::UnboundedSender<RoomAnnouncement>) -> Result<Self> {
+        let socket = bind_probe_socket(beacon_port)?;
         socket
             .set_read_timeout(Some(Duration::from_millis(200)))
             .map_err(transport_err)?;
@@ -150,8 +176,8 @@ impl BeaconProbe {
                 };
                 // 广播覆盖跨机，回环覆盖同机
                 let targets = [
-                    SocketAddr::from((Ipv4Addr::BROADCAST, BEACON_PORT)),
-                    SocketAddr::from((Ipv4Addr::LOCALHOST, BEACON_PORT)),
+                    SocketAddr::from((Ipv4Addr::BROADCAST, beacon_port)),
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, beacon_port)),
                 ];
 
                 let mut buf = [0u8; MAX_PACKET];
@@ -164,8 +190,9 @@ impl BeaconProbe {
                     let mut found: Vec<RoomAnnouncement> = Vec::new();
                     let deadline = Instant::now() + REPLY_WINDOW;
                     while Instant::now() < deadline {
+                        // 读超时继续等，而不是立刻结束本轮——迟到的应答同样要收
                         let Ok((len, from)) = socket.recv_from(&mut buf) else {
-                            break;
+                            continue;
                         };
                         let Ok(reply) = serde_json::from_slice::<Reply>(&buf[..len]) else {
                             continue;
@@ -228,11 +255,17 @@ mod tests {
     #[tokio::test]
     async fn discovers_room_on_same_host() {
         let room = RoomId::new();
-        let _responder =
-            BeaconResponder::start(room, "广播测试".into(), 45678, "cafebabe".into()).unwrap();
+        let _responder = BeaconResponder::start(
+            DEFAULT_BEACON_PORT,
+            room,
+            "广播测试".into(),
+            45678,
+            "cafebabe".into(),
+        )
+        .unwrap();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let _probe = BeaconProbe::start(tx).unwrap();
+        let _probe = BeaconProbe::start(DEFAULT_BEACON_PORT, tx).unwrap();
 
         let found = tokio::time::timeout(Duration::from_secs(10), async {
             loop {

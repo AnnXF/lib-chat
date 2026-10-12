@@ -72,10 +72,8 @@ pub struct Message {
 pub struct LobbyInfo {
     pub room: RoomId,
     pub name: String,
-    /// 当前在线人数（瞬态）。
+    /// 当前在线人数。房间没有「总人数」的概念：连接断开即离开。
     pub online_count: u32,
-    /// 总成员数（持久）。
-    pub member_count: u32,
 }
 
 /// 服务端当前托管的房间信息，握手时下发给客户端。
@@ -83,13 +81,6 @@ pub struct LobbyInfo {
 pub struct RoomInfo {
     pub room: RoomId,
     pub name: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MemberInfo {
-    pub user: UserId,
-    pub name: String,
-    pub online: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -114,15 +105,21 @@ pub enum ClientRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEvent {
-    Lobby { info: LobbyInfo },
+    Lobby {
+        info: LobbyInfo,
+    },
     Joined {
         room: RoomId,
         you: UserId,
-        members: Vec<MemberInfo>,
+        online_count: u32,
         latest_seq: Seq,
     },
-    Left { room: RoomId },
-    Message { message: Message },
+    Left {
+        room: RoomId,
+    },
+    Message {
+        message: Message,
+    },
     History {
         room: RoomId,
         messages: Vec<Message>,
@@ -131,7 +128,6 @@ pub enum ServerEvent {
     Presence {
         room: RoomId,
         online_count: u32,
-        member_count: u32,
     },
     Error { code: ErrorCode, message: String },
 }

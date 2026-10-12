@@ -1,11 +1,16 @@
 //! lib-chat 桌面界面：左侧发现局域网房间，右侧看人数、加入、聊天。
+//!
+//! 视觉上走极简路线：只用少量灰阶加一个强调色，靠留白和层次区分区域，
+//! 分隔一律用 1px 发丝线，不用卡片和重底色。
 
-use chat_ui_gpui::backend::{self, UiCommand, UiEvent};
-use chat_ui_gpui::text_input::{TextInput, TextInputSubmitted};
 use chat_proto::{RoomId, UserId};
+use chat_ui_gpui::backend::{self, UiCommand, UiEvent};
+use chat_ui_gpui::diag;
+use chat_ui_gpui::text_input::{self, TextInput, TextInputSubmitted};
+use chat_ui_gpui::theme;
 use gpui::{
     AnyElement, App, Application, Bounds, Context, Entity, MouseButton, MouseUpEvent, Render,
-    Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
+    Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, rgba, size,
 };
 
 #[derive(Clone)]
@@ -22,7 +27,6 @@ struct RoomView {
     name: String,
     addr: String,
     online: u32,
-    members: u32,
     joined: bool,
 }
 
@@ -151,28 +155,36 @@ impl ChatApp {
                 name,
                 addr,
                 online,
-                members,
             } => {
                 self.room = Some(RoomView {
                     id: room,
                     name,
                     addr,
                     online,
-                    members,
                     joined: false,
                 });
                 self.lines.clear();
                 self.my_id = None;
             }
-            UiEvent::Joined { room, you, members } => {
+            UiEvent::Joined { room, you, online } => {
+                // 重连后服务端会重新分配身份并再发一次 Joined，措辞要区分开，
+                // 否则用户会以为自己是重新进了一次房间
+                let recovered = self
+                    .room
+                    .as_ref()
+                    .is_some_and(|view| view.id == room && view.joined);
                 if let Some(view) = &mut self.room
                     && view.id == room
                 {
                     view.joined = true;
-                    view.members = members as u32;
+                    view.online = online;
                 }
                 self.my_id = Some(you);
-                self.push_system(format!("已加入，当前成员 {members} 人"));
+                self.push_system(if recovered {
+                    format!("连接已恢复，当前在线 {online} 人")
+                } else {
+                    format!("已加入，当前在线 {online} 人")
+                });
             }
             UiEvent::Left { room } => {
                 if let Some(view) = &mut self.room
@@ -200,22 +212,21 @@ impl ChatApp {
                     });
                 }
             }
-            UiEvent::Presence {
-                room,
-                online,
-                members,
-            } => {
+            UiEvent::Presence { room, online } => {
                 if let Some(view) = &mut self.room
                     && view.id == room
                 {
                     view.online = online;
-                    view.members = members;
                 }
+            }
+            UiEvent::Reconnecting(reason) => {
+                // 只是暂时断开：保留房间与聊天记录，重连成功后会自动恢复身份
+                self.status = format!("{reason}，正在重连…");
             }
             UiEvent::Disconnected => {
                 self.room = None;
                 self.my_id = None;
-                self.status = "连接已断开".into();
+                self.status = "连接已断开，可重新加入".into();
             }
         }
     }
@@ -257,7 +268,17 @@ impl ChatApp {
         cx.notify();
     }
 
-    fn on_room_click(&mut self, addr: String, fingerprint: String, cx: &mut Context<Self>) {
+    fn on_room_click(
+        &mut self,
+        room: RoomId,
+        addr: String,
+        fingerprint: String,
+        cx: &mut Context<Self>,
+    ) {
+        // 已经是当前房间，重复点击不应触发一次「退出再重连」，那只会白白抖动人数
+        if self.room.as_ref().is_some_and(|view| view.id == room) {
+            return;
+        }
         self.connect(addr, Some(fingerprint), cx);
     }
 
@@ -297,38 +318,57 @@ impl ChatApp {
     }
 }
 
-// ---------------------------------------------------------------- 渲染
+// ---------------------------------------------------------------- 视觉件
 
-fn label(text: &str) -> AnyElement {
+/// 侧栏的小节标题。
+fn section_label(text: &str) -> AnyElement {
     div()
-        .text_sm()
-        .text_color(rgb(0x6d7f96))
+        .px_5()
+        .pt_3()
+        .pb_1()
+        .text_xs()
+        .text_color(rgb(theme::FAINT))
         .child(text.to_string())
         .into_any_element()
+}
+
+/// 侧栏内容的统一内边距。
+fn padded(child: impl IntoElement) -> AnyElement {
+    div().px_5().pb_2().child(child).into_any_element()
 }
 
 fn button(
     text: &str,
     primary: bool,
+    full_width: bool,
     on_click: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    let (base, hover) = if primary {
-        (rgb(0x2f6feb), rgb(0x3d81ff))
+    let (fg, bg, hover_bg) = if primary {
+        (theme::ACCENT, theme::ACCENT_SOFT, 0x22345c)
     } else {
-        (rgb(0x26303f), rgb(0x334054))
+        (theme::MUTED, theme::SURFACE, theme::HOVER)
     };
-    div()
+
+    let mut element = div()
+        .flex()
+        .flex_row()
+        .justify_center()
+        .items_center()
         .px_3()
-        .py_1()
+        .py_2()
         .rounded_md()
-        .bg(base)
+        .bg(rgb(bg))
         .text_sm()
-        .text_color(rgb(0xf2f6fc))
+        .text_color(rgb(fg))
         .cursor_pointer()
-        .hover(move |style| style.bg(hover))
+        .hover(move |style| style.bg(rgb(hover_bg)))
         .on_mouse_up(MouseButton::Left, on_click)
-        .child(text.to_string())
-        .into_any_element()
+        .child(text.to_string());
+
+    if full_width {
+        element = element.w_full();
+    }
+    element.into_any_element()
 }
 
 fn render_line(line: &ChatLine) -> AnyElement {
@@ -338,71 +378,59 @@ fn render_line(line: &ChatLine) -> AnyElement {
             .flex()
             .flex_row()
             .justify_center()
-            .text_sm()
-            .text_color(rgb(0x6d7f96))
+            .text_xs()
+            .text_color(rgb(theme::FAINT))
             .child(line.text.clone())
             .into_any_element();
     }
 
-    // 自己发的靠右、蓝底；别人发的靠左、灰底，避免多窗口时张冠李戴
-    let (side, sender_label, sender_color, bubble_bg) = if line.mine {
-        (
-            true,
-            "我".to_string(),
-            rgb(0x9fc2ff),
-            rgb(0x2f6feb),
-        )
-    } else {
-        (
-            false,
-            line.sender.clone(),
-            rgb(0x6fb1ff),
-            rgb(0x232d3d),
-        )
-    };
-
-    let bubble = div()
-        .max_w(px(460.))
-        .px_3()
-        .py_2()
-        .rounded_md()
-        .bg(bubble_bg)
-        .child(line.text.clone());
-
-    let label = div()
-        .text_sm()
-        .text_color(sender_color)
-        .child(sender_label);
-
-    let label_row = if side {
-        div().flex().flex_row().justify_end().child(label)
-    } else {
-        div().flex().flex_row().justify_start().child(label)
-    };
-    let bubble_row = if side {
-        div().flex().flex_row().justify_end().child(bubble)
-    } else {
-        div().flex().flex_row().justify_start().child(bubble)
-    };
-    let column = div().flex().flex_col().child(label_row).child(bubble_row);
-
-    if side {
+    // 自己发的带一点强调色底并靠右，别人的只留文字，视觉噪声更低
+    let body = if line.mine {
         div()
-            .w_full()
-            .flex()
-            .flex_row()
-            .justify_end()
-            .child(column)
-            .into_any_element()
+            .max_w(px(520.))
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(rgb(theme::ACCENT_SOFT))
+            .text_sm()
+            .text_color(rgb(theme::TEXT))
+            .child(line.text.clone())
     } else {
         div()
-            .w_full()
-            .flex()
-            .flex_row()
-            .justify_start()
-            .child(column)
-            .into_any_element()
-    }
+            .max_w(px(520.))
+            .text_sm()
+            .text_color(rgb(theme::TEXT))
+            .child(line.text.clone())
+    };
+
+    let (align_end, label, label_color) = if line.mine {
+        (true, "我".to_string(), theme::FAINT)
+    } else {
+        (false, line.sender.clone(), theme::MUTED)
+    };
+
+    let label_row = if align_end {
+        div().flex().flex_row().justify_end()
+    } else {
+        div().flex().flex_row().justify_start()
+    };
+    let body_row = if align_end {
+        div().flex().flex_row().justify_end()
+    } else {
+        div().flex().flex_row().justify_start()
+    };
+
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .child(
+            label_row
+                .mb_1()
+                .child(div().text_xs().text_color(rgb(label_color)).child(label)),
+        )
+        .child(body_row.child(body))
+        .into_any_element()
 }
 
 impl ChatApp {
@@ -412,16 +440,20 @@ impl ChatApp {
             .flex_row()
             .items_center()
             .justify_between()
-            .px_4()
-            .py_2()
-            .bg(rgb(0x161d29))
+            .h(px(44.))
+            .px_5()
             .border_b_1()
-            .border_color(rgb(0x232c3a))
-            .child(div().text_lg().child("lib-chat · 局域网聊天"))
+            .border_color(rgb(theme::BORDER))
             .child(
                 div()
-                    .text_sm()
-                    .text_color(rgb(0x8fa3bf))
+                    .text_base()
+                    .text_color(rgb(theme::TEXT))
+                    .child("lib-chat"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::MUTED))
                     .child(self.status.clone()),
             )
             .into_any_element()
@@ -429,74 +461,124 @@ impl ChatApp {
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let items: Vec<DiscoveredRoom> = self.rooms.clone();
-        let rooms: Vec<AnyElement> = items
+        let current = self.room.as_ref().map(|view| view.id);
+        let joined = self.room.as_ref().map(|view| view.joined).unwrap_or(false);
+
+        let rows: Vec<AnyElement> = items
             .into_iter()
             .enumerate()
             .map(|(index, room)| {
                 let addr = room.addr.clone();
                 let fingerprint = room.fingerprint.clone();
-                div()
+                let room_id = room.id;
+                let selected = current == Some(room_id);
+                // 选中态：左侧短竖条 + 低饱和强调底；已加入再加一个实心点
+                let name_color = if selected { theme::ACCENT } else { theme::TEXT };
+
+                let base = div()
                     .id(("room", index))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .justify_between()
-                    .px_3()
+                    .pl_3()
+                    .pr_5()
                     .py_2()
-                    .mb_1()
-                    .rounded_md()
-                    .bg(rgb(0x1a2130))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x243044)))
-                    .child(div().text_sm().child(room.name.clone()))
+                    .cursor_pointer();
+                let base = if selected {
+                    base.bg(rgb(theme::ACCENT_SOFT))
+                } else {
+                    base
+                };
+
+                base.hover(|style| style.bg(rgb(theme::HOVER)))
                     .child(
                         div()
+                            .w(px(2.))
+                            .h(px(14.))
+                            .mr_3()
+                            .rounded_md()
+                            .bg(if selected {
+                                rgb(theme::ACCENT)
+                            } else {
+                                rgba(0x00000000)
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
                             .text_sm()
-                            .text_color(rgb(0x6fb1ff))
-                            .child(format!("在线 {}", room.online)),
+                            .text_color(rgb(name_color))
+                            .child(room.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(if selected {
+                                rgb(theme::MUTED)
+                            } else {
+                                rgb(theme::FAINT)
+                            })
+                            .child(format!(
+                                "{}{} 人",
+                                if selected && joined { "● " } else { "" },
+                                room.online
+                            )),
                     )
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |this, _: &MouseUpEvent, _window, cx| {
-                            this.on_room_click(addr.clone(), fingerprint.clone(), cx);
+                            this.on_room_click(room_id, addr.clone(), fingerprint.clone(), cx);
                         }),
                     )
                     .into_any_element()
             })
             .collect();
 
-        let empty_hint = if rooms.is_empty() {
-            Some(label("未发现房间，可手动连接或创建"))
+        let hint = if rows.is_empty() {
+            Some(
+                div()
+                    .px_5()
+                    .py_2()
+                    .text_xs()
+                    .text_color(rgb(theme::FAINT))
+                    .child("未发现房间，可手动连接")
+                    .into_any_element(),
+            )
         } else {
             None
         };
 
         div()
-            .w(px(300.))
+            .w(px(240.))
             .flex()
             .flex_col()
-            .gap_2()
-            .p_3()
-            .bg(rgb(0x121821))
+            .py_3()
+            .bg(rgb(theme::SURFACE))
             .border_r_1()
-            .border_color(rgb(0x232c3a))
-            .child(label("局域网房间"))
+            .border_color(rgb(theme::BORDER))
+            .child(section_label("局域网房间"))
             .child(
                 div()
                     .id("rooms")
                     .flex()
                     .flex_col()
-                    .max_h(px(220.))
+                    .max_h(px(200.))
                     .overflow_y_scroll()
-                    .children(rooms)
-                    .children(empty_hint),
+                    .children(rows)
+                    .children(hint),
             )
-            .child(label("手动连接"))
-            .child(self.addr_input.clone())
-            .child(button("连接", false, cx.listener(Self::on_connect_click)))
-            .child(label("我的昵称"))
-            .child(self.nickname.clone())
-            .child(button("创建房间", true, cx.listener(Self::on_host)))
+            .child(div().flex_1())
+            .child(section_label("直接连接"))
+            .child(padded(self.addr_input.clone()))
+            .child(padded(button(
+                "连接",
+                false,
+                true,
+                cx.listener(Self::on_connect_click),
+            )))
+            .child(section_label("昵称"))
+            .child(padded(self.nickname.clone()))
+            .child(padded(button("创建房间", true, true, cx.listener(Self::on_host))))
             .into_any_element()
     }
 
@@ -504,14 +586,11 @@ impl ChatApp {
         let joined = self.room.as_ref().map(|room| room.joined).unwrap_or(false);
 
         let title = match &self.room {
-            Some(room) => format!("「{}」", room.name),
+            Some(room) => room.name.clone(),
             None => "未连接".to_string(),
         };
         let subtitle = match &self.room {
-            Some(room) => format!(
-                "{}    在线 {} / 成员 {}",
-                room.addr, room.online, room.members
-            ),
+            Some(room) => format!("{}    在线 {} 人", room.addr, room.online),
             None => self
                 .hosted
                 .clone()
@@ -519,9 +598,9 @@ impl ChatApp {
         };
 
         let action = if joined {
-            button("退出房间", false, cx.listener(Self::on_leave))
+            button("退出房间", false, false, cx.listener(Self::on_leave))
         } else {
-            button("加入房间", true, cx.listener(Self::on_join))
+            button("加入房间", true, false, cx.listener(Self::on_join))
         };
 
         let lines: Vec<AnyElement> = self.lines.iter().map(render_line).collect();
@@ -536,20 +615,24 @@ impl ChatApp {
                     .flex_row()
                     .items_center()
                     .justify_between()
-                    .px_4()
+                    .px_5()
                     .py_3()
-                    .bg(rgb(0x161d29))
                     .border_b_1()
-                    .border_color(rgb(0x232c3a))
+                    .border_color(rgb(theme::BORDER))
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .child(div().text_lg().child(title))
                             .child(
                                 div()
-                                    .text_sm()
-                                    .text_color(rgb(0x8fa3bf))
+                                    .text_base()
+                                    .text_color(rgb(theme::TEXT))
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme::MUTED))
                                     .child(subtitle),
                             ),
                     )
@@ -560,10 +643,11 @@ impl ChatApp {
                     .id("messages")
                     .flex_1()
                     .overflow_y_scroll()
-                    .p_4()
+                    .px_5()
+                    .py_4()
                     .flex()
                     .flex_col()
-                    .gap_2()
+                    .gap_3()
                     .children(lines),
             )
             .child(
@@ -572,12 +656,12 @@ impl ChatApp {
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .p_3()
-                    .bg(rgb(0x121821))
+                    .px_5()
+                    .py_3()
                     .border_t_1()
-                    .border_color(rgb(0x232c3a))
+                    .border_color(rgb(theme::BORDER))
                     .child(div().flex_1().child(self.message.clone()))
-                    .child(button("发送", true, cx.listener(Self::on_send))),
+                    .child(button("发送", true, false, cx.listener(Self::on_send))),
             )
             .into_any_element()
     }
@@ -593,8 +677,9 @@ impl Render for ChatApp {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x0f1319))
-            .text_color(rgb(0xe8edf5))
+            .bg(rgb(theme::BG))
+            .text_color(rgb(theme::TEXT))
+            .text_sm()
             .child(header)
             .child(
                 div()
@@ -608,16 +693,33 @@ impl Render for ChatApp {
 }
 
 fn main() {
+    diag::install_panic_hook();
+    diag::log_line(&format!(
+        "[{}] 界面启动 pid={}",
+        diag::now_stamp(),
+        std::process::id()
+    ));
+
     Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1020.), px(700.)), cx);
-        cx.open_window(
+        // 输入框的退格、方向键、复制粘贴依赖这些绑定，必须在开窗前注册
+        text_input::bind_keys(cx);
+
+        let bounds = Bounds::centered(None, size(px(1000.), px(680.)), cx);
+        let opened = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
             |_, cx| cx.new(ChatApp::new),
-        )
-        .unwrap();
+        );
+        if let Err(e) = opened {
+            diag::log_line(&format!("[{}] 打开窗口失败: {e}", diag::now_stamp()));
+            return;
+        }
         cx.activate(true);
     });
+
+    // 能走到这里说明是正常退出；崩溃与信号杀死都到不了这一行
+    diag::log_line(&format!("[{}] 界面退出", diag::now_stamp()));
 }
+

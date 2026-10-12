@@ -5,11 +5,12 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use chat_core::{ChatError, Connection, ConnectionAcceptor, EventStream, Result};
 use chat_proto::{ClientRequest, DeviceId, RoomInfo, ServerEvent};
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use quinn::{ClientConfig, Endpoint, ServerConfig};
+use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
@@ -24,6 +25,44 @@ const MAX_FRAME: usize = 4 * 1024 * 1024;
 
 fn transport_err(e: impl std::fmt::Display) -> ChatError {
     ChatError::Transport(e.to_string())
+}
+
+/// 连接活性参数。
+///
+/// quinn 默认 `max_idle_timeout = 30s` 且**不发送保活包**。而安静的房间不产生任何网络
+/// 流量——房主的人数定时器只走进程内通道，不发包——于是所有连接会在 30 秒后几乎同时被
+/// 判死，用户看到的现象就是「屋里的所有人突然被弹出房间」。
+///
+/// 这里主动发 PING 续命，并把判死时间放宽以容忍 WiFi 抖动与短暂休眠。判死时间仍然保留，
+/// 用于识别真掉线的对端：对端若已死，PING 收不到回应，仍会在该时间内断开。
+#[derive(Clone, Copy, Debug)]
+pub struct Liveness {
+    /// 完全收不到对端数据多久后判定连接已死。
+    pub idle_timeout: Duration,
+    /// 保活 PING 间隔，需明显小于 `idle_timeout`，留出丢包重试的余量。
+    pub keep_alive_interval: Duration,
+}
+
+impl Default for Liveness {
+    fn default() -> Self {
+        Self {
+            idle_timeout: Duration::from_secs(60),
+            keep_alive_interval: Duration::from_secs(15),
+        }
+    }
+}
+
+impl Liveness {
+    fn transport(&self) -> Arc<TransportConfig> {
+        let mut transport = TransportConfig::default();
+        transport.max_idle_timeout(Some(
+            self.idle_timeout
+                .try_into()
+                .expect("空闲超时必须为正且不超过 QUIC 上限"),
+        ));
+        transport.keep_alive_interval(Some(self.keep_alive_interval));
+        Arc::new(transport)
+    }
 }
 
 /// 证书指纹（SHA-256 十六进制小写）。
@@ -182,6 +221,11 @@ pub struct QuicServer {
 
 impl QuicServer {
     pub fn bind(addr: SocketAddr) -> Result<Self> {
+        Self::bind_with(addr, Liveness::default())
+    }
+
+    /// 指定活性参数绑定。测试用短超时验证保活行为时会用到。
+    pub fn bind_with(addr: SocketAddr, liveness: Liveness) -> Result<Self> {
         let cert = SelfSignedCert::generate()?;
 
         let mut tls = quinn::rustls::ServerConfig::builder_with_provider(crypto_provider())
@@ -193,8 +237,9 @@ impl QuicServer {
         tls.alpn_protocols = vec![ALPN.to_vec()];
 
         let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(transport_err)?;
-        let endpoint =
-            Endpoint::server(ServerConfig::with_crypto(Arc::new(crypto)), addr).map_err(transport_err)?;
+        let mut config = ServerConfig::with_crypto(Arc::new(crypto));
+        config.transport_config(liveness.transport());
+        let endpoint = Endpoint::server(config, addr).map_err(transport_err)?;
         let local_addr = endpoint.local_addr().map_err(transport_err)?;
 
         Ok(Self {
@@ -297,6 +342,15 @@ pub async fn connect(
     addr: SocketAddr,
     expected_fingerprint: Option<&str>,
 ) -> Result<QuicConnection> {
+    connect_with(addr, expected_fingerprint, Liveness::default()).await
+}
+
+/// 指定活性参数连接。测试用短超时验证保活行为时会用到。
+pub async fn connect_with(
+    addr: SocketAddr,
+    expected_fingerprint: Option<&str>,
+    liveness: Liveness,
+) -> Result<QuicConnection> {
     let provider = crypto_provider();
     let mut tls = quinn::rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&quinn::rustls::version::TLS13])
@@ -310,7 +364,8 @@ pub async fn connect(
     tls.alpn_protocols = vec![ALPN.to_vec()];
 
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(transport_err)?;
-    let client_config = ClientConfig::new(Arc::new(crypto));
+    let mut client_config = ClientConfig::new(Arc::new(crypto));
+    client_config.transport_config(liveness.transport());
 
     let mut endpoint =
         Endpoint::client("0.0.0.0:0".parse().expect("合法地址")).map_err(transport_err)?;

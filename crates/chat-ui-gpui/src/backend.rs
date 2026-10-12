@@ -13,15 +13,22 @@ use chat_core::{Connection, ConnectionAcceptor};
 use chat_discovery::{RoomAnnouncer, RoomBrowser};
 use chat_proto::{LobbyInfo, RoomId, ServerEvent, UserId};
 use chat_server::{Acceptor, Server};
-use chat_transport_quic::{connect, QuicServer};
+use chat_transport_quic::{Liveness, QuicServer, connect, connect_with};
 use flume::{Receiver, Sender};
 
-/// mDNS 房间的复查间隔。
-const PROBE_INTERVAL: Duration = Duration::from_secs(5);
+/// 房间列表的人数复查间隔。房间要在未加入时也能看到人数，只能周期性探测。
+const PROBE_INTERVAL: Duration = Duration::from_secs(3);
 /// 单次握手与查询的超时。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 /// 房主房间的人数上报间隔。
 const PRESENCE_INTERVAL: Duration = Duration::from_secs(2);
+/// 退出请求发出后到关闭连接之间的等待，确保请求送达。
+const LEAVE_GRACE: Duration = Duration::from_millis(80);
+/// 重连窗口：从断开那一刻开始计时，超出就放弃重连并把用户放回大厅。
+///
+/// 留得足够宽，能覆盖 WiFi 切换与笔记本短暂休眠；又不至于让房间真的消失之后还无限停在
+/// 「正在重连」上。
+const RECONNECT_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
 pub enum UiEvent {
@@ -34,7 +41,6 @@ pub enum UiEvent {
         addr: String,
         fingerprint: String,
         online: u32,
-        members: u32,
     },
     /// 本机已作为房主启动。
     Hosting {
@@ -48,13 +54,12 @@ pub enum UiEvent {
         name: String,
         addr: String,
         online: u32,
-        members: u32,
     },
     Joined {
         room: RoomId,
         /// 我在这个房间里的身份，用于区分「我发的」与「别人发的」。
         you: UserId,
-        members: usize,
+        online: u32,
     },
     Left {
         room: RoomId,
@@ -68,8 +73,10 @@ pub enum UiEvent {
     Presence {
         room: RoomId,
         online: u32,
-        members: u32,
     },
+    /// 连接断开、正在自动重连。房间与聊天记录都应保留，不要把人踢出去。
+    Reconnecting(String),
+    /// 重连超时，会话到此结束。
     Disconnected,
 }
 
@@ -93,36 +100,68 @@ pub enum UiCommand {
 
 /// 启动后端线程，返回指令通道与事件通道。
 pub fn spawn() -> (Sender<UiCommand>, Receiver<UiEvent>) {
+    spawn_on(chat_discovery::beacon::DEFAULT_BEACON_PORT)
+}
+
+/// 指定广播端口启动后端。同机需要跑多套互不干扰的实例（例如并行测试）时使用。
+pub fn spawn_on(beacon_port: u16) -> (Sender<UiCommand>, Receiver<UiEvent>) {
+    spawn_with(beacon_port, Liveness::default())
+}
+
+/// 指定广播端口与连接活性参数启动后端。
+///
+/// 活性参数主要供测试使用：把空闲超时压到秒级，就能在不必真等 30 秒的前提下检验自动重连。
+pub fn spawn_with(beacon_port: u16, liveness: Liveness) -> (Sender<UiCommand>, Receiver<UiEvent>) {
     let (cmd_tx, cmd_rx) = flume::unbounded();
     let (ev_tx, ev_rx) = flume::unbounded();
 
+    // 运行时建不起来也要把原因告诉界面，而不是安静地少掉一个后端线程
+    let report = ev_tx.clone();
     std::thread::Builder::new()
         .name("chat-backend".into())
         .spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
+            let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .worker_threads(2)
-                .build()
-                .expect("创建 tokio 运行时失败");
-            rt.block_on(run(ev_tx, cmd_rx));
+                .build();
+            let Ok(runtime) = runtime else {
+                let _ = report.send(UiEvent::Error("后端运行时启动失败".into()));
+                return;
+            };
+            runtime.block_on(run(ev_tx, cmd_rx, beacon_port, liveness));
         })
         .expect("启动后端线程失败");
 
     (cmd_tx, ev_rx)
 }
 
-/// 一条已建立的会话。
+/// 界面要求当前会话做的事。
+enum SessionCmd {
+    Join(String),
+    Leave,
+    Send(String),
+    /// 结束会话：先退出房间再关闭连接。
+    Stop,
+}
+
+/// 当前会话。连接断开后由会话任务自行重连，界面无需感知。
 struct Active {
-    client: Client,
     room: RoomId,
-    pump: tokio::task::JoinHandle<()>,
+    tx: Sender<SessionCmd>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl Active {
+    /// 结束会话。切换房间时先退出旧房间，让对端的在线人数立刻回落。
     async fn end(self) {
-        self.pump.abort();
-        let _ = self.client.close().await;
+        let _ = self.tx.send(SessionCmd::Stop);
+        let _ = self.task.await;
     }
+}
+
+/// 重连退避：先密后疏，最长 5 秒。
+fn backoff(attempt: u32) -> Duration {
+    Duration::from_secs((1u64 << attempt.min(3)).min(5))
 }
 
 /// 本机托管的房间。切换房间或重新建房时必须回收，否则会留下幽灵房间。
@@ -146,8 +185,13 @@ impl Hosting {
     }
 }
 
-async fn run(events: Sender<UiEvent>, cmds: Receiver<UiCommand>) {
-    tokio::spawn(browse_loop(events.clone()));
+async fn run(
+    events: Sender<UiEvent>,
+    cmds: Receiver<UiCommand>,
+    beacon_port: u16,
+    liveness: Liveness,
+) {
+    tokio::spawn(browse_loop(events.clone(), beacon_port));
 
     let mut active: Option<Active> = None;
     let mut hosting: Option<Hosting> = None;
@@ -163,7 +207,7 @@ async fn run(events: Sender<UiEvent>, cmds: Receiver<UiCommand>) {
                     previous.end().await;
                 }
 
-                match start_host(&name, &events).await {
+                match start_host(&name, &events, beacon_port, liveness).await {
                     Ok(started) => {
                         let alive = Arc::new(AtomicBool::new(true));
                         let visible = Arc::new(AtomicBool::new(true));
@@ -186,7 +230,7 @@ async fn run(events: Sender<UiEvent>, cmds: Receiver<UiCommand>) {
                         });
 
                         // 房主自己也接入房间，否则同一个窗口里无法参与聊天
-                        match open_session(&addr, Some(&fingerprint), &events).await {
+                        match open_session(&addr, Some(&fingerprint), &events, liveness).await {
                             Ok(session) => active = Some(session),
                             Err(e) => {
                                 let _ = events.send(UiEvent::Error(e));
@@ -203,7 +247,7 @@ async fn run(events: Sender<UiEvent>, cmds: Receiver<UiCommand>) {
                 if let Some(previous) = active.take() {
                     previous.end().await;
                 }
-                match open_session(&addr, fingerprint.as_deref(), &events).await {
+                match open_session(&addr, fingerprint.as_deref(), &events, liveness).await {
                     Ok(session) => {
                         // 已切到别的房间，停止用旧房间的人数覆盖界面
                         if let Some(current) = &hosting {
@@ -220,24 +264,20 @@ async fn run(events: Sender<UiEvent>, cmds: Receiver<UiCommand>) {
             }
 
             UiCommand::Join { name } => {
-                if let Some(session) = &active
-                    && let Err(e) = session.client.join(session.room, name).await
-                {
-                    let _ = events.send(UiEvent::Error(format!("加入失败: {e}")));
+                if let Some(session) = &active {
+                    let _ = session.tx.send(SessionCmd::Join(name));
                 }
             }
 
             UiCommand::Leave => {
                 if let Some(session) = &active {
-                    let _ = session.client.leave(session.room).await;
+                    let _ = session.tx.send(SessionCmd::Leave);
                 }
             }
 
             UiCommand::Send { text } => {
-                if let Some(session) = &active
-                    && let Err(e) = session.client.send_text(session.room, text).await
-                {
-                    let _ = events.send(UiEvent::Error(format!("发送失败: {e}")));
+                if let Some(session) = &active {
+                    let _ = session.tx.send(SessionCmd::Send(text));
                 }
             }
         }
@@ -264,7 +304,6 @@ fn spawn_presence_ticker(
             let event = UiEvent::Presence {
                 room,
                 online: server.online_count().await,
-                members: server.member_count().await,
             };
             if events.send(event).is_err() {
                 return;
@@ -281,10 +320,16 @@ struct Started {
     fingerprint: String,
 }
 
-async fn start_host(name: &str, events: &Sender<UiEvent>) -> Result<Started, String> {
+async fn start_host(
+    name: &str,
+    events: &Sender<UiEvent>,
+    beacon_port: u16,
+    liveness: Liveness,
+) -> Result<Started, String> {
     let server = Server::new(name);
     let endpoint = Arc::new(
-        QuicServer::bind(SocketAddr::from(([0, 0, 0, 0], 0))).map_err(|e| e.to_string())?,
+        QuicServer::bind_with(SocketAddr::from(([0, 0, 0, 0], 0)), liveness)
+            .map_err(|e| e.to_string())?,
     );
     let port = endpoint.local_addr().port();
     let fingerprint = endpoint.fingerprint().to_string();
@@ -292,7 +337,7 @@ async fn start_host(name: &str, events: &Sender<UiEvent>) -> Result<Started, Str
     let acceptor: Arc<dyn ConnectionAcceptor> = Arc::new(Acceptor(Arc::clone(&server)));
     tokio::spawn(Arc::clone(&endpoint).serve(acceptor));
 
-    let announcer = RoomAnnouncer::start(server.room(), name, port, &fingerprint)
+    let announcer = RoomAnnouncer::start_on(beacon_port, server.room(), name, port, &fingerprint)
         .map_err(|e| format!("房间广播失败: {e}"))?;
 
     let _ = events.send(UiEvent::Hosting {
@@ -328,14 +373,13 @@ fn map_event(event: ServerEvent) -> UiEvent {
         ServerEvent::Lobby { info } => UiEvent::Presence {
             room: info.room,
             online: info.online_count,
-            members: info.member_count,
         },
         ServerEvent::Joined {
-            room, you, members, ..
+            room, you, online_count, ..
         } => UiEvent::Joined {
             room,
             you,
-            members: members.len(),
+            online: online_count,
         },
         ServerEvent::Left { room } => UiEvent::Left { room },
         ServerEvent::Message { message } => UiEvent::Message {
@@ -344,14 +388,9 @@ fn map_event(event: ServerEvent) -> UiEvent {
             sender: message.sender_name,
             text: message.text,
         },
-        ServerEvent::Presence {
-            room,
-            online_count,
-            member_count,
-        } => UiEvent::Presence {
+        ServerEvent::Presence { room, online_count } => UiEvent::Presence {
             room,
             online: online_count,
-            members: member_count,
         },
         ServerEvent::History { room, .. } => UiEvent::Status(format!("房间 {room} 历史已加载")),
         ServerEvent::Error { message, .. } => UiEvent::Error(message),
@@ -362,18 +401,22 @@ async fn open_session(
     addr_text: &str,
     fingerprint: Option<&str>,
     events: &Sender<UiEvent>,
+    liveness: Liveness,
 ) -> Result<Active, String> {
     let addr: SocketAddr = addr_text
         .parse()
         .map_err(|e| format!("地址「{addr_text}」无效: {e}"))?;
 
-    let conn = Arc::new(connect(addr, fingerprint).await.map_err(|e| format!("连接失败: {e}"))?);
-    let info = conn.room_info().clone();
-    let room = info.room;
+    // 先连一次：既把「连不上」尽早报给界面，也拿到房间标识。
+    // 这条连接直接交给会话任务，不必重复握手。
+    let conn = connect_with(addr, fingerprint, liveness)
+        .await
+        .map_err(|e| format!("连接失败: {e}"))?;
+    let room = conn.room_info().room;
+    let first: Arc<dyn Connection> = Arc::new(conn);
 
-    let dyn_conn: Arc<dyn Connection> = conn.clone();
-    let client = Client::new(dyn_conn);
-
+    // 界面要显示「XX 房间」，这条查询只在首次连接时做
+    let client = Client::new(Arc::clone(&first));
     client
         .lobby(room)
         .await
@@ -384,31 +427,163 @@ async fn open_session(
             name: lobby.name,
             addr: addr_text.to_string(),
             online: lobby.online_count,
-            members: lobby.member_count,
         });
     }
 
-    let pump = {
-        let client = client.clone();
-        let events = events.clone();
-        tokio::spawn(async move {
+    let (tx, rx) = flume::unbounded();
+    let task = tokio::spawn(session(
+        addr,
+        fingerprint.map(str::to_string),
+        room,
+        first,
+        events.clone(),
+        rx,
+        liveness,
+    ));
+
+    Ok(Active { room, tx, task })
+}
+
+/// 会话任务：维持一条到房间的连接。
+///
+/// 连接意外断开（WiFi 抖动、笔记本休眠、房主重启）时自动重连并恢复身份——用户的心智是
+/// 「只有点了退出才离开房间」，网络抖动不该把人踢出去。只有在 [`RECONNECT_WINDOW`] 内
+/// 始终连不上，或收到 [`SessionCmd::Stop`]（用户切房间/退出），会话才真正结束。
+async fn session(
+    addr: SocketAddr,
+    fingerprint: Option<String>,
+    room: RoomId,
+    first: Arc<dyn Connection>,
+    events: Sender<UiEvent>,
+    cmds: Receiver<SessionCmd>,
+    liveness: Liveness,
+) {
+    // 已加入时的昵称，重连后据此恢复身份
+    let mut identity: Option<String> = None;
+    let mut next: Option<Arc<dyn Connection>> = Some(first);
+    let mut attempt: u32 = 0;
+    // 断开后开始计时，超时就不再无限重试
+    let mut give_up_at: Option<tokio::time::Instant> = None;
+
+    loop {
+        let conn = if let Some(conn) = next.take() {
+            conn
+        } else {
+            let deadline = *give_up_at
+                .get_or_insert_with(|| tokio::time::Instant::now() + RECONNECT_WINDOW);
+
+            // 退避等待。期间仍要响应界面指令，并且不能丢掉「改名 / 退出」这类状态变更
+            let until = (tokio::time::Instant::now() + backoff(attempt)).min(deadline);
+            let mut stop = false;
             loop {
-                match client.next_event().await {
-                    Ok(event) => {
-                        if events.send(map_event(event)).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => {
-                        let _ = events.send(UiEvent::Disconnected);
+                let remaining = until.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, cmds.recv_async()).await {
+                    Ok(Err(_)) | Ok(Ok(SessionCmd::Stop)) => {
+                        stop = true;
                         break;
                     }
+                    Ok(Ok(SessionCmd::Join(name))) => identity = Some(name),
+                    Ok(Ok(SessionCmd::Leave)) => {
+                        identity = None;
+                        let _ = events.send(UiEvent::Left { room });
+                    }
+                    // 断线期间的发消息无从投递，明确告知而不是静默丢弃
+                    Ok(Ok(SessionCmd::Send(_))) => {
+                        let _ = events.send(UiEvent::Error("发送失败: 尚未重新连接".into()));
+                    }
+                    Err(_) => break,
                 }
             }
-        })
-    };
+            if stop {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let _ = events.send(UiEvent::Disconnected);
+                return;
+            }
 
-    Ok(Active { client, room, pump })
+            match connect_with(addr, fingerprint.as_deref(), liveness).await {
+                Ok(conn) => Arc::new(conn) as Arc<dyn Connection>,
+                Err(_) => {
+                    attempt += 1;
+                    let _ = events.send(UiEvent::Reconnecting(format!(
+                        "仍无法连接（已重试 {attempt} 次）"
+                    )));
+                    continue;
+                }
+            }
+        };
+
+        let client = Client::new(conn);
+        // 每次（重）连都问一次大厅：确认这条连接真的可用，界面的房间名也靠它
+        if client.lobby(room).await.is_err() {
+            attempt += 1;
+            continue;
+        }
+        // 之前已加入过就恢复身份，用户不会察觉自己掉过线
+        if let Some(name) = identity.clone()
+            && client.join(room, name).await.is_err()
+        {
+            attempt += 1;
+            continue;
+        }
+        attempt = 0;
+        give_up_at = None;
+
+        loop {
+            tokio::select! {
+                event = client.next_event() => match event {
+                    Ok(event) => {
+                        // 界面已经没了，会话没必要继续
+                        if events.send(map_event(event)).is_err() {
+                            let _ = client.close().await;
+                            return;
+                        }
+                    }
+                    Err(_) => break,
+                },
+                cmd = cmds.recv_async() => match cmd {
+                    // 界面已销毁，或明确要求结束
+                    Err(_) | Ok(SessionCmd::Stop) => {
+                        // 明确的离开：先退出房间，让对端的在线人数立刻回落
+                        if identity.is_some() {
+                            let _ = client.leave(room).await;
+                            // 等服务端收下并处理，再关闭连接，否则关得太快会把请求吞掉
+                            tokio::time::sleep(LEAVE_GRACE).await;
+                        }
+                        let _ = client.close().await;
+                        return;
+                    }
+                    Ok(SessionCmd::Join(name)) => {
+                        identity = Some(name.clone());
+                        if let Err(e) = client.join(room, name).await {
+                            let _ = events.send(UiEvent::Error(format!("加入失败: {e}")));
+                        }
+                    }
+                    Ok(SessionCmd::Leave) => {
+                        identity = None;
+                        if let Err(e) = client.leave(room).await {
+                            let _ = events.send(UiEvent::Error(format!("退出失败: {e}")));
+                        }
+                    }
+                    Ok(SessionCmd::Send(text)) => {
+                        if let Err(e) = client.send_text(room, text).await {
+                            let _ = events.send(UiEvent::Error(format!("发送失败: {e}")));
+                        }
+                    }
+                },
+            }
+        }
+
+        // 连接断了：进入重连，不再把用户踢出房间
+        if give_up_at.is_none() {
+            give_up_at = Some(tokio::time::Instant::now() + RECONNECT_WINDOW);
+            let _ = events.send(UiEvent::Reconnecting("连接中断".into()));
+        }
+    }
 }
 
 async fn await_lobby(client: &Client) -> Option<LobbyInfo> {
@@ -435,8 +610,8 @@ struct KnownRoom {
 }
 
 /// 持续浏览局域网房间，并周期复查各自人数。
-async fn browse_loop(events: Sender<UiEvent>) {
-    let mut browser = match RoomBrowser::start() {
+async fn browse_loop(events: Sender<UiEvent>, beacon_port: u16) {
+    let mut browser = match RoomBrowser::start_on(beacon_port) {
         Ok(browser) => browser,
         Err(e) => {
             let _ = events.send(UiEvent::Error(format!("房间发现不可用: {e}")));
@@ -520,7 +695,6 @@ async fn probe_room(room: RoomId, known: &KnownRoom, events: &Sender<UiEvent>) {
                 addr: addr.to_string(),
                 fingerprint: known.fingerprint.clone(),
                 online: info.online_count,
-                members: info.member_count,
             });
             return;
         }

@@ -38,8 +38,20 @@ pub struct RoomAnnouncer {
 
 impl RoomAnnouncer {
     pub fn start(room: RoomId, name: &str, port: u16, fingerprint: &str) -> Result<Self> {
+        Self::start_on(beacon::DEFAULT_BEACON_PORT, room, name, port, fingerprint)
+    }
+
+    /// 指定广播端口。同机需要跑多套互不干扰的实例时使用。
+    pub fn start_on(
+        beacon_port: u16,
+        room: RoomId,
+        name: &str,
+        port: u16,
+        fingerprint: &str,
+    ) -> Result<Self> {
         let mdns = mdns::RoomAdvertiser::start(room, name, port, fingerprint).ok();
         let beacon = beacon::BeaconResponder::start(
+            beacon_port,
             room,
             name.to_string(),
             port,
@@ -71,10 +83,15 @@ pub struct RoomBrowser {
 
 impl RoomBrowser {
     pub fn start() -> Result<Self> {
+        Self::start_on(beacon::DEFAULT_BEACON_PORT)
+    }
+
+    /// 指定广播端口。同机需要跑多套互不干扰的实例时使用。
+    pub fn start_on(beacon_port: u16) -> Result<Self> {
         let (tx, rx) = mpsc::unbounded_channel::<RoomAnnouncement>();
 
         let mdns = mdns::RoomBrowser::start(tx.clone()).ok();
-        let beacon = beacon::BeaconProbe::start(tx.clone()).ok();
+        let beacon = beacon::BeaconProbe::start(beacon_port, tx.clone()).ok();
 
         if mdns.is_none() && beacon.is_none() {
             return Err(ChatError::Transport("mDNS 与 UDP 广播均不可用".into()));

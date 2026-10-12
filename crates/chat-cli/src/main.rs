@@ -105,11 +105,7 @@ async fn host(args: &[String]) -> Result<(), AnyErr> {
 
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
-        println!(
-            "[状态] 在线 {} / 成员 {}",
-            server.online_count().await,
-            server.member_count().await
-        );
+        println!("[状态] 在线 {}", server.online_count().await);
     }
 }
 
@@ -144,10 +140,7 @@ async fn join(args: &[String]) -> Result<(), AnyErr> {
     // 未加入先说清人数：大厅只给摘要，不给消息
     client.lobby(room).await?;
     if let Some(ServerEvent::Lobby { info }) = next_lobby(&client).await {
-        println!(
-            "当前在线 {} 人 / 共 {} 人，输入 join 进入房间",
-            info.online_count, info.member_count
-        );
+        println!("当前在线 {} 人，输入 join 进入房间", info.online_count);
     }
 
     // 事件打印任务
@@ -158,15 +151,17 @@ async fn join(args: &[String]) -> Result<(), AnyErr> {
                 Ok(ServerEvent::Message { message }) => {
                     println!("[{}] {}", message.sender_name, message.text)
                 }
-                Ok(ServerEvent::Presence {
-                    online_count,
-                    member_count,
-                    ..
-                }) => println!("[系统] 在线 {online_count} / 成员 {member_count}"),
-                Ok(ServerEvent::Joined { members, .. }) => {
-                    println!("[系统] 已加入，当前成员 {} 人", members.len())
+                Ok(ServerEvent::Presence { online_count, .. }) => {
+                    println!("[系统] 在线 {online_count} 人")
+                }
+                Ok(ServerEvent::Joined { online_count, .. }) => {
+                    println!("[系统] 已加入，当前在线 {online_count} 人")
                 }
                 Ok(ServerEvent::Left { .. }) => println!("[系统] 已退出房间"),
+                // 未加入（或刚退出）时服务端推的是摘要，同样要显示人数变化
+                Ok(ServerEvent::Lobby { info }) => {
+                    println!("[系统] 在线 {} 人", info.online_count)
+                }
                 Ok(ServerEvent::Error { message, .. }) => println!("[错误] {message}"),
                 Ok(_) => {}
                 Err(_) => break,

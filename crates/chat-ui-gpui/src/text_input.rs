@@ -2,12 +2,14 @@ use std::ops::Range;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyDownEvent,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
-    fill, hsla, point, prelude::*, px, relative, rgb, rgba, size, white,
+    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
+    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
+    Window, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use unicode_segmentation::*;
+
+use crate::theme;
 
 actions!(
     text_input,
@@ -29,6 +31,50 @@ actions!(
     ]
 );
 
+/// 注册输入框需要的按键绑定。
+///
+/// GPUI 的动作必须显式绑定才会被派发，漏掉的话退格、删除、方向键、复制粘贴
+/// 都不会有任何反应——只会显示一个只能输入不能修改的框。
+pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("backspace", Backspace, None),
+        KeyBinding::new("delete", Delete, None),
+        KeyBinding::new("left", Left, None),
+        KeyBinding::new("right", Right, None),
+        KeyBinding::new("shift-left", SelectLeft, None),
+        KeyBinding::new("shift-right", SelectRight, None),
+        KeyBinding::new("cmd-a", SelectAll, None),
+        KeyBinding::new("cmd-v", Paste, None),
+        KeyBinding::new("cmd-c", Copy, None),
+        KeyBinding::new("cmd-x", Cut, None),
+        KeyBinding::new("home", Home, None),
+        KeyBinding::new("end", End, None),
+        KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, None),
+    ]);
+}
+
+/// 把字节索引夹到字符串长度内，并退到最近的字符边界。
+///
+/// 输入法给出的区间可能相对当前内容已经过期（例如内容被程序清空过），
+/// 直接切片会 panic，所以每次切片前都必须过这一道。
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// 把区间夹到字符串范围内，并让两端都落在字符边界上。
+fn clamp_range(text: &str, range: Range<usize>) -> Range<usize> {
+    let (low, high) = if range.start <= range.end {
+        (range.start, range.end)
+    } else {
+        (range.end, range.start)
+    };
+    floor_char_boundary(text, low)..floor_char_boundary(text, high)
+}
+
 pub struct TextInput {
     focus_handle: FocusHandle,
     content: SharedString,
@@ -42,9 +88,35 @@ pub struct TextInput {
 }
 
 impl TextInput {
+    /// 把任意来源的区间夹到当前内容内，保证可以安全切片。
+    fn clamp(&self, range: Range<usize>) -> Range<usize> {
+        clamp_range(&self.content, range)
+    }
+
+    /// 当前选区，已夹紧。
+    fn selection(&self) -> Range<usize> {
+        self.clamp(self.selected_range.clone())
+    }
+
+    /// 解析输入法给出的区间；缺省时退回标记区间，再退回选区。
+    fn resolved_range(&self, range_utf16: Option<&Range<usize>>) -> Range<usize> {
+        let raw = match range_utf16 {
+            Some(range) => self.range_from_utf16(range),
+            None => self
+                .marked_range
+                .clone()
+                .unwrap_or_else(|| self.selected_range.clone()),
+        };
+        self.clamp(raw)
+    }
+
     /// 回车提交；Shift+Enter 暂不处理（V1 为单行输入）。
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if event.keystroke.key == "enter" && !event.keystroke.modifiers.shift {
+        // 组词中（marked text）的回车属于输入法确认候选词，不能当作发送
+        if event.keystroke.key == "enter"
+            && !event.keystroke.modifiers.shift
+            && self.marked_range.is_none()
+        {
             cx.emit(TextInputSubmitted);
         }
     }
@@ -141,16 +213,18 @@ impl TextInput {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
+        let selection = self.selection();
+        if !selection.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
+                self.content[selection].to_string(),
             ));
         }
     }
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
+        let selection = self.selection();
+        if !selection.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
+                self.content[selection].to_string(),
             ));
             self.replace_text_in_range(None, "", window, cx)
         }
@@ -263,7 +337,7 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        let range = self.range_from_utf16(&range_utf16);
+        let range = self.clamp(self.range_from_utf16(&range_utf16));
         actual_range.replace(self.range_to_utf16(&range));
         Some(self.content[range].to_string())
     }
@@ -301,17 +375,13 @@ impl EntityInputHandler for TextInput {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = range_utf16
-            .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .or(self.marked_range.clone())
-            .unwrap_or(self.selected_range.clone());
+        let range = self.resolved_range(range_utf16.as_ref());
 
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
                 .into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
-        self.marked_range.take();
+        self.marked_range = None;
         cx.notify();
     }
 
@@ -323,25 +393,30 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = range_utf16
-            .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .or(self.marked_range.clone())
-            .unwrap_or(self.selected_range.clone());
+        let range = self.resolved_range(range_utf16.as_ref());
 
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
                 .into();
-        if !new_text.is_empty() {
-            self.marked_range = Some(range.start..range.start + new_text.len());
+        self.marked_range = if new_text.is_empty() {
+            None
         } else {
-            self.marked_range = None;
-        }
-        self.selected_range = new_selected_range_utf16
-            .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .map(|new_range| new_range.start + range.start..new_range.end + range.end)
-            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+            Some(range.start..range.start + new_text.len())
+        };
+
+        // 选中范围是相对 new_text 的，要先在新文本内换算，再叠加本次替换的起点
+        self.selected_range = match new_selected_range_utf16 {
+            Some(selected) => {
+                let start = floor_char_boundary(new_text, selected.start);
+                let end = floor_char_boundary(new_text, selected.end);
+                let (start, end) = if start <= end { (start, end) } else { (end, start) };
+                range.start + start..range.start + end
+            }
+            None => {
+                let cursor = range.start + new_text.len();
+                cursor..cursor
+            }
+        };
 
         cx.notify();
     }
@@ -354,7 +429,7 @@ impl EntityInputHandler for TextInput {
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let last_layout = self.last_layout.as_ref()?;
-        let range = self.range_from_utf16(&range_utf16);
+        let range = self.clamp(self.range_from_utf16(&range_utf16));
         Some(Bounds::from_corners(
             point(
                 bounds.left() + last_layout.x_for_index(range.start),
@@ -376,7 +451,10 @@ impl EntityInputHandler for TextInput {
         let line_point = self.last_bounds?.localize(&point)?;
         let last_layout = self.last_layout.as_ref()?;
 
-        assert_eq!(last_layout.text, self.content);
+        // 布局可能落后内容一步（例如刚被程序清空），此时不给命中结果而不是崩溃
+        if last_layout.text != self.content {
+            return None;
+        }
         let utf8_index = last_layout.index_for_x(point.x - line_point.x)?;
         Some(self.offset_to_utf16(utf8_index))
     }
@@ -384,6 +462,11 @@ impl EntityInputHandler for TextInput {
 
 struct TextElement {
     input: Entity<TextInput>,
+    /// 显式指定颜色，不依赖祖先节点的样式继承。
+    text_color: gpui::Hsla,
+    placeholder_color: gpui::Hsla,
+    cursor_color: gpui::Hsla,
+    selection_color: gpui::Hsla,
 }
 
 struct PrepaintState {
@@ -436,14 +519,20 @@ impl Element for TextElement {
     ) -> Self::PrepaintState {
         let input = self.input.read(cx);
         let content = input.content.clone();
-        let selected_range = input.selected_range.clone();
-        let cursor = input.cursor_offset();
-        let style = window.text_style();
+        // 输入法可能给出过期区间，渲染前统一夹紧，避免按旧索引取字形或相减溢出
+        let selected_range = input.clamp(input.selected_range.clone());
+        let cursor = input
+            .clamp(input.cursor_offset()..input.cursor_offset())
+            .start;
+        // 字体沿用窗口样式，颜色必须自己指定：祖先节点的浅色文本色会让输入内容
+        // 与输入框底色同色而看不见
+        let mut style = window.text_style();
+        style.color = self.text_color;
 
         let (display_text, text_color) = if content.is_empty() {
-            (input.placeholder.clone(), hsla(0., 0., 0., 0.2))
+            (input.placeholder.clone(), self.placeholder_color)
         } else {
-            (content, style.color)
+            (content, self.text_color)
         };
 
         let run = TextRun {
@@ -454,7 +543,13 @@ impl Element for TextElement {
             underline: None,
             strikethrough: None,
         };
-        let runs = if let Some(marked_range) = input.marked_range.as_ref() {
+        // 组词区间同样可能过期；空区间直接忽略，避免按 placeholder 长度相减
+        let marked_range = input
+            .marked_range
+            .clone()
+            .map(|range| input.clamp(range))
+            .filter(|range| !range.is_empty());
+        let runs = if let Some(marked_range) = marked_range.as_ref() {
             vec![
                 TextRun {
                     len: marked_range.start,
@@ -495,7 +590,7 @@ impl Element for TextElement {
                         point(bounds.left() + cursor_pos, bounds.top()),
                         size(px(2.), bounds.bottom() - bounds.top()),
                     ),
-                    gpui::blue(),
+                    self.cursor_color,
                 )),
             )
         } else {
@@ -511,7 +606,7 @@ impl Element for TextElement {
                             bounds.bottom(),
                         ),
                     ),
-                    rgba(0x3311ff30),
+                    self.selection_color,
                 )),
                 None,
             )
@@ -542,9 +637,12 @@ impl Element for TextElement {
         if let Some(selection) = prepaint.selection.take() {
             window.paint_quad(selection)
         }
-        let line = prepaint.line.take().unwrap();
-        line.paint(bounds.origin, window.line_height(), window, cx)
-            .unwrap();
+        // gpui 可能复用同一份 prepaint 再次绘制：取不到就跳过，绘制失败也不该
+        // 把整个界面拖崩，顶多这一帧没有文字
+        let Some(line) = prepaint.line.take() else {
+            return;
+        };
+        let _ = line.paint(bounds.origin, window.line_height(), window, cx);
 
         if focus_handle.is_focused(window)
             && let Some(cursor) = prepaint.cursor.take()
@@ -584,17 +682,20 @@ impl Render for TextInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_key_down(cx.listener(Self::on_key_down))
-            .bg(rgb(0xffffff))
-            .line_height(px(22.))
-            .text_size(px(15.))
-            .child(
-                div()
-                    .h(px(22. + 4. * 2.))
-                    .w_full()
-                    .p(px(4.))
-                    .bg(white())
-                    .child(TextElement { input: cx.entity() }),
-            )
+            .w_full()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(rgb(theme::FIELD))
+            .line_height(px(20.))
+            .text_size(px(14.))
+            .child(div().w_full().child(TextElement {
+                input: cx.entity(),
+                text_color: rgb(theme::TEXT).into(),
+                placeholder_color: rgb(theme::FAINT).into(),
+                cursor_color: rgb(theme::ACCENT).into(),
+                selection_color: rgba(0x4c82ff26).into(),
+            }))
     }
 }
 
@@ -634,6 +735,9 @@ impl TextInput {
         self.content = text.into();
         self.selected_range = self.content.len()..self.content.len();
         self.marked_range = None;
+        // 布局缓存对应的是旧文本，必须一并失效，否则按旧索引取字形会越界
+        self.last_layout = None;
+        self.last_bounds = None;
         cx.notify();
     }
 
@@ -642,5 +746,31 @@ impl TextInput {
         let text = self.content.to_string();
         self.set_content("", cx);
         text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn floors_to_char_boundary() {
+        let text = "ab我"; // 「我」占 3 字节，起点在 2
+        assert_eq!(floor_char_boundary(text, 0), 0);
+        assert_eq!(floor_char_boundary(text, 2), 2);
+        assert_eq!(floor_char_boundary(text, 3), 2); // 落在「我」中间，退到起点
+        assert_eq!(floor_char_boundary(text, 4), 2);
+        assert_eq!(floor_char_boundary(text, 5), 5);
+        assert_eq!(floor_char_boundary(text, 99), 5); // 超出长度，夹到末尾
+    }
+
+    #[test]
+    fn clamps_stale_ime_ranges() {
+        // 内容被程序清空后，输入法仍按旧坐标给出区间，必须夹住而不是越界切片
+        assert_eq!(clamp_range("ni", 5..5), 2..2); // 崩溃现场：len 4 却切 [5..]
+        assert_eq!(clamp_range("ni", 0..5), 0..2);
+        assert_eq!(clamp_range("ni", Range { start: 3, end: 1 }), 1..2); // 反向区间也要归一
+        assert_eq!(clamp_range("", 0..7), 0..0);
+        assert_eq!(clamp_range("你好", 1..3), 0..3); // 落在多字节字符中间
     }
 }
