@@ -1,11 +1,11 @@
-//! 界面后端链路：创建房间 → 连接 → 看人数 → 加入 → 发言。
+//! 界面服务链路：创建房间 → 连接 → 看人数 → 加入 → 发言。
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use chat_proto::RoomId;
 use chat_transport_quic::Liveness;
-use chat_ui_gpui::backend::{UiCommand, UiEvent, spawn_on, spawn_with};
+use chat_ui_gpui::service::{UiCommand, UiEvent, spawn_on, spawn_with};
 
 /// 这些用例都要占用全局的 mDNS(5353) 与广播端口，必须串行执行。
 ///
@@ -73,13 +73,19 @@ fn host_then_connect_join_send() {
         _ => unreachable!(),
     }
 
-    cmds.send(UiCommand::Join { name: "Alice".into() }).unwrap();
+    cmds.send(UiCommand::Join {
+        name: "Alice".into(),
+    })
+    .unwrap();
     match recv_until(&events, |e| matches!(e, UiEvent::Joined { .. })) {
         UiEvent::Joined { online, .. } => assert_eq!(online, 1),
         _ => unreachable!(),
     }
 
-    cmds.send(UiCommand::Send { text: "你好".into() }).unwrap();
+    cmds.send(UiCommand::Send {
+        text: "你好".into(),
+    })
+    .unwrap();
     match recv_until(&events, |e| matches!(e, UiEvent::Message { .. })) {
         UiEvent::Message { sender, text, .. } => {
             assert_eq!(sender, "Alice");
@@ -95,10 +101,7 @@ fn host_then_connect_join_send() {
     match recv_until(&events, |e| {
         matches!(e, UiEvent::Presence { online: 0, .. })
     }) {
-        UiEvent::Presence {
-            online,
-            ..
-        } => assert_eq!(online, 0),
+        UiEvent::Presence { online, .. } => assert_eq!(online, 0),
         _ => unreachable!(),
     }
 }
@@ -118,13 +121,18 @@ fn two_instances_discover_each_other_on_one_host() {
         .unwrap();
     recv_until(&events_a, |e| matches!(e, UiEvent::Hosting { .. }));
     recv_until(&events_a, |e| matches!(e, UiEvent::Lobby { .. }));
-    cmds_a.send(UiCommand::Join { name: "Alice".into() }).unwrap();
+    cmds_a
+        .send(UiCommand::Join {
+            name: "Alice".into(),
+        })
+        .unwrap();
     recv_until(&events_a, |e| matches!(e, UiEvent::Joined { .. }));
 
     // 实例 B 无需任何手工配置即可发现该房间
-    let found = recv_until(&events_b, |e| {
-        matches!(e, UiEvent::RoomFound { name, .. } if name == "同机房间")
-    });
+    let found = recv_until(
+        &events_b,
+        |e| matches!(e, UiEvent::RoomFound { name, .. } if name == "同机房间"),
+    );
     let UiEvent::RoomFound {
         addr, fingerprint, ..
     } = found
@@ -147,10 +155,7 @@ fn two_instances_discover_each_other_on_one_host() {
     match recv_until(&events_a, |e| {
         matches!(e, UiEvent::Presence { online: 2, .. })
     }) {
-        UiEvent::Presence {
-            online,
-            ..
-        } => assert_eq!(online, 2),
+        UiEvent::Presence { online, .. } => assert_eq!(online, 2),
         _ => unreachable!(),
     }
 
@@ -202,16 +207,17 @@ fn leaving_on_switch_drops_online_count() {
         })
         .unwrap();
     recv_until(&events_a, |e| matches!(e, UiEvent::Lobby { .. }));
-    cmds_a.send(UiCommand::Join { name: "Alice".into() }).unwrap();
+    cmds_a
+        .send(UiCommand::Join {
+            name: "Alice".into(),
+        })
+        .unwrap();
     recv_until(&events_a, |e| matches!(e, UiEvent::Joined { .. }));
 
     match recv_until(&events_b, |e| {
         matches!(e, UiEvent::Presence { online: 2, .. })
     }) {
-        UiEvent::Presence {
-            online,
-            ..
-        } => assert_eq!(online, 2),
+        UiEvent::Presence { online, .. } => assert_eq!(online, 2),
         _ => unreachable!(),
     }
 
@@ -314,7 +320,10 @@ fn reconnects_after_connection_drops_without_leaving_room() {
     .unwrap();
     recv_until(&events, |e| matches!(e, UiEvent::Hosting { .. }));
     recv_until(&events, |e| matches!(e, UiEvent::Lobby { .. }));
-    cmds.send(UiCommand::Join { name: "Alice".into() }).unwrap();
+    cmds.send(UiCommand::Join {
+        name: "Alice".into(),
+    })
+    .unwrap();
     recv_until(&events, |e| matches!(e, UiEvent::Joined { .. }));
 
     // 安静下来，等连接因空闲被判死，再等它自己恢复
@@ -348,7 +357,11 @@ fn switching_rooms_does_not_leak_old_presence() {
         UiEvent::Lobby { room, .. } => room,
         _ => unreachable!(),
     };
-    cmds_a.send(UiCommand::Join { name: "Alice".into() }).unwrap();
+    cmds_a
+        .send(UiCommand::Join {
+            name: "Alice".into(),
+        })
+        .unwrap();
     recv_until(&events_a, |e| matches!(e, UiEvent::Joined { .. }));
 
     cmds_b

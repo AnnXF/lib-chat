@@ -1,5 +1,7 @@
 //! 诊断：把启动、退出与 panic 落到文件。
 //!
+//! 归二进制所有——安装进程级 panic 钩子属于应用的决定，库不该替调用方做。
+//!
 //! 起因是「界面自己就没了」却查无实据。三种收场方式留下的痕迹不同，日志能区分：
 //!
 //! | 收场 | 日志表现 |
@@ -79,10 +81,7 @@ fn panic_line(
         .or_else(|| payload.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "非字符串 panic 负载".to_string());
 
-    format!(
-        "[{}] panic [{thread}] {payload} @ {location}",
-        now_stamp()
-    )
+    format!("[{}] panic [{thread}] {payload} @ {location}", now_stamp())
 }
 
 /// 把 Unix 秒格式化成 UTC 的 `YYYY-MM-DD HH:MM:SS`。

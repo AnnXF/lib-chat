@@ -5,7 +5,7 @@ version.workspace = true
 
 [[bin]]
 name = "libchat-ui"
-path = "src/main.rs"
+path = "src/bin/libchat-ui/main.rs"
 
 [dependencies]
 chat-proto.workspace = true

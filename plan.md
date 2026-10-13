@@ -354,9 +354,62 @@ crates/
 ├── chat-client          带类型的客户端 SDK
 ├── chat-discovery       房间发现：mDNS + UDP 广播双通道
 ├── chat-transport-quic  QUIC 传输 + 自签证书 + TOFU
-├── chat-ui-gpui         GPUI 桌面界面（lib: backend + text_input；bin: libchat-ui）
+├── chat-ui-gpui         GPUI 桌面界面（bin 只剩开窗；逻辑全在 lib 里）
 └── chat-cli             libchat host / join
 ```
+
+**界面 crate 的模块划分**：
+
+```
+chat-ui-gpui/src/
+├── lib.rs               库根：界面 + 聊天服务
+├── app.rs               界面根：ChatApp 状态 + 构造 + 整体组装
+├── app/                 界面
+│   ├── model.rs         视图数据（DiscoveredRoom / RoomView / ChatLine）
+│   ├── update.rs        服务事件 → 界面状态（唯一写入方）
+│   ├── actions.rs       用户操作 → 服务指令（只发指令，不改数据）
+│   ├── views.rs         三大区域 + 共用小件（小节标题、内边距、按钮、消息行）
+│   ├── views/
+│   │   ├── header.rs    顶栏
+│   │   ├── sidebar.rs   房间列表 / 手动连接 / 昵称 / 创建房间
+│   │   └── chat.rs      消息区 + 输入条
+│   ├── widgets.rs       可复用控件
+│   ├── widgets/
+│   │   └── text_input.rs 输入控件（含 IME 支持）
+│   └── theme.rs         配色
+├── service.rs           聊天服务根：UiEvent / UiCommand / 启动 / 主循环
+├── service/             聊天服务（独立 tokio 运行时）
+│   ├── session.rs       会话：建连、身份恢复、断线重连
+│   ├── hosting.rs       本机托管房间：监听、广播、人数上报
+│   ├── discovery.rs     局域网房间发现与人数探测
+│   └── protocol.rs      网络协议 → 界面事件（收窄界面要处理的事件种类）
+└── bin/libchat-ui/      二进制：只做属于「进程」的事
+    ├── main.rs          入口：装诊断 + 开窗
+    └── diag.rs          启动 / 退出 / panic 落盘
+```
+
+**三条组织规则**（依 Rust 官方《The Rust Programming Language》第 7 章）：
+
+1. **按角色命名，不按层次命名**。书中用餐厅举例，分组是 `front_of_house`（含 `hosting`、`serving`）这类角色名，而不是 `backend` / `frontend` 这类技术层名。所以这一层叫 `service`（它对外提供的是「聊天服务」：连上某个房间、或自己托管一个房间），而不是 `backend`。
+2. **用 `foo.rs + foo/`，不用 `foo/mod.rs`**。Rust 2018 起的现代约定：这样模块文件与子模块目录同层，一眼能看清结构；`mod.rs` 会造成一堆同名文件难以辨认。`app.rs` / `service.rs` 各自与同名目录成对出现，正是这个规则。
+3. **顶层文件数 = 顶层模块数**，这是模块系统的硬性规则：Cargo 只固定 `lib.rs` 与 `main.rs` 两个名字，其余每个顶层模块都必须在 crate 根声明，落盘只有 `foo.rs` 或 `foo/mod.rs` 两种，没有第三种。
+
+**二进制独立成目录**（`bin/libchat-ui/`）的原因：装进程级 panic 钩子、把启动/退出写盘，这些是**应用的决定**而非库的职责。`diag` 只有 `main.rs` 用得到，放在库里会让它成为顶层多出来的一个孤立文件，也等于替调用方做了进程级副作用。
+
+隐私边界也由此确定：`ChatApp` 定义在 `app.rs`（`update` / `actions` / `views` 三者的**父模块**），因此三个子模块能访问其私有字段，而外部不能——这是刻意的，不用把字段放宽成 `pub(crate)`。
+
+**代码约定**（改代码时请一并守住）：
+
+| 约定 | 理由 |
+|---|---|
+| 界面状态只有一个写入方（`app/update.rs`） | `actions` 只发指令、`views` 只读，不会出现两处各改一半 |
+| 重复的判断给它起个名字（如 `ChatApp::showing(room)`） | 「事件是否属于当前房间」原来在 4 处各写一遍 |
+| 长函数拆成**有名字的阶段**，而不是加注释分层 | `session.rs` 的重连监督原是一个 135 行、三层嵌套循环的函数，现拆成 `acquire` / `handshake` / `serve` / `wait_before_retry`，最长 41 行，主循环 `run()` 读起来就是它的规格说明 |
+| 一段逻辑只在一处决定样式/状态 | 侧栏房间行的选中态原分散在 4 处 `if`，现集中算一次 |
+| 不留单文件时代的产物 | 如 `// ---- 状态` 这类分节注释，模块化之后已是冗余 |
+| 不用 `utils.rs` / `common.rs` / `shared.rs` | 这类名字会变成杂物间；共用小件留在其父模块（如 `app/views.rs`） |
+
+另：`App` 的输入控件来自 gpui 官方示例改造，内含 IME（`EntityInputHandler`）与全文光标逻辑，**没有拆分的必要**——它是一个内聚的整体。
 
 ### 用法
 

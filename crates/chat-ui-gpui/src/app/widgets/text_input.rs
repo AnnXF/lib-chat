@@ -9,7 +9,7 @@ use gpui::{
 };
 use unicode_segmentation::*;
 
-use crate::theme;
+use crate::app::theme;
 
 actions!(
     text_input,
@@ -27,7 +27,6 @@ actions!(
         Paste,
         Cut,
         Copy,
-        Quit,
     ]
 );
 
@@ -326,7 +325,6 @@ impl TextInput {
             .find_map(|(idx, _)| (idx > offset).then_some(idx))
             .unwrap_or(self.content.len())
     }
-
 }
 
 impl EntityInputHandler for TextInput {
@@ -409,7 +407,11 @@ impl EntityInputHandler for TextInput {
             Some(selected) => {
                 let start = floor_char_boundary(new_text, selected.start);
                 let end = floor_char_boundary(new_text, selected.end);
-                let (start, end) = if start <= end { (start, end) } else { (end, start) };
+                let (start, end) = if start <= end {
+                    (start, end)
+                } else {
+                    (end, start)
+                };
                 range.start + start..range.start + end
             }
             None => {
