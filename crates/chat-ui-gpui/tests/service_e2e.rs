@@ -46,6 +46,26 @@ fn spawn_test(beacon_port: u16) -> (flume::Sender<UiCommand>, flume::Receiver<Ui
     spawn_with_data(beacon_port, Liveness::default(), test_data_dir(beacon_port))
 }
 
+/// 在给定时间内等一个满足条件的事件；等不到就返回 `None`。
+fn wait_for(
+    events: &flume::Receiver<UiEvent>,
+    pred: impl Fn(&UiEvent) -> bool,
+    wait: std::time::Duration,
+) -> Option<UiEvent> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        match events.recv_timeout(left) {
+            Ok(event) if pred(&event) => return Some(event),
+            Ok(_) => continue,
+            Err(_) => return None,
+        }
+    }
+}
+
 fn recv_until<F>(events: &flume::Receiver<UiEvent>, pred: F) -> UiEvent
 where
     F: Fn(&UiEvent) -> bool,
@@ -393,6 +413,349 @@ fn host_once(beacon_port: u16, dir: &std::path::Path) -> RoomId {
     drop(cmds);
     drop(events);
     room
+}
+
+/// 重开软件后应当提示本机房间还在，点它就能回到原房间、历史都在。
+#[test]
+fn reopening_offers_the_local_room_back() {
+    let (_guard, beacon_port) = serial();
+    let dir = test_data_dir(beacon_port);
+
+    // 全新的数据目录不该凭空冒出一个「本机房间」
+    {
+        let (_cmds, events) = spawn_with_data(beacon_port, Liveness::default(), dir.clone());
+        let found = wait_for(
+            &events,
+            |e| matches!(e, UiEvent::LocalRoom { .. }),
+            Duration::from_millis(400),
+        );
+        assert!(found.is_none(), "全新目录不该有本机房间");
+    }
+
+    // 建一次房，说三句话
+    {
+        let (cmds, events) = spawn_with_data(beacon_port, Liveness::default(), dir.clone());
+        cmds.send(UiCommand::Host {
+            name: "会留下的房间".into(),
+        })
+        .unwrap();
+        recv_until(&events, |e| matches!(e, UiEvent::Lobby { .. }));
+        cmds.send(UiCommand::Join {
+            name: "Alice".into(),
+        })
+        .unwrap();
+        recv_until(&events, |e| matches!(e, UiEvent::Joined { .. }));
+        for i in 1..=3 {
+            cmds.send(UiCommand::Send {
+                text: format!("第 {i} 句"),
+            })
+            .unwrap();
+        }
+        recv_until(&events, |e| {
+            matches!(e, UiEvent::Message { text, .. } if text.as_str() == "第 3 句")
+        });
+        drop(cmds);
+        drop(events);
+    }
+    std::thread::sleep(Duration::from_millis(600));
+
+    // 重开：先提示本机房间还在，再点进去应看到原来的历史
+    let (cmds, events) = spawn_with_data(beacon_port, Liveness::default(), dir.clone());
+    match wait_for(
+        &events,
+        |e| matches!(e, UiEvent::LocalRoom { .. }),
+        Duration::from_secs(2),
+    ) {
+        Some(UiEvent::LocalRoom { messages }) => assert_eq!(messages, 3),
+        _ => panic!("重开后应提示本机房间还在"),
+    }
+
+    cmds.send(UiCommand::Host {
+        name: "会留下的房间".into(),
+    })
+    .unwrap();
+    recv_until(&events, |e| matches!(e, UiEvent::Lobby { .. }));
+    cmds.send(UiCommand::Join {
+        name: "Alice".into(),
+    })
+    .unwrap();
+    match recv_until(&events, |e| matches!(e, UiEvent::History { .. })) {
+        UiEvent::History { messages, .. } => {
+            assert_eq!(messages.len(), 3);
+            assert_eq!(messages[0].text, "第 1 句");
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// 「新建房间」把本机房间的历史清空，从空白重新开始。
+#[test]
+fn new_room_clears_the_local_history() {
+    let (_guard, beacon_port) = serial();
+    let dir = test_data_dir(beacon_port);
+
+    // 先留一条历史
+    {
+        let (cmds, events) = spawn_with_data(beacon_port, Liveness::default(), dir.clone());
+        cmds.send(UiCommand::Host {
+            name: "旧房间".into(),
+        })
+        .unwrap();
+        recv_until(&events, |e| matches!(e, UiEvent::Lobby { .. }));
+        cmds.send(UiCommand::Join {
+            name: "Alice".into(),
+        })
+        .unwrap();
+        recv_until(&events, |e| matches!(e, UiEvent::Joined { .. }));
+        cmds.send(UiCommand::Send {
+            text: "旧消息".into(),
+        })
+        .unwrap();
+        recv_until(&events, |e| matches!(e, UiEvent::Message { .. }));
+        drop(cmds);
+        drop(events);
+    }
+    std::thread::sleep(Duration::from_millis(600));
+
+    let (cmds, events) = spawn_with_data(beacon_port, Liveness::default(), dir.clone());
+    wait_for(
+        &events,
+        |e| matches!(e, UiEvent::LocalRoom { .. }),
+        Duration::from_secs(2),
+    );
+
+    cmds.send(UiCommand::NewRoom {
+        name: "新房间".into(),
+    })
+    .unwrap();
+    recv_until(&events, |e| matches!(e, UiEvent::Lobby { .. }));
+    cmds.send(UiCommand::Join {
+        name: "Alice".into(),
+    })
+    .unwrap();
+    match recv_until(&events, |e| matches!(e, UiEvent::History { .. })) {
+        UiEvent::History {
+            messages, has_more, ..
+        } => {
+            assert!(messages.is_empty(), "新建的房间不该带着旧历史");
+            assert!(!has_more);
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// 已经开着一个房间时再点「新建房间」，新房间必须照常可用。
+#[test]
+fn new_room_while_hosting_keeps_the_room_usable() {
+    let (_guard, beacon_port) = serial();
+    let dir = test_data_dir(beacon_port);
+    let (cmds, events) = spawn_with_data(beacon_port, Liveness::default(), dir);
+
+    cmds.send(UiCommand::Host {
+        name: "第一个".into(),
+    })
+    .unwrap();
+    recv_until(&events, |e| matches!(e, UiEvent::Hosting { .. }));
+    recv_until(&events, |e| matches!(e, UiEvent::Lobby { .. }));
+    cmds.send(UiCommand::Join {
+        name: "Alice".into(),
+    })
+    .unwrap();
+    recv_until(&events, |e| matches!(e, UiEvent::Joined { .. }));
+    cmds.send(UiCommand::Send {
+        text: "旧消息".into(),
+    })
+    .unwrap();
+    recv_until(&events, |e| matches!(e, UiEvent::Message { .. }));
+
+    cmds.send(UiCommand::NewRoom {
+        name: "第二个".into(),
+    })
+    .unwrap();
+
+    let hosting = wait_for(
+        &events,
+        |e| matches!(e, UiEvent::Hosting { .. }),
+        Duration::from_secs(5),
+    );
+    assert!(hosting.is_some(), "新建后应当重新发出 Hosting");
+
+    let lobby = wait_for(
+        &events,
+        |e| matches!(e, UiEvent::Lobby { .. }),
+        Duration::from_secs(5),
+    );
+    assert!(lobby.is_some(), "新建后应当重新接入自己的房间");
+
+    cmds.send(UiCommand::Join {
+        name: "Alice".into(),
+    })
+    .unwrap();
+    let joined = wait_for(
+        &events,
+        |e| matches!(e, UiEvent::Joined { .. }),
+        Duration::from_secs(5),
+    );
+    assert!(joined.is_some(), "新房间应当能正常加入");
+}
+
+/// 连着建两个房间，再点「加入房间」，也必须能加入。
+#[test]
+fn joining_after_two_new_rooms_still_works() {
+    let (_guard, beacon_port) = serial();
+    let dir = test_data_dir(beacon_port);
+    let (cmds, events) = spawn_with_data(beacon_port, Liveness::default(), dir);
+
+    for name in ["一号", "二号"] {
+        cmds.send(UiCommand::NewRoom { name: name.into() })
+            .unwrap();
+        let hosting = wait_for(
+            &events,
+            |e| matches!(e, UiEvent::Hosting { .. }),
+            Duration::from_secs(10),
+        );
+        assert!(hosting.is_some(), "建「{name}」应当发出 Hosting");
+        let lobby = wait_for(
+            &events,
+            |e| matches!(e, UiEvent::Lobby { .. }),
+            Duration::from_secs(10),
+        );
+        assert!(lobby.is_some(), "建「{name}」后应当接入自己的房间");
+    }
+
+    cmds.send(UiCommand::Join {
+        name: "Alice".into(),
+    })
+    .unwrap();
+    let joined = wait_for(
+        &events,
+        |e| matches!(e, UiEvent::Joined { .. }),
+        Duration::from_secs(10),
+    );
+    assert!(joined.is_some(), "第二个房间应当能正常加入");
+}
+
+/// 重建房间后，旧房间（本机自己刚撤下的那个）必须马上离开房间列表。
+///
+/// 列表里留一行连不上的旧房间，用户就会去点它，然后吃到一次「连接超时」。
+#[test]
+fn rebuilding_the_local_room_drops_the_old_one_right_away() {
+    let (_guard, beacon_port) = serial();
+    let dir = test_data_dir(beacon_port);
+    let (cmds, events) = spawn_with_data(beacon_port, Liveness::default(), dir);
+
+    cmds.send(UiCommand::NewRoom { name: "一号".into() })
+        .unwrap();
+    recv_until(&events, |e| matches!(e, UiEvent::Hosting { .. }));
+    // 房间标识用「自己接进自己房间」带回的那个，别拿房间列表里的：
+    // mDNS 会让同网段别的房间也飘进来，抓到的可能不是自己的
+    let old = match recv_until(&events, |e| matches!(e, UiEvent::Lobby { .. })) {
+        UiEvent::Lobby { room, .. } => room,
+        _ => unreachable!(),
+    };
+
+    cmds.send(UiCommand::NewRoom { name: "二号".into() })
+        .unwrap();
+
+    // 旧房间的「消失」和新房间的「上线」谁先谁后都算数，所以一起收着看
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let (mut hosting, mut gone, mut came_back) = (false, false, false);
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        match events.recv_timeout(left) {
+            Ok(UiEvent::Hosting { .. }) => hosting = true,
+            Ok(UiEvent::RoomGone { room }) if room == old => gone = true,
+            Ok(UiEvent::RoomFound { room, .. }) if room == old => came_back = true,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+
+    assert!(hosting, "新房间应当上线");
+    assert!(gone, "旧房间应当马上从列表里消失");
+    assert!(!came_back, "旧房间不该再冒出来");
+}
+
+/// 连一个没人监听的地址必须很快失败。
+///
+/// 后端是串行处理指令的：一次握手卡住多久，界面就「点不动」多久。房间重启换了端口后，
+/// 列表里残留的旧地址正是这种没人监听的地址，点一下就能把界面钉住。
+#[test]
+fn connecting_to_a_dead_address_fails_quickly() {
+    let (_guard, beacon_port) = serial();
+    let (cmds, events) = spawn_test(beacon_port);
+
+    // 分配一个本地端口再立刻放掉：此后没人监听
+    let dead = {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        drop(socket);
+        addr
+    };
+
+    let started = Instant::now();
+    cmds.send(UiCommand::Connect {
+        addr: dead.to_string(),
+        fingerprint: None,
+    })
+    .unwrap();
+    let failed = wait_for(
+        &events,
+        |e| matches!(e, UiEvent::Error(_)),
+        Duration::from_secs(20),
+    );
+    let elapsed = started.elapsed();
+
+    assert!(failed.is_some(), "连不上应当报错，实际耗时 {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "连不上的地址应当很快放弃，实际耗时 {elapsed:?}"
+    );
+}
+
+/// 自己建了房间，又从房间列表点进自己的房间，再点「加入房间」，也必须能加入。
+#[test]
+fn connecting_to_own_room_then_joining_works() {
+    let (_guard, beacon_port) = serial();
+    let dir = test_data_dir(beacon_port);
+    let (cmds, events) = spawn_with_data(beacon_port, Liveness::default(), dir);
+
+    cmds.send(UiCommand::Host {
+        name: "自己的房间".into(),
+    })
+    .unwrap();
+    recv_until(&events, |e| matches!(e, UiEvent::Hosting { .. }));
+    recv_until(&events, |e| matches!(e, UiEvent::Lobby { .. }));
+
+    // 等自己广播的房间被自己发现，然后像用户点房间列表那样连过去
+    let found = wait_for(
+        &events,
+        |e| matches!(e, UiEvent::RoomFound { .. }),
+        Duration::from_secs(10),
+    );
+    let (addr, fingerprint) = match found {
+        Some(UiEvent::RoomFound {
+            addr, fingerprint, ..
+        }) => (addr, fingerprint),
+        _ => panic!("没等到自己房间的广播"),
+    };
+
+    cmds.send(UiCommand::Connect {
+        addr,
+        fingerprint: Some(fingerprint),
+    })
+    .unwrap();
+    recv_until(&events, |e| matches!(e, UiEvent::Lobby { .. }));
+
+    cmds.send(UiCommand::Join {
+        name: "Alice".into(),
+    })
+    .unwrap();
+    let joined = wait_for(
+        &events,
+        |e| matches!(e, UiEvent::Joined { .. }),
+        Duration::from_secs(10),
+    );
+    assert!(joined.is_some(), "点进自己的房间后应当能正常加入");
 }
 
 /// 加入房间要把之前的对话带回来，否则进房间只看到一片空白。

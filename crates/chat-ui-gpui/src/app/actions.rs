@@ -88,6 +88,17 @@ impl ChatApp {
         self.tell(UiCommand::Host { name }, cx);
     }
 
+    /// 清空本机房间的历史，从空白重新开一个。
+    pub(crate) fn on_new_room(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = self.nickname_or("局域网聊天室", cx);
+        self.tell(UiCommand::NewRoom { name }, cx);
+    }
+
     pub(crate) fn on_join(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         let name = self.nickname_or("我", cx);
         self.tell(UiCommand::Join { name }, cx);

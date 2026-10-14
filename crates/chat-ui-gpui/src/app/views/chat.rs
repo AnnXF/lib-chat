@@ -2,8 +2,6 @@ use super::*;
 
 impl ChatApp {
     pub(crate) fn render_main(&self, cx: &mut Context<Self>) -> AnyElement {
-        let joined = self.room.as_ref().map(|room| room.joined).unwrap_or(false);
-
         let title = match &self.room {
             Some(room) => room.name.clone(),
             None => "未连接".to_string(),
@@ -16,10 +14,11 @@ impl ChatApp {
                 .unwrap_or_else(|| "从左侧选择房间，或创建自己的房间".to_string()),
         };
 
-        let action = if joined {
-            button("退出房间", false, false, cx.listener(Self::on_leave))
-        } else {
-            button("加入房间", true, false, cx.listener(Self::on_join))
+        // 没连上房间时不摆「加入」：那会儿点下去什么也不会发生，只会让人以为界面卡住了
+        let action = match self.room.as_ref().map(|room| room.joined) {
+            None => div().into_any_element(),
+            Some(true) => button("退出房间", false, false, cx.listener(Self::on_leave)),
+            Some(false) => button("加入房间", true, false, cx.listener(Self::on_join)),
         };
 
         // 只渲染可见范围那几条，消息再多每帧成本也不变

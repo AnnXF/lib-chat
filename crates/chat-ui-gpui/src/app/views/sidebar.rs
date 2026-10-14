@@ -2,16 +2,24 @@ use super::*;
 
 impl ChatApp {
     pub(crate) fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
-        // 渲染期间要用 cx 注册点击回调，所以先把房间列表取出来，避免同时借用 self.rooms
+        // 渲染期间要用 cx 注册点击回调，所以先把要用的状态取出来，避免同时借用 self
         let items = self.rooms.clone();
         let empty = items.is_empty();
+        let local = self.local_room;
+        // 「新建房间」连库一起删的是本机房间：本机有房间（不用的在侧栏挂着，在用的正托管着）
+        // 就得提示，否则正用着的时候反而是没提示的时候
+        let local_exists = local.is_some() || self.hosted.is_some();
         let current = self.room.as_ref().map(|view| view.id);
         let joined = self.room.as_ref().map(|view| view.joined).unwrap_or(false);
 
-        let rows = items.into_iter().enumerate().map(|(index, room)| {
-            let selected = current == Some(room.id);
-            room_row(index, room, selected, joined, cx)
-        });
+        let rows: Vec<AnyElement> = items
+            .into_iter()
+            .enumerate()
+            .map(|(index, room)| {
+                let selected = current == Some(room.id);
+                room_row(index, room, selected, joined, cx)
+            })
+            .collect();
 
         div()
             .w(px(240.))
@@ -32,6 +40,11 @@ impl ChatApp {
                     .children(rows)
                     .when(empty, |this| this.child(hint("未发现房间，可手动连接"))),
             )
+            // 本机那个房间不在局域网里——它要点了才会被广播出去
+            .when(local.is_some(), |this| {
+                this.child(section_label("本机房间"))
+                    .child(local_room_row(local.unwrap_or(0), cx))
+            })
             .child(div().flex_1())
             .child(section_label("直接连接"))
             .child(padded(self.addr_input.clone()))
@@ -44,13 +57,59 @@ impl ChatApp {
             .child(section_label("昵称"))
             .child(padded(self.nickname.clone()))
             .child(padded(button(
-                "创建房间",
+                "新建房间",
                 true,
                 true,
-                cx.listener(Self::on_host),
+                cx.listener(Self::on_new_room),
             )))
+            .when(local_exists, |this| {
+                this.child(hint("新建会清空本机房间的历史"))
+            })
             .into_any_element()
     }
+}
+
+/// 侧栏里「回到本机房间」的一行：点一下就把它重新开张，历史都还在。
+fn local_room_row(messages: u64, cx: &mut Context<ChatApp>) -> AnyElement {
+    let subtitle = if messages == 0 {
+        "暂无历史".to_string()
+    } else {
+        format!("历史 {messages} 条")
+    };
+
+    div()
+        .id("local-room")
+        .flex()
+        .flex_row()
+        .items_center()
+        .pl_3()
+        .pr_5()
+        .py_2()
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(theme::HOVER)))
+        .child(
+            div()
+                .w(px(2.))
+                .h(px(14.))
+                .mr_3()
+                .rounded_md()
+                .bg(rgb(theme::ACCENT)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .text_sm()
+                .text_color(rgb(theme::TEXT))
+                .child("我的房间"),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::FAINT))
+                .child(subtitle),
+        )
+        .on_mouse_up(MouseButton::Left, cx.listener(ChatApp::on_host))
+        .into_any_element()
 }
 
 /// 房间列表里的一行。

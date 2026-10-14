@@ -39,9 +39,11 @@ impl ChatApp {
                             online,
                         });
                         self.rooms.sort_by(|a, b| a.name.cmp(&b.name));
+                        // 只在确实多了一个房间时说话。复查是在刷新同一个房间，
+                        // 每次都刷状态栏的话，连接失败之类的提示两秒就没了。
+                        self.report_room_count();
                     }
                 }
-                self.status = format!("发现 {} 个局域网房间", self.rooms.len());
             }
             UiEvent::Hosting {
                 name,
@@ -54,7 +56,12 @@ impl ChatApp {
                     "已创建「{name}」，地址 {}（指纹 {short}…）",
                     addrs.join("  /  ")
                 ));
+                // 已经在用这个房间了，侧栏那个「回到我的房间」入口就该收起来
+                self.local_room = None;
                 self.status = "房间已启动，等待其他客户端连接".into();
+            }
+            UiEvent::LocalRoom { messages } => {
+                self.local_room = Some(messages);
             }
             UiEvent::Lobby {
                 room,
@@ -73,6 +80,8 @@ impl ChatApp {
                 // 新房间，能不能往上翻要等它的第一页历史说了算
                 self.has_older = true;
                 self.my_id = None;
+                // 连上了就得把状态栏拉回现在：上一次连不上的错误提示不能一直挂在那儿
+                self.status = "已连接，可加入房间".into();
             }
             UiEvent::Joined { room, you, online } => {
                 // 重连后服务端会重新分配身份并再发一次 Joined，措辞要区分开，
@@ -83,17 +92,19 @@ impl ChatApp {
                     view.online = online;
                 }
                 self.my_id = Some(you);
-                self.push_system(if recovered {
+                self.status = if recovered {
                     format!("连接已恢复，当前在线 {online} 人")
                 } else {
                     format!("已加入，当前在线 {online} 人")
-                });
+                };
+                self.push_system(self.status.clone());
             }
             UiEvent::Left { room } => {
                 if let Some(view) = self.showing_mut(room) {
                     view.joined = false;
                 }
                 self.my_id = None;
+                self.status = "已退出房间".into();
                 self.push_system("已退出房间".into());
             }
             UiEvent::Message {
@@ -142,8 +153,11 @@ impl ChatApp {
                 }
             }
             UiEvent::RoomGone { room } => {
+                let before = self.rooms.len();
                 self.rooms.retain(|known| known.id != room);
-                self.status = format!("发现 {} 个局域网房间", self.rooms.len());
+                if self.rooms.len() != before {
+                    self.report_room_count();
+                }
             }
             UiEvent::Reconnecting(reason) => {
                 // 只是暂时断开：保留房间与聊天记录，重连成功后会自动恢复身份
@@ -155,6 +169,13 @@ impl ChatApp {
                 self.status = "连接已断开，可重新加入".into();
             }
         }
+    }
+
+    /// 把「发现了几个房间」写进状态栏。
+    ///
+    /// 只在房间数真的变了时调用：复查是每几秒一轮的，逢轮就写会把错误提示盖掉。
+    fn report_room_count(&mut self) {
+        self.status = format!("发现 {} 个局域网房间", self.rooms.len());
     }
 
     /// 追加一条消息。

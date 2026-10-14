@@ -1,5 +1,40 @@
 use super::*;
+use chat_core::MessageStore;
 use store_sqlite::SqliteStore;
+
+/// 本机房间的库文件：按广播端口分开，一个端口一个房间。
+fn room_db_path(data_dir: &Path, beacon_port: u16) -> PathBuf {
+    data_dir.join(format!("room-{beacon_port}.db"))
+}
+
+/// 看一眼本机是否已经有这个端口的房间；有就返回它存了多少条消息。
+///
+/// 只做探测，绝不新建文件——没房间时返回 `None`，不会凭空留下一个空库。
+pub(super) async fn local_room_messages(data_dir: &Path, beacon_port: u16) -> Option<u64> {
+    let path = room_db_path(data_dir, beacon_port);
+    if !path.exists() {
+        return None;
+    }
+    let store = SqliteStore::open(&path).await.ok()?;
+    let room = store.room();
+    let latest = store.latest_seq(room).await.ok()?;
+    Some(latest.max(0) as u64)
+}
+
+/// 清空本机房间：连库文件一起删掉，之后重建会拿到新的房间标识与空白历史。
+pub(super) fn reset_local_room(data_dir: &Path, beacon_port: u16) -> Result<(), String> {
+    let path = room_db_path(data_dir, beacon_port);
+    // WAL 模式还会留下 -wal / -shm，一起清掉才算真的重来
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = path.clone().into_os_string();
+        name.push(suffix);
+        let file = PathBuf::from(name);
+        if file.exists() {
+            std::fs::remove_file(&file).map_err(|e| format!("清空本机房间失败: {e}"))?;
+        }
+    }
+    Ok(())
+}
 
 /// 本机托管的房间。切换房间或重新建房时必须回收，否则会留下幽灵房间。
 pub(super) struct Hosting {
@@ -14,10 +49,13 @@ pub(super) struct Hosting {
 }
 
 impl Hosting {
-    pub(super) fn shutdown(self) {
+    pub(super) fn shutdown(self, events: &Sender<UiEvent>) {
         self.alive.store(false, Ordering::Relaxed);
         self.visible.store(false, Ordering::Relaxed);
         self.endpoint.close();
+        // 这个房间是我们自己撤下的，不必等房间发现那边探三次失败（十来秒）才从列表里下去。
+        // 那一行留在列表里就是可点的，点一下只能换来一次连接超时。
+        let _ = events.send(UiEvent::RoomGone { room: self.room });
         // announcer 随 self 一起析构，撤销 mDNS 注册并停止广播应答
     }
 }
@@ -38,7 +76,7 @@ pub(super) async fn start_host(
     data_dir: &Path,
 ) -> Result<Started, String> {
     // 库文件按广播端口分开：同机不同端口各是各的房间，同一个端口重启后仍是同一个房间
-    let path = data_dir.join(format!("room-{beacon_port}.db"));
+    let path = room_db_path(data_dir, beacon_port);
     let store = SqliteStore::open(&path)
         .await
         .map_err(|e| format!("打开消息库失败: {e}"))?;

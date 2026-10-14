@@ -26,10 +26,10 @@ use chat_core::{ChatError, Connection, ConnectionAcceptor};
 use chat_discovery::{RoomAnnouncer, RoomBrowser};
 use chat_proto::{LobbyInfo, Message, RoomId, Seq, ServerEvent, UserId};
 use chat_server::{Acceptor, Server};
-use chat_transport_quic::{Liveness, QuicServer, connect, connect_with};
+use chat_transport_quic::{Liveness, QuicConnection, QuicServer, connect, connect_with};
 use discovery::browse_loop;
 use flume::{Receiver, Sender};
-use hosting::{Hosting, start_host};
+use hosting::{Hosting, local_room_messages, reset_local_room, start_host};
 use session::{Active, SessionCmd, open_session};
 
 /// 房间列表的人数复查间隔。房间要在未加入时也能看到人数，只能周期性探测。
@@ -122,6 +122,10 @@ pub enum UiEvent {
         addrs: Vec<String>,
         fingerprint: String,
     },
+    /// 本机已经有一个可恢复的房间（已存多少条消息）。界面据此在本机给出入口。
+    LocalRoom {
+        messages: u64,
+    },
     /// 已连上某个房间，但尚未加入。
     Lobby {
         room: RoomId,
@@ -175,6 +179,10 @@ pub enum UiEvent {
 #[derive(Clone, Debug)]
 pub enum UiCommand {
     Host {
+        name: String,
+    },
+    /// 清空本机房间的历史，从空白重新开一个。
+    NewRoom {
         name: String,
     },
     Connect {
@@ -249,6 +257,36 @@ fn default_data_dir() -> PathBuf {
     base.join(".lib-chat").join("rooms")
 }
 
+/// 建房：先回收旧资源（旧房间的 endpoint、广播、人数定时器），再启动新的托管。
+async fn start_new_room(
+    name: String,
+    hosting: &mut Option<Hosting>,
+    active: &mut Option<Active>,
+    events: &Sender<UiEvent>,
+    beacon_port: u16,
+    liveness: Liveness,
+    data_dir: &Path,
+) {
+    // 顺序不能反：先把会话优雅结束掉，再关托管。反过来的话连接会先断，
+    // 会话会先去重连，`end()` 就得等它退避一轮，甚至卡在握手上。
+    if let Some(previous) = active.take() {
+        previous.end().await;
+    }
+    if let Some(previous) = hosting.take() {
+        previous.shutdown(events);
+    }
+
+    match start_hosting(&name, events, beacon_port, liveness, data_dir).await {
+        Ok((started, session)) => {
+            *hosting = Some(started);
+            *active = session;
+        }
+        Err(e) => {
+            let _ = events.send(UiEvent::Error(e));
+        }
+    }
+}
+
 async fn run(
     events: Sender<UiEvent>,
     cmds: Receiver<UiCommand>,
@@ -258,24 +296,50 @@ async fn run(
 ) {
     tokio::spawn(browse_loop(events.clone(), beacon_port));
 
+    // 本机是不是已经有这个端口的房间了？有就在侧栏给一个「回到我的房间」的入口
+    if let Some(messages) = local_room_messages(&data_dir, beacon_port).await {
+        let _ = events.send(UiEvent::LocalRoom { messages });
+    }
+
     let mut active: Option<Active> = None;
     let mut hosting: Option<Hosting> = None;
 
     while let Ok(cmd) = cmds.recv_async().await {
         match cmd {
             UiCommand::Host { name } => {
-                // 先回收旧资源：旧房间的 endpoint、广播、人数定时器
-                if let Some(previous) = hosting.take() {
-                    previous.shutdown();
-                }
+                start_new_room(
+                    name,
+                    &mut hosting,
+                    &mut active,
+                    &events,
+                    beacon_port,
+                    liveness,
+                    &data_dir,
+                )
+                .await;
+            }
+
+            UiCommand::NewRoom { name } => {
+                // 同上：先结束会话再关托管，别让连接先断
                 if let Some(previous) = active.take() {
                     previous.end().await;
                 }
+                if let Some(previous) = hosting.take() {
+                    previous.shutdown(&events);
+                }
 
-                match start_hosting(&name, &events, beacon_port, liveness, &data_dir).await {
-                    Ok((started, session)) => {
-                        hosting = Some(started);
-                        active = session;
+                match reset_local_room(&data_dir, beacon_port) {
+                    Ok(()) => {
+                        start_new_room(
+                            name,
+                            &mut hosting,
+                            &mut active,
+                            &events,
+                            beacon_port,
+                            liveness,
+                            &data_dir,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         let _ = events.send(UiEvent::Error(e));
@@ -303,11 +367,15 @@ async fn run(
                 }
             }
 
-            UiCommand::Join { name } => {
-                if let Some(session) = &active {
+            UiCommand::Join { name } => match &active {
+                Some(session) => {
                     let _ = session.tx.send(SessionCmd::Join(name));
                 }
-            }
+                // 没有会话时点「加入」不能一声不吭，否则看起来就是界面卡住了
+                None => {
+                    let _ = events.send(UiEvent::Error("还没有连上房间".into()));
+                }
+            },
 
             UiCommand::Leave => {
                 if let Some(session) = &active {

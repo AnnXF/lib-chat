@@ -19,11 +19,45 @@ pub(super) struct Active {
     pub(super) task: tokio::task::JoinHandle<()>,
 }
 
+/// 等会话结束的上限。正常退出只要几十毫秒，拖这么久说明它卡在某次握手里了。
+const STOP_TIMEOUT: Duration = Duration::from_secs(2);
+
 impl Active {
     /// 结束会话。切换房间时先退出旧房间，让对端的在线人数立刻回落。
     pub(super) async fn end(self) {
         let _ = self.tx.send(SessionCmd::Stop);
-        let _ = self.task.await;
+        // 会话若正卡在一次连接握手里（那一步不处理指令），不能让它把整个后端循环一起拖住，
+        // 否则之后所有指令——包括连接别的房间——都排不上队，界面看起来就是「所有房间都点不动」。
+        let _ = tokio::time::timeout(STOP_TIMEOUT, self.task).await;
+        // `tx` 随 self 析构，通道关闭也会催会话退出
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归：会话若不听指令（卡在一次不轮询指令的等待里），`end` 也必须带超时返回。
+    ///
+    /// 后端是单线程串行处理指令的，`end` 一旦挂住，后面的建/切房间就全排不上队，
+    /// 界面看起来就是「所有房间都点不动」。
+    #[tokio::test]
+    async fn end_gives_up_on_a_session_that_ignores_stop() {
+        let (tx, _rx) = flume::unbounded();
+        // 一个既不读指令、也不会结束的会话任务
+        let task = tokio::spawn(std::future::pending::<()>());
+        let active = Active {
+            room: RoomId::new(),
+            tx,
+            task,
+        };
+
+        let started = tokio::time::Instant::now();
+        let ended = tokio::time::timeout(STOP_TIMEOUT * 2, active.end()).await;
+        let elapsed = started.elapsed();
+
+        assert!(ended.is_ok(), "end 必须带超时，实际耗时 {elapsed:?}");
+        assert!(elapsed < STOP_TIMEOUT * 2, "end 不该等这么久：{elapsed:?}");
     }
 }
 
@@ -45,9 +79,31 @@ struct Target {
 impl Target {
     /// 建立一条连接。首次连接与重连走的是同一条路径。
     async fn connect(&self) -> Result<Arc<dyn Connection>, ChatError> {
-        let conn = connect_with(self.addr, self.fingerprint.as_deref(), self.liveness).await?;
-        Ok(Arc::new(conn))
+        Ok(Arc::new(
+            connect_once(self.addr, self.fingerprint.as_deref(), self.liveness).await?,
+        ))
     }
+}
+
+/// 建连超时。房间重建会换端口，房间列表里残留的旧地址就再也没人应了。
+///
+/// 没有超时的话，一次握手会一直挂到 QUIC 空闲超时（默认 60 秒）；而后端是串行处理指令的，
+/// 这一挂就是「点了没反应」——换房间、建房、加入全排不上队。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 建一条连接，带超时。首次连接与重连共用同一份超时策略。
+async fn connect_once(
+    addr: SocketAddr,
+    fingerprint: Option<&str>,
+    liveness: Liveness,
+) -> Result<QuicConnection, ChatError> {
+    let connected = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        connect_with(addr, fingerprint, liveness),
+    )
+    .await
+    .map_err(|_| ChatError::Transport(format!("连接超时（{CONNECT_TIMEOUT:?}）")))?;
+    connected
 }
 
 /// 一条连接上的服务是怎么结束的。
@@ -71,7 +127,7 @@ pub(super) async fn open_session(
 
     // 先连一次：既把「连不上」尽早报给界面，也拿到房间标识。
     // 这条连接直接交给会话任务，不必重复握手。
-    let first = connect_with(addr, fingerprint.as_deref(), liveness)
+    let first = connect_once(addr, fingerprint.as_deref(), liveness)
         .await
         .map_err(|e| format!("连接失败: {e}"))?;
     let target = Target {
