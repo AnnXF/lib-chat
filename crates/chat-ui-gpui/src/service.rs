@@ -16,6 +16,7 @@ mod session;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -23,7 +24,7 @@ use std::time::Duration;
 use chat_client::Client;
 use chat_core::{ChatError, Connection, ConnectionAcceptor};
 use chat_discovery::{RoomAnnouncer, RoomBrowser};
-use chat_proto::{LobbyInfo, RoomId, ServerEvent, UserId};
+use chat_proto::{LobbyInfo, Message, RoomId, Seq, ServerEvent, UserId};
 use chat_server::{Acceptor, Server};
 use chat_transport_quic::{Liveness, QuicServer, connect, connect_with};
 use discovery::browse_loop;
@@ -43,8 +44,9 @@ async fn start_hosting(
     events: &Sender<UiEvent>,
     beacon_port: u16,
     liveness: Liveness,
+    data_dir: &Path,
 ) -> Result<(Hosting, Option<Active>), String> {
-    let started = start_host(name, events, beacon_port, liveness).await?;
+    let started = start_host(name, events, beacon_port, liveness, data_dir).await?;
 
     let alive = Arc::new(AtomicBool::new(true));
     let visible = Arc::new(AtomicBool::new(true));
@@ -87,6 +89,21 @@ const LEAVE_GRACE: Duration = Duration::from_millis(80);
 /// 「正在重连」上。
 const RECONNECT_WINDOW: Duration = Duration::from_secs(60);
 
+/// 加入房间时拉取的最近消息条数。
+const HISTORY_LIMIT: u32 = 50;
+/// 往上翻一页的条数。
+const OLDER_PAGE: u32 = 50;
+/// 重连后每次追平的条数上限；还有更多就继续拉。
+const SYNC_LIMIT: u32 = 200;
+
+/// 一条补齐回来的消息。
+#[derive(Clone, Debug)]
+pub struct HistoryMessage {
+    pub sender_id: UserId,
+    pub sender: String,
+    pub text: String,
+}
+
 #[derive(Clone, Debug)]
 pub enum UiEvent {
     Status(String),
@@ -127,9 +144,27 @@ pub enum UiEvent {
         sender: String,
         text: String,
     },
+    /// 取回的一页历史（比当前会话更早），界面应插到列表最前。
+    History {
+        room: RoomId,
+        messages: Vec<HistoryMessage>,
+        /// 还能继续往前翻更早的消息。
+        has_more: bool,
+    },
+    /// 重连后追平的漏收消息（晚于当前会话），界面应追加到列表末尾。
+    Missed {
+        room: RoomId,
+        messages: Vec<HistoryMessage>,
+    },
     Presence {
         room: RoomId,
         online: u32,
+    },
+    /// 某个房间已经探不到了，应从列表里摘掉。
+    ///
+    /// 房主被强杀时不会有任何告别信号，只能靠连续探测失败发现。
+    RoomGone {
+        room: RoomId,
     },
     /// 连接断开、正在自动重连。房间与聊天记录都应保留，不要把人踢出去。
     Reconnecting(String),
@@ -153,6 +188,8 @@ pub enum UiCommand {
     Send {
         text: String,
     },
+    /// 往前翻一页更早的历史。
+    LoadOlder,
 }
 
 /// 启动后端线程，返回指令通道与事件通道。
@@ -169,6 +206,18 @@ pub fn spawn_on(beacon_port: u16) -> (Sender<UiCommand>, Receiver<UiEvent>) {
 ///
 /// 活性参数主要供测试使用：把空闲超时压到秒级，就能在不必真等 30 秒的前提下检验自动重连。
 pub fn spawn_with(beacon_port: u16, liveness: Liveness) -> (Sender<UiCommand>, Receiver<UiEvent>) {
+    spawn_with_data(beacon_port, liveness, default_data_dir())
+}
+
+/// 指定数据目录启动后端。
+///
+/// 消息库落在该目录下，文件名带广播端口——所以**数据目录加端口**才是房间的真正边界。
+/// 测试用它把库关进临时目录，不去碰真实数据。
+pub fn spawn_with_data(
+    beacon_port: u16,
+    liveness: Liveness,
+    data_dir: PathBuf,
+) -> (Sender<UiCommand>, Receiver<UiEvent>) {
     let (cmd_tx, cmd_rx) = flume::unbounded();
     let (ev_tx, ev_rx) = flume::unbounded();
 
@@ -185,11 +234,19 @@ pub fn spawn_with(beacon_port: u16, liveness: Liveness) -> (Sender<UiCommand>, R
                 let _ = report.send(UiEvent::Error("后端运行时启动失败".into()));
                 return;
             };
-            runtime.block_on(run(ev_tx, cmd_rx, beacon_port, liveness));
+            runtime.block_on(run(ev_tx, cmd_rx, beacon_port, liveness, data_dir));
         })
         .expect("启动后端线程失败");
 
     (cmd_tx, ev_rx)
+}
+
+/// 消息库所在目录：`$HOME/.lib-chat/rooms`，家目录不可用时退回临时目录。
+fn default_data_dir() -> PathBuf {
+    let base = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(".lib-chat").join("rooms")
 }
 
 async fn run(
@@ -197,6 +254,7 @@ async fn run(
     cmds: Receiver<UiCommand>,
     beacon_port: u16,
     liveness: Liveness,
+    data_dir: PathBuf,
 ) {
     tokio::spawn(browse_loop(events.clone(), beacon_port));
 
@@ -214,7 +272,7 @@ async fn run(
                     previous.end().await;
                 }
 
-                match start_hosting(&name, &events, beacon_port, liveness).await {
+                match start_hosting(&name, &events, beacon_port, liveness, &data_dir).await {
                     Ok((started, session)) => {
                         hosting = Some(started);
                         active = session;
@@ -260,6 +318,12 @@ async fn run(
             UiCommand::Send { text } => {
                 if let Some(session) = &active {
                     let _ = session.tx.send(SessionCmd::Send(text));
+                }
+            }
+
+            UiCommand::LoadOlder => {
+                if let Some(session) = &active {
+                    let _ = session.tx.send(SessionCmd::LoadOlder);
                 }
             }
         }

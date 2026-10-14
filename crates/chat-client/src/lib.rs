@@ -56,6 +56,13 @@ impl Client {
             .await
     }
 
+    /// 补齐 `after` 之后的增量，用于重连后追平断线期间的消息。
+    pub async fn sync(&self, room: RoomId, after: Seq, limit: u32) -> Result<()> {
+        self.conn
+            .request(ClientRequest::Sync { room, after, limit })
+            .await
+    }
+
     /// 等待下一个服务端事件。
     pub async fn next_event(&self) -> Result<ServerEvent> {
         self.conn.next_event().await

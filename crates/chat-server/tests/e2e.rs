@@ -270,3 +270,47 @@ async fn history_returns_recent_messages() {
         _ => unreachable!(),
     }
 }
+
+#[tokio::test]
+async fn sync_returns_messages_after_cursor() {
+    let server = Server::new("room");
+    let room = server.room();
+    let a = Client::new(server.connect(DeviceId::new()).await);
+
+    a.join(room, "Alice").await.unwrap();
+    wait_for(&a, |e| matches!(e, ServerEvent::Joined { .. })).await;
+
+    for i in 1..=5 {
+        a.send_text(room, format!("m{i}")).await.unwrap();
+    }
+    for _ in 1..=5 {
+        wait_for(&a, |e| matches!(e, ServerEvent::Message { .. })).await;
+    }
+
+    // 只补游标之后的部分
+    a.sync(room, 2, 10).await.unwrap();
+    match wait_for(&a, |e| matches!(e, ServerEvent::Sync { .. })).await {
+        ServerEvent::Sync {
+            messages, has_more, ..
+        } => {
+            assert_eq!(messages.len(), 3);
+            assert_eq!(messages[0].text, "m3");
+            assert_eq!(messages[2].text, "m5");
+            assert!(!has_more, "已追到最新，不应再提示还有更多");
+        }
+        _ => unreachable!(),
+    }
+
+    // 缺口超过一页时靠 has_more 翻页
+    a.sync(room, 0, 2).await.unwrap();
+    match wait_for(&a, |e| matches!(e, ServerEvent::Sync { .. })).await {
+        ServerEvent::Sync {
+            messages, has_more, ..
+        } => {
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0].text, "m1");
+            assert!(has_more);
+        }
+        _ => unreachable!(),
+    }
+}

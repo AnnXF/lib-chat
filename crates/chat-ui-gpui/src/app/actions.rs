@@ -37,6 +37,17 @@ impl ChatApp {
         }
     }
 
+    /// 消息区滑到最顶时再往前翻一页。
+    ///
+    /// 这里只喊一声：能不能翻、还有没有更早的，交给会话层判断。
+    pub(crate) fn load_older(&mut self, cx: &mut Context<Self>) {
+        if !self.has_older || self.loading_older {
+            return;
+        }
+        self.loading_older = true;
+        self.tell(UiCommand::LoadOlder, cx);
+    }
+
     pub(crate) fn connect_from_input(&mut self, cx: &mut Context<Self>) {
         let addr = self.addr_input.read(cx).content().trim().to_string();
         if !addr.is_empty() {
@@ -52,7 +63,9 @@ impl ChatApp {
     ) {
         // 换房间是一次明确的离开，旧房间的视图与记录先清干净
         self.room = None;
-        self.lines.clear();
+        self.clear_lines();
+        self.has_older = true;
+        self.loading_older = false;
         self.status = format!("正在连接 {addr} …");
         self.tell(UiCommand::Connect { addr, fingerprint }, cx);
     }

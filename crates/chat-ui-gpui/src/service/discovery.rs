@@ -1,5 +1,13 @@
+use std::time::Instant;
+
 use super::protocol::await_lobby;
 use super::*;
+
+/// 连续探测失败这么多次，就当房间已经不在了。
+///
+/// 房主被强杀时不会留下任何告别信号：广播停了，但没人会通知我们。只凭「收不到广播」
+/// 判断会把 WiFi 抖动误伤成房间消失，所以在同一条「连不上」的信号上连续计数。
+const PROBE_FAILURES_BEFORE_DROP: u32 = 3;
 
 /// 已发现的房间。候选地址按可达性排序，非回环优先。
 #[derive(Clone)]
@@ -7,7 +15,25 @@ struct KnownRoom {
     name: String,
     fingerprint: String,
     addrs: Vec<SocketAddr>,
+    /// 连续探测失败次数，探到一次就清零。
+    failures: u32,
+    /// 上次探测时刻：广播每 2 秒就会重复播报，不必每次都重新握手。
+    last_probed: Option<Instant>,
 }
+
+impl KnownRoom {
+    fn new(name: String, fingerprint: String) -> Self {
+        Self {
+            name,
+            fingerprint,
+            addrs: Vec::new(),
+            failures: 0,
+            last_probed: None,
+        }
+    }
+}
+
+type Rooms = Arc<tokio::sync::Mutex<HashMap<RoomId, KnownRoom>>>;
 
 /// 持续浏览局域网房间，并周期复查各自人数。
 pub(super) async fn browse_loop(events: Sender<UiEvent>, beacon_port: u16) {
@@ -20,35 +46,26 @@ pub(super) async fn browse_loop(events: Sender<UiEvent>, beacon_port: u16) {
     };
 
     // 按房间标识去重：mDNS 与 UDP 广播会重复播报同一个房间
-    let known: Arc<tokio::sync::Mutex<HashMap<RoomId, KnownRoom>>> =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let known: Rooms = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
+    // 周期复查：房间消失时没有任何通知，只能靠探测发现
     {
         let known = Arc::clone(&known);
         let events = events.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(PROBE_INTERVAL).await;
-                let rooms: Vec<(RoomId, KnownRoom)> = known
-                    .lock()
-                    .await
-                    .iter()
-                    .map(|(room, entry)| (*room, entry.clone()))
-                    .collect();
-                for (room, entry) in rooms {
-                    probe_room(room, &entry, &events).await;
-                }
+                let due = take_due(&known, None).await;
+                probe_all(&known, due, &events).await;
             }
         });
     }
 
     while let Ok(announcement) = browser.next_room().await {
-        let entry = {
-            let mut known = known.lock().await;
-            let entry = known.entry(announcement.room).or_insert_with(|| KnownRoom {
-                name: announcement.name.clone(),
-                fingerprint: announcement.fingerprint.clone(),
-                addrs: Vec::new(),
+        {
+            let mut map = known.lock().await;
+            let entry = map.entry(announcement.room).or_insert_with(|| {
+                KnownRoom::new(announcement.name.clone(), announcement.fingerprint.clone())
             });
             entry.name = announcement.name.clone();
             entry.fingerprint = announcement.fingerprint.clone();
@@ -59,24 +76,84 @@ pub(super) async fn browse_loop(events: Sender<UiEvent>, beacon_port: u16) {
             }
             // 非回环优先：跨机必须用它，同机也照样可用
             entry.addrs.sort_by_key(|addr| addr.ip().is_loopback());
-            entry.clone()
-        };
-        probe_room(announcement.room, &entry, &events).await;
+        }
+        let due = take_due(&known, Some(announcement.room)).await;
+        probe_all(&known, due, &events).await;
     }
 }
 
-/// 连一下房间只为读大厅摘要，随后断开——未加入者拿不到任何消息。
+/// 挑出「该复查了」的房间，并记下时刻。`only` 为 `None` 表示所有房间都参与挑选。
+async fn take_due(known: &Rooms, only: Option<RoomId>) -> Vec<(RoomId, KnownRoom)> {
+    let mut map = known.lock().await;
+    let now = Instant::now();
+    let mut due = Vec::new();
+
+    for (room, entry) in map.iter_mut() {
+        if only.is_some_and(|wanted| wanted != *room) {
+            continue;
+        }
+        // 广播每 2 秒重复播报一次，刚探过的不必再握手一遍
+        if entry
+            .last_probed
+            .is_some_and(|at| now.duration_since(at) < PROBE_INTERVAL)
+        {
+            continue;
+        }
+        entry.last_probed = Some(now);
+        due.push((*room, entry.clone()));
+    }
+    due
+}
+
+/// 并发探测一批房间，并按结果淘汰连续失败到阈值的那些。
+async fn probe_all(known: &Rooms, rooms: Vec<(RoomId, KnownRoom)>, events: &Sender<UiEvent>) {
+    // 各探各的：某个地址不可达时只拖慢它自己，不会把整批房间一起卡住
+    let mut handles = Vec::with_capacity(rooms.len());
+    for (room, entry) in rooms {
+        let events = events.clone();
+        handles.push(tokio::spawn(async move {
+            (room, probe_room(room, &entry, &events).await)
+        }));
+    }
+
+    for handle in handles {
+        let Ok((room, alive)) = handle.await else {
+            continue;
+        };
+        let mut map = known.lock().await;
+        let too_many_failures = {
+            let Some(entry) = map.get_mut(&room) else {
+                continue;
+            };
+            if alive {
+                entry.failures = 0;
+                false
+            } else {
+                entry.failures += 1;
+                entry.failures >= PROBE_FAILURES_BEFORE_DROP
+            }
+        };
+        if too_many_failures {
+            map.remove(&room);
+            drop(map);
+            let _ = events.send(UiEvent::RoomGone { room });
+        }
+    }
+}
+
+/// 探测一个房间：连一下、读大厅摘要、断开。返回是否探到摘要。
 ///
-/// 依次尝试候选地址，只播报第一个能拿到摘要的地址，避免同一房间出现多条记录。
-async fn probe_room(room: RoomId, known: &KnownRoom, events: &Sender<UiEvent>) {
+/// 每个地址都带超时：房主被强杀时地址会在广播残留期间一直不可达，而 QUIC 连接要等到
+/// 空闲超时才失败（默认 60 秒）——没有超时的话，一次探测就能把整个发现功能拖死。
+async fn probe_room(room: RoomId, known: &KnownRoom, events: &Sender<UiEvent>) -> bool {
     let expected = (!known.fingerprint.is_empty()).then_some(known.fingerprint.as_str());
 
     for addr in &known.addrs {
-        let Ok(conn) = connect(*addr, expected).await else {
+        let Ok(Ok(conn)) = tokio::time::timeout(PROBE_TIMEOUT, connect(*addr, expected)).await
+        else {
             continue;
         };
-        let conn = Arc::new(conn);
-        let dyn_conn: Arc<dyn Connection> = conn.clone();
+        let dyn_conn: Arc<dyn Connection> = Arc::new(conn);
         let client = Client::new(dyn_conn);
         if client.lobby(room).await.is_err() {
             continue;
@@ -96,7 +173,40 @@ async fn probe_room(room: RoomId, known: &KnownRoom, events: &Sender<UiEvent>) {
                 fingerprint: known.fingerprint.clone(),
                 online: info.online_count,
             });
-            return;
+            return true;
         }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归：不可达地址必须**很快**放弃。
+    ///
+    /// 曾经没有超时，`connect` 会一直挂到 QUIC 空闲超时（默认 60 秒）才失败；而探测是
+    /// 串行的，一个被强杀的房间就能让房间发现功能彻底停摆。
+    #[tokio::test]
+    async fn gives_up_quickly_on_unreachable_room() {
+        let (events, _rx) = flume::unbounded();
+        let dead = KnownRoom {
+            name: "已经没人了".into(),
+            fingerprint: String::new(),
+            // 192.0.2.0/24 是 TEST-NET-1，保证不会有主机应答
+            addrs: vec!["192.0.2.1:45678".parse().unwrap()],
+            failures: 0,
+            last_probed: None,
+        };
+
+        let started = Instant::now();
+        let alive = probe_room(RoomId::new(), &dead, &events).await;
+        let elapsed = started.elapsed();
+
+        assert!(!alive, "不可达地址不应算探测成功");
+        assert!(
+            elapsed < PROBE_TIMEOUT * 2,
+            "探测必须带超时，否则会拖住整个发现循环；实际耗时 {elapsed:?}"
+        );
     }
 }

@@ -74,17 +74,26 @@ impl MessageStore for InMemoryStore {
         let Some(log) = guard.get(&room) else {
             return Ok(Vec::new());
         };
+
+        // `messages` 按 seq 递增，所以「早于 cutoff」的部分一定是个前缀，可以二分定位。
+        // 只克隆末尾的 limit 条——先 clone 全部再截断会让耗时随房间总量线性增长，
+        // 取 50 条也要把几万条消息连同正文复制一遍。
         let cutoff = before.unwrap_or(Seq::MAX);
-        let mut out: Vec<Message> = log
-            .messages
-            .iter()
-            .filter(|m| m.seq < cutoff)
-            .cloned()
-            .collect();
-        if out.len() > limit {
-            out.drain(..out.len() - limit);
-        }
-        Ok(out)
+        let end = log.messages.partition_point(|m| m.seq < cutoff);
+        let start = end.saturating_sub(limit);
+        Ok(log.messages[start..end].to_vec())
+    }
+
+    async fn since(&self, room: RoomId, after: Seq, limit: usize) -> Result<Vec<Message>> {
+        let guard = self.inner.lock().await;
+        let Some(log) = guard.get(&room) else {
+            return Ok(Vec::new());
+        };
+
+        // 与 `history` 同理：按 seq 递增二分定位，只克隆命中的那段。
+        let start = log.messages.partition_point(|m| m.seq <= after);
+        let end = (start + limit).min(log.messages.len());
+        Ok(log.messages[start..end].to_vec())
     }
 
     async fn latest_seq(&self, room: RoomId) -> Result<Seq> {
@@ -125,8 +134,18 @@ impl Server {
     }
 
     pub fn with_store(name: impl Into<String>, store: Arc<dyn MessageStore>) -> Arc<Self> {
+        Self::with_room(RoomId::new(), name, store)
+    }
+
+    /// 指定房间标识构造。落库场景下房间由库决定，不能每次重新生成，
+    /// 否则重启后读不回已有的历史。
+    pub fn with_room(
+        room: RoomId,
+        name: impl Into<String>,
+        store: Arc<dyn MessageStore>,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            room: RoomId::new(),
+            room,
             name: name.into(),
             store,
             conns: RwLock::new(HashMap::new()),
@@ -396,6 +415,29 @@ impl Server {
                 self.send_to(
                     conn,
                     ServerEvent::History {
+                        room: self.room,
+                        messages,
+                        has_more,
+                    },
+                )
+                .await;
+            }
+
+            ClientRequest::Sync { room, after, limit } => {
+                if room != self.room {
+                    self.error_to(conn, ErrorCode::RoomMismatch, "房间不存在").await;
+                    return Ok(());
+                }
+                if self.member_of(conn).await.is_none() {
+                    self.error_to(conn, ErrorCode::NotJoined, "未加入房间").await;
+                    return Ok(());
+                }
+                let limit = limit.clamp(1, 200) as usize;
+                let messages = self.store.since(self.room, after, limit).await?;
+                let has_more = messages.len() == limit;
+                self.send_to(
+                    conn,
+                    ServerEvent::Sync {
                         room: self.room,
                         messages,
                         has_more,

@@ -10,7 +10,9 @@ mod chat;
 mod header;
 mod sidebar;
 
-use gpui::{AnyElement, App, Context, MouseButton, MouseUpEvent, Window, div, prelude::*, px, rgb};
+use gpui::{
+    AnyElement, App, Context, MouseButton, MouseUpEvent, Window, div, list, prelude::*, px, rgb,
+};
 
 use crate::app::theme;
 
@@ -83,6 +85,8 @@ fn render_line(line: &ChatLine) -> AnyElement {
     if line.system {
         return div()
             .w_full()
+            .px_5()
+            .py_2()
             .flex()
             .flex_row()
             .justify_center()
@@ -109,6 +113,8 @@ fn render_line(line: &ChatLine) -> AnyElement {
 
     div()
         .w_full()
+        .px_5()
+        .py_2()
         .flex()
         .flex_col()
         .when_else(
@@ -125,4 +131,40 @@ fn render_line(line: &ChatLine) -> AnyElement {
         )
         .child(body)
         .into_any_element()
+}
+
+#[cfg(test)]
+mod perf {
+    use super::*;
+    use std::time::Instant;
+
+    /// 性能特征测量：构造单条消息元素的成本。
+    ///
+    /// 列表是虚拟化的，每帧只对可见的那些条调用这个函数，所以这个数乘上可见条数
+    /// 就是每帧的渲染开销——与消息总量无关。
+    ///
+    /// 只打印不断言——它是用来复现结论的标尺，不是回归门槛（时间断言在 CI 上不稳定）。
+    /// 用 `cargo test --release -- --nocapture line_element_cost` 查看。
+    #[test]
+    fn line_element_cost() {
+        for count in [1_000usize, 10_000, 50_000] {
+            let lines: Vec<ChatLine> = (0..count)
+                .map(|i| ChatLine {
+                    sender: "某人".into(),
+                    text: format!("这是第 {i} 条消息，长度大约二十来个字"),
+                    mine: i % 2 == 0,
+                    system: false,
+                })
+                .collect();
+
+            let started = Instant::now();
+            let elements: Vec<AnyElement> = lines.iter().map(render_line).collect();
+            let elapsed = started.elapsed();
+            println!(
+                "{count:>7} 条 → 构造元素 {elapsed:>10.2?}（{:.2}µs/条）",
+                elapsed.as_secs_f64() * 1e6 / count as f64
+            );
+            std::hint::black_box(elements);
+        }
+    }
 }

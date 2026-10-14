@@ -6,6 +6,8 @@ pub(super) enum SessionCmd {
     Join(String),
     Leave,
     Send(String),
+    /// 往前翻一页更早的历史。
+    LoadOlder,
     /// 结束会话：先退出房间再关闭连接。
     Stop,
 }
@@ -120,6 +122,16 @@ struct Session {
     attempt: u32,
     /// 本轮断线到什么时候放弃重连；连上后清空。
     give_up_at: Option<tokio::time::Instant>,
+    /// 已收到的最大 seq；重连后据此补齐断线期间漏掉的消息。
+    cursor: Seq,
+    /// 首次加入要拉一次最近历史；之后的重连只补缺口。
+    needs_history: bool,
+    /// 已拿到的最早一条 seq，作为往更早翻的游标。
+    oldest: Option<Seq>,
+    /// 服务端说更早的消息还有。
+    has_older: bool,
+    /// 有一页还没回来，避免滚动回调重复触发。
+    loading_older: bool,
 }
 
 impl Session {
@@ -137,6 +149,11 @@ impl Session {
             next: Some(first),
             attempt: 0,
             give_up_at: None,
+            cursor: 0,
+            needs_history: true,
+            oldest: None,
+            has_older: true,
+            loading_older: false,
         }
     }
 
@@ -228,6 +245,7 @@ impl Session {
             tokio::select! {
                 event = client.next_event() => match event {
                     Ok(event) => {
+                        self.observe(client, &event).await;
                         // 界面已经没了，会话没必要继续
                         if self.events.send(map_event(event)).is_err() {
                             let _ = client.close().await;
@@ -260,8 +278,89 @@ impl Session {
                             let _ = self.events.send(UiEvent::Error(format!("发送失败: {e}")));
                         }
                     }
+                    Ok(SessionCmd::LoadOlder) => self.load_older(client).await,
                 },
             }
+        }
+    }
+
+    /// 跟踪消息序号，并把界面还没看到的那些消息拉回来。
+    ///
+    /// 断线期间服务端推的消息会丢失，而重连后服务端会再发一次 `Joined`，借它把缺口补齐；
+    /// 首次加入则拉最近一页历史，否则进了房间也是空的。
+    async fn observe(&mut self, client: &Client, event: &ServerEvent) {
+        match event {
+            ServerEvent::Message { message } => self.advance(std::slice::from_ref(message)),
+
+            ServerEvent::Joined { latest_seq, .. } if self.needs_history => {
+                self.needs_history = false;
+                // 只取最近一页，缺的那段早期历史不追——拉全量会随房间增长越来越慢
+                self.cursor = self.cursor.max(*latest_seq);
+                let _ = client
+                    .history(self.target.room, None, HISTORY_LIMIT)
+                    .await;
+            }
+
+            ServerEvent::Joined { latest_seq, .. } if *latest_seq > self.cursor => {
+                let _ = client
+                    .sync(self.target.room, self.cursor, SYNC_LIMIT)
+                    .await;
+            }
+
+            ServerEvent::History {
+                messages, has_more, ..
+            } => {
+                self.advance(messages);
+                self.loading_older = false;
+                self.has_older = *has_more;
+                // 游标挪到这一页的最早一条，下一页从它继续往前取
+                if let Some(first) = messages.first() {
+                    self.oldest = Some(first.seq);
+                }
+            }
+
+            ServerEvent::Sync {
+                messages, has_more, ..
+            } => {
+                self.advance(messages);
+                // 缺口可能不止一页，继续拉到追平为止
+                if *has_more {
+                    let _ = client
+                        .sync(self.target.room, self.cursor, SYNC_LIMIT)
+                        .await;
+                }
+            }
+
+            _ => {}
+        }
+    }
+
+    /// 往前翻一页更早的历史。
+    ///
+    /// 界面滑到顶喊一声就行，能不能翻、从哪翻由这里决定。
+    async fn load_older(&mut self, client: &Client) {
+        if self.loading_older || !self.has_older {
+            return;
+        }
+        // 初始那一页还没回来，等它把游标定下来
+        let Some(oldest) = self.oldest else {
+            return;
+        };
+
+        self.loading_older = true;
+        if client
+            .history(self.target.room, Some(oldest), OLDER_PAGE)
+            .await
+            .is_err()
+        {
+            self.loading_older = false;
+        }
+    }
+
+    /// 把已看到的序号推进到这批消息之后。
+    fn advance(&mut self, messages: &[Message]) {
+        if let Some(last) = messages.last() {
+            self.cursor = self.cursor.max(last.seq);
         }
     }
 
@@ -300,6 +399,8 @@ impl Session {
                         .events
                         .send(UiEvent::Error("发送失败: 尚未重新连接".into()));
                 }
+                // 断线期间翻不了历史，重连后界面再滑到顶会重新发
+                Ok(Ok(SessionCmd::LoadOlder)) => {}
                 Err(_) => return true,
             }
         }

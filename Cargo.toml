@@ -13,6 +13,7 @@ chat-server = { path = "crates/chat-server" }
 chat-client = { path = "crates/chat-client" }
 chat-discovery = { path = "crates/chat-discovery" }
 chat-transport-quic = { path = "crates/chat-transport-quic" }
+store-sqlite = { path = "crates/store-sqlite" }
 
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
@@ -20,3 +21,5 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "io-util"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+sea-query = "0.32"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }

@@ -23,7 +23,7 @@ pub mod widgets;
 pub use model::{ChatLine, DiscoveredRoom, RoomView};
 
 use chat_proto::{RoomId, UserId};
-use gpui::{Context, Entity, Render, Window, div, prelude::*, rgb};
+use gpui::{Context, Entity, ListAlignment, ListState, Render, Window, div, prelude::*, px, rgb};
 
 use crate::service::{self, UiCommand};
 
@@ -37,6 +37,12 @@ pub struct ChatApp {
     rooms: Vec<DiscoveredRoom>,
     room: Option<RoomView>,
     lines: Vec<ChatLine>,
+    /// 消息列表的虚拟化状态；项数必须与 `lines` 始终一致，否则渲染会越界。
+    list: ListState,
+    /// 服务端那边还有更早的消息可以往前翻。
+    has_older: bool,
+    /// 有一页更早的历史还在路上；避免滚动回调反复发同一个请求。
+    loading_older: bool,
     status: String,
     hosted: Option<String>,
     /// 我在当前房间的身份；用于判断消息是不是自己发的。
@@ -92,6 +98,16 @@ impl ChatApp {
         })
         .detach();
 
+        // 滚到最顶就再往前翻一页；能不能翻、还有没有更早的，交给会话层判断
+        let list = ListState::new(0, ListAlignment::Bottom, px(200.));
+        let this = cx.entity().downgrade();
+        list.set_scroll_handler(move |event, _window, cx| {
+            if event.visible_range.start > 0 {
+                return;
+            }
+            let _ = this.update(cx, |app, cx| app.load_older(cx));
+        });
+
         Self {
             cmd_tx,
             nickname,
@@ -100,6 +116,9 @@ impl ChatApp {
             rooms: Vec::new(),
             room: None,
             lines: Vec::new(),
+            list,
+            has_older: true,
+            loading_older: false,
             status: "正在搜索局域网房间…".into(),
             hosted: None,
             my_id: None,
@@ -122,5 +141,34 @@ impl Render for ChatApp {
             .text_sm()
             .child(header)
             .child(div().flex().flex_row().flex_1().child(sidebar).child(main))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 消息列表的项数由 `ListState` 自己记着，而它只认「旧区间被新项替换」这一种说法。
+    /// 这里把 [`ChatApp`] 各处用到的那几种写法钉住，免得哪天写成越界的区间。
+    #[test]
+    fn list_state_item_count_follows_splice() {
+        let list = ListState::new(0, ListAlignment::Bottom, px(0.));
+        assert_eq!(list.item_count(), 0);
+
+        // 追加一条：空区间放在末尾
+        list.splice(0..0, 1);
+        assert_eq!(list.item_count(), 1);
+
+        // 再追加两条
+        list.splice(1..1, 2);
+        assert_eq!(list.item_count(), 3);
+
+        // 前插五条：空区间放在最前
+        list.splice(0..0, 5);
+        assert_eq!(list.item_count(), 8);
+
+        // 清空
+        list.reset(0);
+        assert_eq!(list.item_count(), 0);
     }
 }

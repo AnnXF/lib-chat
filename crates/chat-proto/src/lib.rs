@@ -100,6 +100,12 @@ pub enum ClientRequest {
         before: Option<Seq>,
         limit: u32,
     },
+    /// 补齐缺口：取 `after` 之后的增量，用于重连后追平断线期间的消息。
+    Sync {
+        room: RoomId,
+        after: Seq,
+        limit: u32,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -121,6 +127,12 @@ pub enum ServerEvent {
         message: Message,
     },
     History {
+        room: RoomId,
+        messages: Vec<Message>,
+        has_more: bool,
+    },
+    /// [`ClientRequest::Sync`] 的应答，按 seq 升序。`has_more` 表示之后还有更新。
+    Sync {
         room: RoomId,
         messages: Vec<Message>,
         has_more: bool,

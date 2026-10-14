@@ -1,4 +1,5 @@
 use super::*;
+use store_sqlite::SqliteStore;
 
 /// 本机托管的房间。切换房间或重新建房时必须回收，否则会留下幽灵房间。
 pub(super) struct Hosting {
@@ -34,8 +35,14 @@ pub(super) async fn start_host(
     events: &Sender<UiEvent>,
     beacon_port: u16,
     liveness: Liveness,
+    data_dir: &Path,
 ) -> Result<Started, String> {
-    let server = Server::new(name);
+    // 库文件按广播端口分开：同机不同端口各是各的房间，同一个端口重启后仍是同一个房间
+    let path = data_dir.join(format!("room-{beacon_port}.db"));
+    let store = SqliteStore::open(&path)
+        .await
+        .map_err(|e| format!("打开消息库失败: {e}"))?;
+    let server = Server::with_room(store.room(), name, Arc::new(store));
     let endpoint = Arc::new(
         QuicServer::bind_with(SocketAddr::from(([0, 0, 0, 0], 0)), liveness)
             .map_err(|e| e.to_string())?,

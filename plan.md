@@ -32,59 +32,26 @@
 ### 1.1 分层与依赖方向（面向接口）
 
 ```
-chat-proto     协议 DTO：客户端 <-> 服务端，与具体传输解耦（serde + 版本协商）
-chat-core      领域模型 + 端口 trait（存储/推送/鉴权/媒体），无传输细节
+chat-proto     协议 DTO：客户端 <-> 服务端，与具体传输解耦（serde）
+chat-core      领域模型 + 端口 trait（连接 / 存储），无传输细节
    ▲
-   ├── store-postgres   服务端存储（sea-query + sqlx）
-   ├── store-sqlite     客户端本地缓存（sea-query + sqlx）
-   ├── media-fs / media-s3
-   └── bus-nats / bus-inproc   节点间消息总线（单机用 inproc）
+   ├── store-sqlite         消息落库（sea-query + sqlx）
+   ├── chat-server          房间状态、在线人数、扇出
+   ├── chat-discovery       局域网发现（mDNS + UDP 广播）
+   └── chat-transport-quic  QUIC 传输 + 自签证书 + TOFU
    ▲
-chat-server    服务端：连接网关、会话、扇出、同步、媒体
-chat-client    客户端 SDK：连接管理、重连、本地缓存、事件流
+chat-client    带类型的客户端 SDK
    ▲
-chat-ui-gpui   视图层，仅消费 chat-client 的 ViewModel + 事件流
-   ▲
-bin/server     服务端可执行（可单机内嵌，也可集群部署）
-bin/client     客户端可执行
+chat-ui-gpui   桌面界面（app/ 状态与渲染、service/ 网络与托管）
+chat-cli       命令行 host / join
 ```
 
 > 面向接口编程的价值从「P2P ↔ 中继切换」转变为「**单机内嵌 ↔ 集群部署**」与「**存储/总线/媒体后端可替换**」。
 
-### 1.2 核心端口（trait 草图）
+### 1.2 核心端口
 
-```rust
-// 服务端：持久化
-#[async_trait::async_trait]
-pub trait MessageStore: Send + Sync {
-    async fn append(&self, conv: &ConvId, msg: &NewMessage) -> Result<Seq>;   // 分配会话内单调 seq
-    async fn since(&self, conv: &ConvId, cursor: Seq, limit: usize) -> Result<Vec<StoredMessage>>;
-    async fn latest_seq(&self, conv: &ConvId) -> Result<Seq>;
-}
-
-// 服务端：把会话更新投递给某个在线订阅者（单机=直接写连接；集群=发总线）
-#[async_trait::async_trait]
-pub trait Fanout: Send + Sync {
-    async fn publish(&self, conv: &ConvId, from: Seq, to: Seq) -> Result<()>;
-    async fn subscribe(&self, conv: &ConvId, sink: Box<dyn UpdateSink>);
-}
-
-// 客户端：与服务端对话的唯一出口（LAN / WAN 只是 endpoint 不同）
-#[async_trait::async_trait]
-pub trait ServerApi: Send + Sync {
-    async fn authenticate(&self, cred: Credential) -> Result<Session>;
-    async fn sync(&self, cursors: Vec<ConvCursor>) -> Result<Vec<UpdateRange>>;
-    async fn send(&self, conv: &ConvId, draft: Draft) -> Result<Seq>;
-    async fn recv(&self) -> Result<ServerEvent>;   // 长连接事件流
-}
-
-// 客户端：媒体
-#[async_trait::async_trait]
-pub trait BlobClient: Send + Sync {
-    async fn upload(&self, data: Bytes, mime: &str) -> Result<BlobId>;
-    async fn download(&self, id: &BlobId, range: Option<Range>, resume: Option<Offset>) -> Result<Bytes>;
-}
-```
+见 `crates/chat-core`：`Connection` / `RequestSink` / `ConnectionAcceptor` / `MessageStore`。
+文档不再抄一份签名，避免与代码漂移。
 
 ---
 
@@ -151,7 +118,7 @@ pub trait BlobClient: Send + Sync {
    | 点「退出房间」 | -1 |
    | 切换房间 / 关闭应用（连接断开） | -1 |
 
-3. **房主**：V1 采用「第一个启动者自动成为房主」的内嵌托管；房主退出即房间解散（V1 简单语义，不做迁移/选举）。
+3. **房主**：V1 采用「第一个启动者自动成为房主」的内嵌托管；房间随托管进程存活——房主点「退出房间」只是本人离开，房间继续广播，关窗或重新建房才结束。不做迁移/选举。
 
 **V1 明确不做**：账号体系、多端同步、单聊、万人群、公网、端到端加密、富媒体。
 
@@ -227,18 +194,21 @@ struct StoredMessage {
 - **表情包**：Unicode emoji 走字体；贴纸包为一组 blob 打包按需拉取。
 - 存储后端抽象为 `media-fs`（局域网）/ `media-s3`（公网）。
 
-### 3.6 存储
+### 3.6 存储（`store-sqlite`）
 
-- 服务端 Postgres，客户端 SQLite，统一用 `sea-query` + `sqlx`，SQL 一律通过 `Query::select()` 构造，禁止硬编码字符串。
-- 服务端表：
-  - `users(user_id, display_name, created_at)`
-  - `devices(device_id, user_id, public_key, last_seen)`
-  - `conversations(conv_id, kind, title, created_at)`
-  - `messages(conv_id, seq, msg_id, sender_id, kind, body, blob_id, server_ts)` — PK `(conv_id, seq)`
-  - `blobs(blob_id, size, mime, storage_key, state)`
-  - `receipts(conv_id, user_id, last_read_seq)`
-- 索引：`messages(conv_id, seq)` 支撑增量拉取；`messages(conv_id, sender_id, client_msg_id)` 唯一幂等。
-- 客户端缓存同构裁剪版，只保留本地需要的会话与区间。
+统一用 `sea-query` + `sqlx`，SQL 一律经 builder 构造，不拼字符串。
+
+- `messages(room_id, seq, msg_id, sender, sender_name, kind, body, server_ts)`，PK `(room_id, seq)`。
+- `room_meta(id = 1, room_id)`：单行，记着本库属于哪个房间 —— **这就是「重启后还是同一个房间」的依据**。
+- 消息**全部落盘，进程内不留副本**，所以房间历史再长也不会把内存撑爆。
+- 序号在写锁内按 `MAX(seq) + 1` 分配，避免两条连接抢到同一个 `seq`。
+- `history` 取 `seq < before` 的最近 `limit` 条，`since` 取 `seq > after` 的最早 `limit` 条，都走 `(room_id, seq)` 主键。
+
+**库文件位置**：`~/.lib-chat/rooms/room-<广播端口>.db`。
+也就是说**数据目录 + 端口才是房间的边界**：同机不同端口各是各的房间，
+同一端口重启后仍是同一个房间。这解决了「落库却读不回」与「多个服务端顶同一个身份」两个问题。
+
+后续做多会话 / 多端时，再补 `users` / `devices` / `conversations` / `receipts` 等表。
 
 ---
 
@@ -308,29 +278,18 @@ struct StoredMessage {
 
 | 决策点 | 结论 | 理由 |
 |---|---|---|
-| 人数显示 | 未加入：只显示「在线 N 人」；加入后：显示「在线 N / 共 M」 | 隐私友好，且区分瞬态/持久 |
+| 人数显示 | 始终只有「在线 N 人」，房间没有总人数概念 | 连接断开即离开，不存在持久成员表 |
 | 未加入的可见信息 | 仅房间名 + 人数，**不暴露昵称** | 局域网隐私 |
 | 房间数量 | V1 单房间；协议保留 `room_id`，多房间无需改协议 | 先简化，预留扩展 |
 | 消息类型 | V1 纯文本 + Unicode emoji，不做图片/贴纸/视频 | 聚焦核心链路 |
 | 服务端存储 | SQLite 单机，`sea-query` + `sqlx`；后期可迁 Postgres | V1 单机足够 |
 | 传输 | QUIC（`quinn`）+ rustls 自签证书 + TOFU 指纹校验 | 自带 TLS 1.3、多路复用，免单独配 TLS |
 | 端到端加密 | **不进 V1**，仅传输层加密 | 避免与搜索/审核/回放冲突 |
-| 房主仲裁 | 同时启动时，`DeviceId` 最小者成为房主；mDNS 冲突检测后让位 | 避免双房主 |
+| 房主仲裁 | **未实现**：当前由用户手动「创建房间」，`DeviceId` 最小者优先的规则待落地 | 避免双房主 |
 
 ---
 
-## 10. 后续演进（V1 之后）
-
-1. 多房间与房间列表选择。
-2. 图片 / 表情包（BlobStore + 两级推送）。
-3. 单聊与端到端加密。
-4. 离线消息与多端同步。
-5. 万人群：网关合并推送 + 提示/拉取。
-6. 公网部署与集群化。
-
----
-
-## 11. 实现进度
+## 10. 实现进度
 
 | 阶段 | 状态 | 说明 |
 |---|---|---|
@@ -339,6 +298,9 @@ struct StoredMessage {
 | M2 加入/退出 + 文本群聊 | 完成 | 在线人数实时推送、消息扇出、历史分页 |
 | **桌面界面** | **完成** | GPUI 单窗口：房间列表、人数、加入/退出、聊天、创建房间 |
 | **连接活性** | **完成** | 保活 PING + 断线自动重连恢复身份（修复「安静房间 30 秒后所有人被弹出」） |
+| **消息补齐** | **完成** | 加入拉最近一页历史；重连/重进按 seq 补齐漏收的消息 |
+| **消息落库** | **完成** | SQLite（`store-sqlite`）；房间标识入库，重启后房间与历史延续 |
+| **消息列表虚拟化** | **完成** | gpui 变高虚拟列表，只渲染可见项；滑到顶加载更早历史 |
 | M3 单聊与多会话 | 未开始 | |
 | M4 富媒体 | 未开始 | |
 | M5 万人群 | 未开始 | |
@@ -350,7 +312,8 @@ struct StoredMessage {
 crates/
 ├── chat-proto           协议 DTO（RoomInfo / LobbyInfo / ClientRequest / ServerEvent）
 ├── chat-core            端口：Connection / RequestSink / ConnectionAcceptor / MessageStore
-├── chat-server          房间状态、在线人数、扇出、内存存储
+├── store-sqlite         消息落库 + 房间标识（sea-query + sqlx）
+├── chat-server          房间状态、在线人数、扇出
 ├── chat-client          带类型的客户端 SDK
 ├── chat-discovery       房间发现：mDNS + UDP 广播双通道
 ├── chat-transport-quic  QUIC 传输 + 自签证书 + TOFU
@@ -388,15 +351,15 @@ chat-ui-gpui/src/
     └── diag.rs          启动 / 退出 / panic 落盘
 ```
 
-**三条组织规则**（依 Rust 官方《The Rust Programming Language》第 7 章）：
+**三条组织规则**（依 Rust 官方书第 7 章）：
 
-1. **按角色命名，不按层次命名**。书中用餐厅举例，分组是 `front_of_house`（含 `hosting`、`serving`）这类角色名，而不是 `backend` / `frontend` 这类技术层名。所以这一层叫 `service`（它对外提供的是「聊天服务」：连上某个房间、或自己托管一个房间），而不是 `backend`。
-2. **用 `foo.rs + foo/`，不用 `foo/mod.rs`**。Rust 2018 起的现代约定：这样模块文件与子模块目录同层，一眼能看清结构；`mod.rs` 会造成一堆同名文件难以辨认。`app.rs` / `service.rs` 各自与同名目录成对出现，正是这个规则。
-3. **顶层文件数 = 顶层模块数**，这是模块系统的硬性规则：Cargo 只固定 `lib.rs` 与 `main.rs` 两个名字，其余每个顶层模块都必须在 crate 根声明，落盘只有 `foo.rs` 或 `foo/mod.rs` 两种，没有第三种。
+1. **按角色命名，不按层次命名**：这一层叫 `service`（对外提供「聊天服务」），而不是 `backend`。
+2. **用 `foo.rs + foo/`，不用 `foo/mod.rs`**：模块文件与子目录同层，一眼看清结构。
+3. **顶层文件数 = 顶层模块数**：每个顶层模块都必须在 crate 根声明。
 
-**二进制独立成目录**（`bin/libchat-ui/`）的原因：装进程级 panic 钩子、把启动/退出写盘，这些是**应用的决定**而非库的职责。`diag` 只有 `main.rs` 用得到，放在库里会让它成为顶层多出来的一个孤立文件，也等于替调用方做了进程级副作用。
+**二进制独立成目录**（`bin/libchat-ui/`）：装 panic 钩子、把启动/退出写盘是**应用的决定**，不是库的职责。
 
-隐私边界也由此确定：`ChatApp` 定义在 `app.rs`（`update` / `actions` / `views` 三者的**父模块**），因此三个子模块能访问其私有字段，而外部不能——这是刻意的，不用把字段放宽成 `pub(crate)`。
+`ChatApp` 定义在 `app.rs`（`update` / `actions` / `views` 的**父模块**），所以三个子模块能访问其私有字段，外部不能——刻意如此。
 
 **代码约定**（改代码时请一并守住）：
 
@@ -411,6 +374,28 @@ chat-ui-gpui/src/
 
 另：`App` 的输入控件来自 gpui 官方示例改造，内含 IME（`EntityInputHandler`）与全文光标逻辑，**没有拆分的必要**——它是一个内聚的整体。
 
+### 性能排查结论
+
+用 `cargo run --release -p chat-ui-gpui --example perf_probe` 可以复现下面这些结论。
+
+**已修复**
+
+| 问题 | 修复 |
+|---|---|
+| `history` 先克隆房间内**全部**消息再截断到 `limit` | 按 seq 二分定位，只克隆命中段（10 万条从 5.99ms 降到 5.2µs） |
+| 房间探测**没有超时**且是**串行**的 | 每个地址加 `PROBE_TIMEOUT`，并改为并发探测 |
+| 陈旧房间**从不淘汰**，会让发现功能永久卡死 | 连续 3 次探测失败即摘除，并发 `RoomGone` 通知界面 |
+| 广播每 2 秒重复播报，每次都触发完整 QUIC 握手 | 同一房间在探测间隔内不重复探测（0.80 → 0.20 次/秒） |
+| 服务端消息**只增不淘汰**，内存随房间无限涨 | 落库 SQLite，进程内不缓存消息 |
+| 界面每帧把**全部**消息重建成元素 | 换虚拟列表（`ListAlignment::Bottom`），只渲染可见项，成本与消息总量脱钩 |
+
+**属于取舍**
+
+| 问题 | 现状 | 需要决定 |
+|---|---|---|
+| 往上翻过的历史仍留在内存里 | 翻得越远占用越多（渲染不受影响，只是数据留着） | 目前不设上限；真要封顶就得丢弃视口之外的段 |
+| 剩余探测开销 0.20 次握手/秒/房间 | 约 605µs CPU + 一次 UDP socket + 服务端连接增删 | 若在意耗电，可改持一条大厅订阅连接由服务端推送人数 |
+
 ### 用法
 
 ```bash
@@ -424,6 +409,8 @@ cargo run -p chat-cli -- join --addr 10.0.0.5:45678 --fingerprint <hex>
 ```
 
 **界面操作**：点「创建房间」即成为房主，界面会自动接入。其他实例（**同一台机器也可以**）打开后会在左侧「局域网房间」里自动看到该房间与在线人数，点一下即连接，再点「加入房间」进入聊天。若发现被网络环境阻断，仍可用「手动连接」填 `127.0.0.1:端口` 或局域网地址兜底。
+
+**数据落盘**：房主的消息存到 `~/.lib-chat/rooms/room-52100.db`（默认端口）。同一目录 + 同一端口重启后仍是原房间，历史都在；换个端口就是另一个房间。
 
 **发现机制**：mDNS（跨机标准做法）与 UDP 广播（`52100/udp` 探测应答，覆盖同机多实例与 mDNS 失效的网络）双通道并用，去重合并后展示。
 
@@ -452,18 +439,40 @@ cargo run -p chat-cli -- join --addr 10.0.0.5:45678 --fingerprint <hex>
 
 ### 连接活性（保活与自动重连）
 
-**踩过的坑**：两个人进房间后只要 30 秒没人说话，就双双被强行弹出房间。
+quinn 默认 `max_idle_timeout = 30s` 且**不发保活包**，而安静房间不产生任何流量，于是所有连接会在 30 秒后几乎同时被判死——表现就是「屋里的人突然全被踢了」。修复分两层：
 
-根因是 quinn 的默认传输配置：`max_idle_timeout = 30s` 且**不发送保活包**。而安静的房间不产生任何网络流量——房主的人数定时器只走进程内通道、不发包——于是所有连接会在 30 秒后几乎同时被判死，客户端收到断连、界面清空房间，表现就是「屋里的人突然全被踢了」。
+| 层 | 做法 |
+|---|---|
+| **传输层** | 空闲超时放宽到 60 秒，每 15 秒发一次保活 PING |
+| **会话层** | 断开后自动重连并**恢复身份**（记住昵称重新 join），窗口 60 秒 |
 
-修复分两层：
+所以成员语义是：**只有点「退出房间」，或超过 60 秒始终连不上，才算真的离开。**
 
-| 层 | 做法 | 解决的问题 |
+### 消息补齐
+
+界面只在收到消息时追加，所以两条路径都必须主动补，否则用户会看到空白或漏话。两者都在会话层自动完成，界面只负责摆放：
+
+| 时机 | 请求 | 界面表现 |
 |---|---|---|
-| **传输层** | 空闲超时放宽到 60 秒，每 15 秒发一次保活 PING | 安静房间不再被判死；真掉线的对端仍会在 60 秒内被识别 |
-| **会话层** | 断开后自动重连并**恢复身份**（记住昵称重新 join），窗口 60 秒 | WiFi 抖动、笔记本短时休眠、对端重启，用户无感；超出窗口才回到大厅 |
+| 首次加入 | `History { before: None, limit: 50 }` | 最近 50 条插到列表**最前**（早于「已加入」提示） |
+| 重连 / 重新加入 | `Sync { after: cursor, limit: 200 }` | 漏收的消息追加到**末尾**；`has_more` 为真就继续翻页直到追平 |
+| 滑到最顶 | `History { before: oldest, limit: 50 }` | 更早的一页插到**最前**；`has_more` 为假就说明到头了 |
 
-所以默认配置下的成员语义是：**只有点「退出房间」，或超过 60 秒始终连不上，才算真的离开。**
+`cursor` 是客户端已收到的最大 `seq`，随每条消息推进；服务端的 `since` 与 `history` 一样按 seq 二分定位，只克隆命中的那一段。
+
+> 首次加入只取最近一页，不追早期历史——拉全量会随房间消息总量线性变慢。
+> 断线期间**自己**发的消息不存在（发不出去），所以补回来的必然是别人的消息。
+
+### 消息列表
+
+消息区用 gpui 的 `list`（变高虚拟列表，`ListAlignment::Bottom`——源码注释写着 "like a chat log"）
+渲染，只对可见范围调用渲染闭包，所以每帧成本只与可见条数有关，跟消息总量无关。
+
+`lines` 的改动一律走 `push_line` / `push_lines` / `prepend_lines` / `clear_lines` 四个方法，
+它们同时维护 `ListState` 的项数——绕过它们直接改 `lines` 就会越界。
+
+滑到最顶时 `ListState` 的滚动回调发一次「往前翻」；能不能翻、还有没有更早的由会话层判断，
+界面不记账。翻回来的一页前插到最前，再用 `scroll_to` 把视口按回原处，避免跳动。
 
 ### 排查问题
 
@@ -482,7 +491,8 @@ cargo run -p chat-cli -- join --addr 10.0.0.5:45678 --fingerprint <hex>
 ### 已知限制
 
 - ~~同主机 mDNS 互相看不见~~：已由 UDP 广播通道解决（`_libchat/_tcp` 之外在 `52100/udp` 上做探测应答）。同机两个实例现可自动发现，跨机由 mDNS + 广播双保险。
-- **未落盘**：服务端消息仅存内存，进程退出即丢失。SQLite 持久化待后续。
+- **消息库位置**：`~/.lib-chat/rooms/room-<广播端口>.db`——端口即房间边界，删掉该文件就清空了这个房间的历史。
+- **历史里自己的旧消息会显示成别人的**：服务端每次加入都分配新的 `UserId`（身份只活在连接上），重新加入后取回的历史中，自己此前发的消息无法被识别为「我发的」。
 - **重连窗口 60 秒**：断开后自动重连并恢复身份；超过窗口则回到大厅并提示「连接已断开，可重新加入」，不会无限停在「正在重连」。
 - **单会话**：界面同一时刻只连接一个房间。切换房间会**先退出旧房间**再连新的，在线人数立刻回落；自己创建的房间在切换后仍继续广播与监听，直到再次「创建房间」或关闭应用。
 - **房主仲裁未实现**：`DeviceId` 最小者优先的规则尚未落地，当前由用户手动创建房间。

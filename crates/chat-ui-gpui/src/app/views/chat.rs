@@ -22,7 +22,13 @@ impl ChatApp {
             button("加入房间", true, false, cx.listener(Self::on_join))
         };
 
-        let lines: Vec<AnyElement> = self.lines.iter().map(render_line).collect();
+        // 只渲染可见范围那几条，消息再多每帧成本也不变
+        let this = cx.entity();
+        let messages = list(self.list.clone(), move |ix, _window, cx| {
+            let lines = &this.read(cx).lines;
+            render_line(&lines[ix])
+        })
+        .flex_1();
 
         div()
             .flex_1()
@@ -52,18 +58,7 @@ impl ChatApp {
                     )
                     .child(action),
             )
-            .child(
-                div()
-                    .id("messages")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .px_5()
-                    .py_4()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .children(lines),
-            )
+            .child(messages)
             .child(
                 div()
                     .flex()

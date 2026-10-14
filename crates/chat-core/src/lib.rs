@@ -14,6 +14,8 @@ pub enum ChatError {
     Transport(String),
     #[error("协议错误: {0}")]
     Protocol(String),
+    #[error("存储错误: {0}")]
+    Storage(String),
     #[error("连接已关闭")]
     Closed,
 }
@@ -70,6 +72,8 @@ pub trait MessageStore: Send + Sync {
     async fn append(&self, room: RoomId, msg: NewMessage) -> Result<Message>;
     /// 取 `before`（不含）之前的最近 `limit` 条，按 seq 升序返回。
     async fn history(&self, room: RoomId, before: Option<Seq>, limit: usize) -> Result<Vec<Message>>;
+    /// 取 `after`（不含）之后的、最早的 `limit` 条，按 seq 升序返回。
+    async fn since(&self, room: RoomId, after: Seq, limit: usize) -> Result<Vec<Message>>;
     /// 当前最大序号，空房间为 0。
     async fn latest_seq(&self, room: RoomId) -> Result<Seq>;
 }

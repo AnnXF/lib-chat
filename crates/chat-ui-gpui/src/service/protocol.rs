@@ -33,8 +33,28 @@ pub(super) fn map_event(event: ServerEvent) -> UiEvent {
             room,
             online: online_count,
         },
-        ServerEvent::History { .. } => UiEvent::Status("房间历史已加载".into()),
+        ServerEvent::History {
+            room,
+            messages,
+            has_more,
+        } => UiEvent::History {
+            room,
+            messages: messages.into_iter().map(to_history_message).collect(),
+            has_more,
+        },
+        ServerEvent::Sync { room, messages, .. } => UiEvent::Missed {
+            room,
+            messages: messages.into_iter().map(to_history_message).collect(),
+        },
         ServerEvent::Error { message, .. } => UiEvent::Error(message),
+    }
+}
+
+fn to_history_message(message: Message) -> HistoryMessage {
+    HistoryMessage {
+        sender_id: message.sender,
+        sender: message.sender_name,
+        text: message.text,
     }
 }
 
