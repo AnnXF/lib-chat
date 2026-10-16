@@ -47,6 +47,8 @@ pub struct ChatApp {
     hosted: Option<String>,
     /// 本机已有一个可恢复的房间，存了多少条消息；`None` 表示还没有，或已经在用。
     local_room: Option<u64>,
+    /// 本机房间的房间标识：拿它判断界面是不是正待在这个房间里，免得再摆一个入口。
+    local_room_id: Option<RoomId>,
     /// 我在当前房间的身份；用于判断消息是不是自己发的。
     my_id: Option<UserId>,
 }
@@ -124,6 +126,7 @@ impl ChatApp {
             status: "正在搜索局域网房间…".into(),
             hosted: None,
             local_room: None,
+            local_room_id: None,
             my_id: None,
         }
     }

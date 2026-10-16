@@ -33,9 +33,15 @@ fn main() {
             diag::log_line(&format!("[{}] 打开窗口失败: {e}", diag::now_stamp()));
             return;
         }
+
+        // 关掉窗口就把整个应用退掉：macOS 默认只是收起窗口，进程还活着，
+        // 托管的房间会继续广播，本机再开一个实例也接不进去。
+        cx.on_window_closed(|cx| {
+            diag::log_line(&format!("[{}] 窗口已关闭，退出", diag::now_stamp()));
+            cx.quit();
+        })
+        .detach();
+
         cx.activate(true);
     });
-
-    // 能走到这里说明是正常退出；崩溃与信号杀死都到不了这一行
-    diag::log_line(&format!("[{}] 界面退出", diag::now_stamp()));
 }

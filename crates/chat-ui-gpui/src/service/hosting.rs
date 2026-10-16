@@ -7,10 +7,13 @@ fn room_db_path(data_dir: &Path, beacon_port: u16) -> PathBuf {
     data_dir.join(format!("room-{beacon_port}.db"))
 }
 
-/// 看一眼本机是否已经有这个端口的房间；有就返回它存了多少条消息。
+/// 看一眼本机是否已经有这个端口的房间；有就返回它的房间标识与消息条数。
 ///
 /// 只做探测，绝不新建文件——没房间时返回 `None`，不会凭空留下一个空库。
-pub(super) async fn local_room_messages(data_dir: &Path, beacon_port: u16) -> Option<u64> {
+///
+/// 同机的实例共用同一个库，于是也共用同一个房间标识：拿它去房间发现里问一句
+/// 「这个房间是不是已经有人在托管了」，就能避免两个实例各起一个服务器。
+pub(super) async fn local_room(data_dir: &Path, beacon_port: u16) -> Option<(RoomId, u64)> {
     let path = room_db_path(data_dir, beacon_port);
     if !path.exists() {
         return None;
@@ -18,7 +21,35 @@ pub(super) async fn local_room_messages(data_dir: &Path, beacon_port: u16) -> Op
     let store = SqliteStore::open(&path).await.ok()?;
     let room = store.room();
     let latest = store.latest_seq(room).await.ok()?;
-    Some(latest.max(0) as u64)
+    Some((room, latest.max(0) as u64))
+}
+
+/// 本机房间的独占锁：谁拿着它，谁才是本机这个房间的房主。
+///
+/// 光看广播判断「本机有没有人在托管」有个窗口：第二个实例刚起来、还没发现房间，
+/// 那会儿它会再起一个服务器，同一个房间标识下又变成两个服务器。锁是跟着打开实例走的
+/// （同一个进程里两次打开也互斥），所以同机多实例一样管用。
+pub(super) struct RoomHostLock {
+    _file: std::fs::File,
+}
+
+/// 抢占本机房间的房主位置；已经被别的实例占着就返回 `Err`。
+pub(super) fn claim_local_room(data_dir: &Path, beacon_port: u16) -> Result<RoomHostLock, String> {
+    let path = data_dir.join(format!("room-{beacon_port}.lock"));
+    // 抢锁发生在开库之前，目录可能还不存在，这里先把它备好
+    std::fs::create_dir_all(data_dir).map_err(|e| format!("创建数据目录失败: {e}"))?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        // 只是拿它加锁，不动里面的内容
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("打开本机房间的锁失败: {e}"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(RoomHostLock { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => Err("本机已有实例开着这个房间".into()),
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("锁定本机房间失败: {e}")),
+    }
 }
 
 /// 清空本机房间：连库文件一起删掉，之后重建会拿到新的房间标识与空白历史。
@@ -46,6 +77,8 @@ pub(super) struct Hosting {
     pub(super) alive: Arc<AtomicBool>,
     /// 界面当前是否在展示这个房间；否则上报会污染别的房间的人数。
     pub(super) visible: Arc<AtomicBool>,
+    /// 房主位置：托管没了就还回去，别的实例才能接手。
+    pub(super) _lock: RoomHostLock,
 }
 
 impl Hosting {
@@ -66,6 +99,7 @@ pub(super) struct Started {
     pub(super) announcer: RoomAnnouncer,
     pub(super) addr: String,
     pub(super) fingerprint: String,
+    pub(super) lock: RoomHostLock,
 }
 
 pub(super) async fn start_host(
@@ -75,6 +109,10 @@ pub(super) async fn start_host(
     liveness: Liveness,
     data_dir: &Path,
 ) -> Result<Started, String> {
+    // 先抢本机房间的房主位置：抢不到说明本机已经有实例开着它，
+    // 再起一个只会让同一个房间裂成两个服务器
+    let lock = claim_local_room(data_dir, beacon_port)?;
+
     // 库文件按广播端口分开：同机不同端口各是各的房间，同一个端口重启后仍是同一个房间
     let path = room_db_path(data_dir, beacon_port);
     let store = SqliteStore::open(&path)
@@ -106,6 +144,7 @@ pub(super) async fn start_host(
         announcer,
         addr: format!("127.0.0.1:{port}"),
         fingerprint,
+        lock,
     })
 }
 

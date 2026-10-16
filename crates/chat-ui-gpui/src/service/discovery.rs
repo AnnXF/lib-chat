@@ -35,8 +35,28 @@ impl KnownRoom {
 
 type Rooms = Arc<tokio::sync::Mutex<HashMap<RoomId, KnownRoom>>>;
 
+/// 已发现房间的查询入口。
+///
+/// 后端循环用它回答一个问题：这个房间现在有没有人在托管？——同机的第二个实例不该
+/// 再起一个服务器，而要接到已有的那个上。
+#[derive(Clone, Default)]
+pub(super) struct DiscoveredRooms(Rooms);
+
+impl DiscoveredRooms {
+    /// 这个房间正被谁托管？给出一个可用地址与它的指纹。
+    ///
+    /// 地址来自广播播报，条目要连续探测失败几次才摘掉，所以这里查得到只说明前阵子还有人应答。
+    /// 房主刚走时广播会残留在这里，拿到地址后得真连一次才算数。
+    pub(super) async fn host_of(&self, room: RoomId) -> Option<(String, String)> {
+        let map = self.0.lock().await;
+        let entry = map.get(&room)?;
+        let addr = entry.addrs.first()?.to_string();
+        Some((addr, entry.fingerprint.clone()))
+    }
+}
+
 /// 持续浏览局域网房间，并周期复查各自人数。
-pub(super) async fn browse_loop(events: Sender<UiEvent>, beacon_port: u16) {
+pub(super) async fn browse_loop(events: Sender<UiEvent>, beacon_port: u16, rooms: DiscoveredRooms) {
     let mut browser = match RoomBrowser::start_on(beacon_port) {
         Ok(browser) => browser,
         Err(e) => {
@@ -46,7 +66,7 @@ pub(super) async fn browse_loop(events: Sender<UiEvent>, beacon_port: u16) {
     };
 
     // 按房间标识去重：mDNS 与 UDP 广播会重复播报同一个房间
-    let known: Rooms = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let known = rooms.0;
 
     // 周期复查：房间消失时没有任何通知，只能靠探测发现
     {

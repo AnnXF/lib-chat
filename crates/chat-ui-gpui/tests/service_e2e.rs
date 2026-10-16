@@ -466,7 +466,7 @@ fn reopening_offers_the_local_room_back() {
         |e| matches!(e, UiEvent::LocalRoom { .. }),
         Duration::from_secs(2),
     ) {
-        Some(UiEvent::LocalRoom { messages }) => assert_eq!(messages, 3),
+        Some(UiEvent::LocalRoom { messages, .. }) => assert_eq!(messages, 3),
         _ => panic!("重开后应提示本机房间还在"),
     }
 
@@ -633,6 +633,95 @@ fn joining_after_two_new_rooms_still_works() {
         Duration::from_secs(10),
     );
     assert!(joined.is_some(), "第二个房间应当能正常加入");
+}
+
+/// 同机两个实例都开「本机房间」，消息也必须实时到达。
+///
+/// 本机房间按广播端口落在同一个库文件里：两个实例拿到的是同一个房间标识。各自起一个
+/// 服务器的话，消息只落库、只推给自己那半边的连接，看起来就是「不实时，退出再进才看得见」。
+/// 后开的那个应当接到先开的那个上。
+#[test]
+fn two_instances_sharing_the_local_room_deliver_in_real_time() {
+    let (_guard, beacon_port) = serial();
+    // 两个实例共用一个库目录：正是「同一台机器上开两次」的样子
+    let dir = test_data_dir(beacon_port);
+    let (cmds_a, events_a) = spawn_with_data(beacon_port, Liveness::default(), dir.clone());
+
+    cmds_a
+        .send(UiCommand::Host {
+            name: "本机房间".into(),
+        })
+        .unwrap();
+    recv_until(&events_a, |e| matches!(e, UiEvent::Hosting { .. }));
+    recv_until(&events_a, |e| matches!(e, UiEvent::Lobby { .. }));
+    cmds_a
+        .send(UiCommand::Join {
+            name: "Alice".into(),
+        })
+        .unwrap();
+    recv_until(&events_a, |e| matches!(e, UiEvent::Joined { .. }));
+
+    // 第二个实例后开：启动时看到本机已有房间
+    let (cmds_b, events_b) = spawn_with_data(beacon_port, Liveness::default(), dir);
+    let room = match recv_until(&events_b, |e| matches!(e, UiEvent::LocalRoom { .. })) {
+        UiEvent::LocalRoom { room, .. } => room,
+        _ => unreachable!(),
+    };
+
+    // B 马上就点「我的房间」：这时它多半还没在房间列表里看到这个房间（广播还没认出来），
+    // 也必须接到 A 的服务器上，而不是再起一个
+    cmds_b
+        .send(UiCommand::Host {
+            name: "本机房间".into(),
+        })
+        .unwrap();
+    let outcome = wait_for(
+        &events_b,
+        |e| matches!(e, UiEvent::Lobby { .. } | UiEvent::Hosting { .. }),
+        Duration::from_secs(10),
+    )
+    .expect("点「我的房间」后既没接上房间，也没起服务器");
+    match outcome {
+        UiEvent::Lobby { room: shown, .. } => {
+            assert_eq!(shown, room, "应当接到本机已有实例的那个房间上")
+        }
+        // 再起一个服务器就会和本机那个裂成两个，消息各推各的
+        UiEvent::Hosting { .. } => panic!("本机已经有实例开着这个房间，不该再起一个服务器"),
+        _ => unreachable!(),
+    }
+
+    cmds_b.send(UiCommand::Join { name: "Bob".into() }).unwrap();
+    recv_until(&events_b, |e| matches!(e, UiEvent::Joined { .. }));
+
+    cmds_a
+        .send(UiCommand::Send {
+            text: "在吗".into(),
+        })
+        .unwrap();
+    assert!(
+        wait_for(
+            &events_b,
+            |e| matches!(e, UiEvent::Message { .. }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "A 发的消息应当实时到达 B"
+    );
+
+    cmds_b
+        .send(UiCommand::Send {
+            text: "在".into(),
+        })
+        .unwrap();
+    assert!(
+        wait_for(
+            &events_a,
+            |e| matches!(e, UiEvent::Message { .. }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "B 发的消息应当实时到达 A"
+    );
 }
 
 /// 重建房间后，旧房间（本机自己刚撤下的那个）必须马上离开房间列表。

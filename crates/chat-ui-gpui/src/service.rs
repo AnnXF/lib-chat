@@ -27,9 +27,9 @@ use chat_discovery::{RoomAnnouncer, RoomBrowser};
 use chat_proto::{LobbyInfo, Message, RoomId, Seq, ServerEvent, UserId};
 use chat_server::{Acceptor, Server};
 use chat_transport_quic::{Liveness, QuicConnection, QuicServer, connect, connect_with};
-use discovery::browse_loop;
+use discovery::{DiscoveredRooms, browse_loop};
 use flume::{Receiver, Sender};
-use hosting::{Hosting, local_room_messages, reset_local_room, start_host};
+use hosting::{Hosting, claim_local_room, local_room, reset_local_room, start_host};
 use session::{Active, SessionCmd, open_session};
 
 /// 房间列表的人数复查间隔。房间要在未加入时也能看到人数，只能周期性探测。
@@ -64,6 +64,7 @@ async fn start_hosting(
         _announcer: started.announcer,
         alive,
         visible,
+        _lock: started.lock,
     };
 
     // 房主自己也接入房间，否则同一个窗口里无法参与聊天
@@ -122,8 +123,9 @@ pub enum UiEvent {
         addrs: Vec<String>,
         fingerprint: String,
     },
-    /// 本机已经有一个可恢复的房间（已存多少条消息）。界面据此在本机给出入口。
+    /// 本机已经有一个可恢复的房间（房间标识 + 已存多少条消息）。界面据此给出入口。
     LocalRoom {
+        room: RoomId,
         messages: u64,
     },
     /// 已连上某个房间，但尚未加入。
@@ -287,6 +289,100 @@ async fn start_new_room(
     }
 }
 
+/// 进入一个房间：旧会话先结束，本机托管不动——自己建过的房间不该因为切走就消失。
+async fn take_room(
+    addr: &str,
+    fingerprint: Option<&str>,
+    hosting: &Option<Hosting>,
+    active: &mut Option<Active>,
+    events: &Sender<UiEvent>,
+    liveness: Liveness,
+) -> Result<RoomId, String> {
+    if let Some(previous) = active.take() {
+        previous.end().await;
+    }
+    let session = open_session(addr, fingerprint, events, liveness).await?;
+    // 界面正在展示这个房间时，本机托管的人数上报才有意义
+    if let Some(current) = hosting.as_ref() {
+        current
+            .visible
+            .store(current.room == session.room, Ordering::Relaxed);
+    }
+    let room = session.room;
+    *active = Some(session);
+    Ok(room)
+}
+
+/// 进入一个房间，进不去就把原因报给界面。
+async fn connect_room(
+    addr: String,
+    fingerprint: Option<String>,
+    hosting: &mut Option<Hosting>,
+    active: &mut Option<Active>,
+    events: &Sender<UiEvent>,
+    liveness: Liveness,
+) {
+    if let Err(e) = take_room(&addr, fingerprint.as_deref(), hosting, active, events, liveness).await {
+        let _ = events.send(UiEvent::Error(e));
+    }
+}
+
+/// 房主的广播可能要等一轮才被认出来：广播 2 秒一轮，多给一点。
+const LOCAL_HOST_WAIT: Duration = Duration::from_secs(4);
+
+/// 本机已经有实例当着房主吗？广播可能还没跟上，所以直接问库旁边的锁。
+///
+/// 能拿到锁就说明本机没有房主，拿到立刻还回去——这里只是问一句。
+fn local_room_has_host(data_dir: &Path, beacon_port: u16) -> bool {
+    claim_local_room(data_dir, beacon_port).is_err()
+}
+
+/// 「我的房间」：本机已经有实例开着这个房间就接过去，返回是否接上了。
+///
+/// 本机房间按广播端口共享同一个库，所以同一个房间标识可能同时被两个实例「开」。各自起
+/// 服务器的话，消息只落库、只推给自己那半边的连接，看起来就是「不实时，退出再进才看得见」。
+///
+/// 广播会在房主退出后残留一会儿，所以这里真连一次再算数：连不上（残留、或是它已经不在
+/// 那个指纹后面了）就当没人在开，照常自己开一个。
+async fn adopt_local_room(
+    rooms: &DiscoveredRooms,
+    data_dir: &Path,
+    beacon_port: u16,
+    hosting: &Option<Hosting>,
+    active: &mut Option<Active>,
+    events: &Sender<UiEvent>,
+    liveness: Liveness,
+) -> bool {
+    let Some((room, _)) = local_room(data_dir, beacon_port).await else {
+        return false;
+    };
+    // 自己就是房主时不必「接」：下面走的还是原来的重建逻辑
+    if hosting.as_ref().is_some_and(|current| current.room == room) {
+        return false;
+    }
+
+    // 锁被占着就说明本机确实有房主，只是第二个实例刚起来还没在广播里看到它，值多等一轮
+    let deadline = local_room_has_host(data_dir, beacon_port)
+        .then(|| tokio::time::Instant::now() + LOCAL_HOST_WAIT);
+
+    loop {
+        if let Some((addr, fingerprint)) = rooms.host_of(room).await
+            && take_room(&addr, Some(&fingerprint), hosting, active, events, liveness)
+                .await
+                .is_ok()
+        {
+            return true;
+        }
+        let Some(deadline) = deadline else {
+            return false;
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 async fn run(
     events: Sender<UiEvent>,
     cmds: Receiver<UiCommand>,
@@ -294,11 +390,12 @@ async fn run(
     liveness: Liveness,
     data_dir: PathBuf,
 ) {
-    tokio::spawn(browse_loop(events.clone(), beacon_port));
+    let rooms = DiscoveredRooms::default();
+    tokio::spawn(browse_loop(events.clone(), beacon_port, rooms.clone()));
 
     // 本机是不是已经有这个端口的房间了？有就在侧栏给一个「回到我的房间」的入口
-    if let Some(messages) = local_room_messages(&data_dir, beacon_port).await {
-        let _ = events.send(UiEvent::LocalRoom { messages });
+    if let Some((room, messages)) = local_room(&data_dir, beacon_port).await {
+        let _ = events.send(UiEvent::LocalRoom { room, messages });
     }
 
     let mut active: Option<Active> = None;
@@ -307,16 +404,29 @@ async fn run(
     while let Ok(cmd) = cmds.recv_async().await {
         match cmd {
             UiCommand::Host { name } => {
-                start_new_room(
-                    name,
-                    &mut hosting,
+                // 「我的房间」：本机已经有实例开着这个房间时接过去，没人开才自己开
+                let adopted = adopt_local_room(
+                    &rooms,
+                    &data_dir,
+                    beacon_port,
+                    &hosting,
                     &mut active,
                     &events,
-                    beacon_port,
                     liveness,
-                    &data_dir,
                 )
                 .await;
+                if !adopted {
+                    start_new_room(
+                        name,
+                        &mut hosting,
+                        &mut active,
+                        &events,
+                        beacon_port,
+                        liveness,
+                        &data_dir,
+                    )
+                    .await;
+                }
             }
 
             UiCommand::NewRoom { name } => {
@@ -348,23 +458,7 @@ async fn run(
             }
 
             UiCommand::Connect { addr, fingerprint } => {
-                if let Some(previous) = active.take() {
-                    previous.end().await;
-                }
-                match open_session(&addr, fingerprint.as_deref(), &events, liveness).await {
-                    Ok(session) => {
-                        // 已切到别的房间，停止用旧房间的人数覆盖界面
-                        if let Some(current) = &hosting {
-                            current
-                                .visible
-                                .store(current.room == session.room, Ordering::Relaxed);
-                        }
-                        active = Some(session);
-                    }
-                    Err(e) => {
-                        let _ = events.send(UiEvent::Error(e));
-                    }
-                }
+                connect_room(addr, fingerprint, &mut hosting, &mut active, &events, liveness).await;
             }
 
             UiCommand::Join { name } => match &active {

@@ -3,7 +3,7 @@
 //! 所有状态变更都收敛在这里，渲染函数只读不写。消息列表只能经 [`ChatApp`] 上那几个
 //! `*_lines` 方法改动——它们同时维护虚拟列表的项数，绕过它们就会越界。
 
-use chat_proto::UserId;
+use chat_proto::{RoomId, UserId};
 use gpui::ListOffset;
 
 use crate::service::UiEvent;
@@ -23,6 +23,12 @@ impl ChatApp {
                 online,
                 ..
             } => {
+                // 自己就在这个房间里时，人数以房间推送为准：探测是几秒一轮的，
+                // 早于推送发出的那次探测结果回来，只会把数字倒回去
+                let online = match self.room.as_ref().filter(|view| view.id == room && view.joined) {
+                    Some(view) => view.online,
+                    None => online,
+                };
                 match self.rooms.iter_mut().find(|known| known.id == room) {
                     Some(known) => {
                         known.name = name;
@@ -58,10 +64,12 @@ impl ChatApp {
                 ));
                 // 已经在用这个房间了，侧栏那个「回到我的房间」入口就该收起来
                 self.local_room = None;
+                self.local_room_id = None;
                 self.status = "房间已启动，等待其他客户端连接".into();
             }
-            UiEvent::LocalRoom { messages } => {
+            UiEvent::LocalRoom { room, messages } => {
                 self.local_room = Some(messages);
+                self.local_room_id = Some(room);
             }
             UiEvent::Lobby {
                 room,
@@ -76,6 +84,7 @@ impl ChatApp {
                     online,
                     joined: false,
                 });
+                self.sync_online(room, online);
                 self.clear_lines();
                 // 新房间，能不能往上翻要等它的第一页历史说了算
                 self.has_older = true;
@@ -91,6 +100,7 @@ impl ChatApp {
                     view.joined = true;
                     view.online = online;
                 }
+                self.sync_online(room, online);
                 self.my_id = Some(you);
                 self.status = if recovered {
                     format!("连接已恢复，当前在线 {online} 人")
@@ -151,6 +161,7 @@ impl ChatApp {
                 if let Some(view) = self.showing_mut(room) {
                     view.online = online;
                 }
+                self.sync_online(room, online);
             }
             UiEvent::RoomGone { room } => {
                 let before = self.rooms.len();
@@ -176,6 +187,16 @@ impl ChatApp {
     /// 只在房间数真的变了时调用：复查是每几秒一轮的，逢轮就写会把错误提示盖掉。
     fn report_room_count(&mut self) {
         self.status = format!("发现 {} 个局域网房间", self.rooms.len());
+    }
+
+    /// 把实时人数同步到侧栏那一行。
+    ///
+    /// 侧栏平时只能靠几秒一轮的探测更新人数，正在聊的这个房间明明有实时推送，
+    /// 不同步的话就会出现「房间里写着 2 人、侧栏还停在 1 人」。
+    fn sync_online(&mut self, room: RoomId, online: u32) {
+        if let Some(known) = self.rooms.iter_mut().find(|known| known.id == room) {
+            known.online = online;
+        }
     }
 
     /// 追加一条消息。

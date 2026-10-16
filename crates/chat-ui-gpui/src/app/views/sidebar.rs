@@ -10,6 +10,8 @@ impl ChatApp {
         // 就得提示，否则正用着的时候反而是没提示的时候
         let local_exists = local.is_some() || self.hosted.is_some();
         let current = self.room.as_ref().map(|view| view.id);
+        // 「回到我的房间」那一行：本机有房间、且界面不是正待在这个房间里时才摆
+        let local_row = local.is_some() && current != self.local_room_id;
         let joined = self.room.as_ref().map(|view| view.joined).unwrap_or(false);
 
         let rows: Vec<AnyElement> = items
@@ -40,8 +42,9 @@ impl ChatApp {
                     .children(rows)
                     .when(empty, |this| this.child(hint("未发现房间，可手动连接"))),
             )
-            // 本机那个房间不在局域网里——它要点了才会被广播出去
-            .when(local.is_some(), |this| {
+            // 本机那个房间不在局域网里——它要点了才会被广播出去。
+            // 已经待在这个房间里（可能是本机另一个实例开着、我们接过去）就别再摆入口了
+            .when(local_row, |this| {
                 this.child(section_label("本机房间"))
                     .child(local_room_row(local.unwrap_or(0), cx))
             })
