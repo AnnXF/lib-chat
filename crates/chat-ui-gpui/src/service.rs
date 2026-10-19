@@ -38,7 +38,9 @@ use session::{Active, SessionCmd, open_session};
 /// 房间列表的人数复查间隔。房间要在未加入时也能看到人数，只能周期性探测。
 const PROBE_INTERVAL: Duration = Duration::from_secs(3);
 /// 单次握手与查询的超时。
-const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+/// 单次探测的总期限。必须长于传输层握手期限，否则探测会先取消，
+/// 服务端只能看到一条握手到一半就消失的连接。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 /// 建房：起监听与广播、开人数上报，并把房主自己也接进去。
 ///
 /// 自己接不进去不算建房失败——房间已经在广播了，别人照样能连，只是本窗口暂时不进房。

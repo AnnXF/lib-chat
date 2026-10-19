@@ -34,6 +34,21 @@ const BLOB_CHUNK: usize = 64 * 1024;
 /// 单次附件传输的总期限，避免对端失联时无限等待。
 const BLOB_TIMEOUT: Duration = Duration::from_secs(120);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 握手未完成就断开的标记：探测超时、界面取消都会走到这里，属于正常现象。
+const HANDSHAKE_ABORT: &str = "握手未完成";
+
+fn handshake_abort(step: &str) -> ChatError {
+    ChatError::Protocol(format!("{HANDSHAKE_ABORT}: {step}"))
+}
+
+/// 对端退出、探测取消或连接被关闭都属于常规结束，不必当成故障刷日志。
+fn is_routine_end(error: &ChatError) -> bool {
+    match error {
+        ChatError::Closed | ChatError::Transport(_) => true,
+        ChatError::Protocol(message) => message.starts_with(HANDSHAKE_ABORT),
+        _ => false,
+    }
+}
 
 fn transport_err(e: impl std::fmt::Display) -> ChatError {
     ChatError::Transport(e.to_string())
@@ -377,8 +392,12 @@ impl QuicServer {
         while let Some(incoming) = self.endpoint.accept().await {
             let acceptor = Arc::clone(&acceptor);
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(incoming, acceptor).await {
-                    eprintln!("连接处理结束: {e}");
+                if let Err(error) = handle_connection(incoming, acceptor).await {
+                    // 探测、切房、对端退出都会让连接半途结束，默认不打扰；
+                    // 需要排查时用 LIBCHAT_DEBUG=1 看全部结果。
+                    if !is_routine_end(&error) || std::env::var_os("LIBCHAT_DEBUG").is_some() {
+                        eprintln!("连接结束: {error}");
+                    }
                 }
             });
         }
@@ -399,16 +418,16 @@ async fn handle_connection(
 ) -> Result<()> {
     let conn = tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming)
         .await
-        .map_err(|_| ChatError::Protocol("连接握手超时".into()))?
+        .map_err(|_| handshake_abort("等待连接建立"))?
         .map_err(transport_err)?;
     let (mut send, mut recv) = tokio::time::timeout(HANDSHAKE_TIMEOUT, conn.accept_bi())
         .await
-        .map_err(|_| ChatError::Protocol("打开请求流超时".into()))?
+        .map_err(|_| handshake_abort("等待请求流"))?
         .map_err(transport_err)?;
 
     let device = match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame::<ClientFrame>(&mut recv))
         .await
-        .map_err(|_| ChatError::Protocol("等待 hello 超时".into()))??
+        .map_err(|_| handshake_abort("等待 hello"))??
     {
         ClientFrame::Hello { device, version } if version == PROTOCOL_VERSION => device,
         ClientFrame::Hello { version, .. } => {
