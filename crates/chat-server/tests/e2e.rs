@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use chat_core::Client;
 use chat_core::{
-    ChatError, ClientRequest, Connection, DeviceId, ErrorCode, Message, MessageStore, NewMessage,
-    RoomId, Seq, ServerEvent, EVENT_QUEUE_CAPACITY,
+    guess_mime, sha256_hex, Attachment, AttachmentId, ChatError, ClientRequest, Connection,
+    DeviceId, ErrorCode, Message, MessageKind, MessageStore, NewMessage, RoomId, Seq, ServerEvent,
+    EVENT_QUEUE_CAPACITY,
 };
 use chat_server::Server;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -373,6 +374,14 @@ impl MessageStore for FailingStore {
             Ok(0)
         }
     }
+
+    async fn attachment(
+        &self,
+        _: RoomId,
+        _: chat_core::AttachmentId,
+    ) -> chat_core::Result<Option<chat_core::Attachment>> {
+        Ok(None)
+    }
 }
 
 #[tokio::test]
@@ -517,4 +526,137 @@ async fn slow_member_is_disconnected_without_blocking_other_members() {
         |e| matches!(e, ServerEvent::Message { message } if message.text == "still online"),
     )
     .await;
+}
+
+fn attachment_of(name: &str, data: &[u8]) -> Attachment {
+    Attachment {
+        id: AttachmentId::new(),
+        name: name.into(),
+        size: data.len() as u64,
+        mime: guess_mime(name).into(),
+        sha256: sha256_hex(data),
+    }
+}
+
+#[tokio::test]
+async fn file_message_carries_attachment_and_can_be_downloaded() {
+    let server = Server::new("room");
+    let room = server.room();
+    let sender = Client::new(server.connect(DeviceId::new()).await);
+    let receiver = Client::new(server.connect(DeviceId::new()).await);
+    for (client, name) in [(&sender, "Alice"), (&receiver, "Bob")] {
+        client.join(room, name).await.unwrap();
+        wait_for(client, |e| matches!(e, ServerEvent::Joined { .. })).await;
+    }
+
+    let data = b"hello, file".to_vec();
+    let attachment = attachment_of("hello.txt", &data);
+    sender
+        .upload(room, attachment.clone(), data.clone())
+        .await
+        .unwrap();
+    sender
+        .send_file(room, uuid::Uuid::new_v4(), attachment.clone())
+        .await
+        .unwrap();
+
+    match wait_for(&receiver, |e| matches!(e, ServerEvent::Message { .. })).await {
+        ServerEvent::Message { message } => {
+            assert_eq!(message.kind, MessageKind::File);
+            assert_eq!(message.text, "");
+            let received = message.attachment.expect("文件消息必须带附件");
+            assert_eq!(received.id, attachment.id);
+            assert_eq!(received.name, "hello.txt");
+            assert_eq!(received.size, data.len() as u64);
+            assert_eq!(received.mime, "text/plain");
+        }
+        _ => unreachable!(),
+    }
+
+    assert_eq!(receiver.download(room, attachment.id).await.unwrap(), data);
+
+    receiver.history(room, None, 10).await.unwrap();
+    match wait_for(&receiver, |e| matches!(e, ServerEvent::History { .. })).await {
+        ServerEvent::History { messages, .. } => {
+            assert_eq!(messages.len(), 1);
+            assert_eq!(
+                messages[0].attachment.as_ref().map(|a| a.sha256.as_str()),
+                Some(attachment.sha256.as_str())
+            );
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn upload_requires_membership_and_matching_content() {
+    let server = Server::new("room");
+    let room = server.room();
+    let member = Client::new(server.connect(DeviceId::new()).await);
+    let outsider = Client::new(server.connect(DeviceId::new()).await);
+    member.join(room, "Alice").await.unwrap();
+    wait_for(&member, |e| matches!(e, ServerEvent::Joined { .. })).await;
+
+    let data = b"payload".to_vec();
+    let attachment = attachment_of("a.bin", &data);
+
+    // 未加入的连接不能上传，也不能下载
+    assert!(outsider
+        .upload(room, attachment.clone(), data.clone())
+        .await
+        .is_err());
+    assert!(outsider.download(room, attachment.id).await.is_err());
+
+    // 摘要不一致必须拒绝
+    let mut wrong_hash = attachment.clone();
+    wrong_hash.sha256 = sha256_hex(b"other");
+    assert!(member.upload(room, wrong_hash, data.clone()).await.is_err());
+
+    // 大小不一致必须拒绝
+    let mut wrong_size = attachment.clone();
+    wrong_size.size += 1;
+    assert!(member.upload(room, wrong_size, data.clone()).await.is_err());
+
+    // 没有上传就发文件消息，必须报 NotFound
+    member
+        .send_file(room, uuid::Uuid::new_v4(), attachment.clone())
+        .await
+        .unwrap();
+    match wait_for(&member, |e| matches!(e, ServerEvent::Error { .. })).await {
+        ServerEvent::Error { code, .. } => assert_eq!(code, ErrorCode::NotFound),
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn duplicate_file_message_is_stored_once() {
+    let server = Server::new("room");
+    let room = server.room();
+    let client = Client::new(server.connect(DeviceId::new()).await);
+    client.join(room, "Alice").await.unwrap();
+    wait_for(&client, |e| matches!(e, ServerEvent::Joined { .. })).await;
+
+    let data = b"same".to_vec();
+    let attachment = attachment_of("same.txt", &data);
+    client
+        .upload(room, attachment.clone(), data.clone())
+        .await
+        .unwrap();
+    let id = uuid::Uuid::new_v4();
+    client
+        .send_file(room, id, attachment.clone())
+        .await
+        .unwrap();
+    wait_for(&client, |e| matches!(e, ServerEvent::Message { .. })).await;
+    client.send_file(room, id, attachment).await.unwrap();
+    match wait_for(&client, |e| matches!(e, ServerEvent::Message { .. })).await {
+        ServerEvent::Message { message } => assert_eq!(message.seq, 1),
+        _ => unreachable!(),
+    }
+
+    client.history(room, None, 10).await.unwrap();
+    match wait_for(&client, |e| matches!(e, ServerEvent::History { .. })).await {
+        ServerEvent::History { messages, .. } => assert_eq!(messages.len(), 1),
+        _ => unreachable!(),
+    }
 }

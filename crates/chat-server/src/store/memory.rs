@@ -3,7 +3,10 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use chat_core::{AppendResult, ChatError, Message, MessageStore, NewMessage, Result, RoomId, Seq};
+use chat_core::{
+    AppendResult, Attachment, AttachmentId, ChatError, Message, MessageStore, NewMessage, Result,
+    RoomId, Seq,
+};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -14,6 +17,7 @@ struct RoomLog {
     next_seq: Seq,
     messages: Vec<Message>,
     ids: HashMap<Uuid, usize>,
+    attachments: HashMap<AttachmentId, Attachment>,
 }
 
 /// 进程内消息存储，按房间维护单调序号。
@@ -46,8 +50,12 @@ impl MessageStore for InMemoryStore {
             sender_name: msg.sender_name,
             kind: msg.kind,
             text: msg.text,
+            attachment: msg.attachment.clone(),
             server_ts_ms: now_ms(),
         };
+        if let Some(attachment) = &stored.attachment {
+            log.attachments.insert(attachment.id, attachment.clone());
+        }
         log.ids.insert(stored.client_msg_id, log.messages.len());
         log.messages.push(stored.clone());
         Ok(AppendResult {
@@ -91,5 +99,12 @@ impl MessageStore for InMemoryStore {
     async fn latest_seq(&self, room: RoomId) -> Result<Seq> {
         let guard = self.inner.lock().await;
         Ok(guard.get(&room).map(|l| l.next_seq).unwrap_or(0))
+    }
+
+    async fn attachment(&self, room: RoomId, id: AttachmentId) -> Result<Option<Attachment>> {
+        let guard = self.inner.lock().await;
+        Ok(guard
+            .get(&room)
+            .and_then(|log| log.attachments.get(&id).cloned()))
     }
 }

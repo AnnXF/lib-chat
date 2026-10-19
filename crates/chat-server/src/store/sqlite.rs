@@ -7,7 +7,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use chat_core::{AppendResult, ChatError, MessageStore, NewMessage, Result};
-use chat_core::{Message, MessageKind, RoomId, Seq};
+use chat_core::{Attachment, AttachmentId, Message, MessageKind, RoomId, Seq};
 use sea_query::{ColumnDef, Expr, Index, Order, Query, SqliteQueryBuilder, Table, Value, Values};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
@@ -25,6 +25,11 @@ mod messages {
     pub const KIND: &str = "kind";
     pub const BODY: &str = "body";
     pub const SERVER_TS: &str = "server_ts";
+    pub const ATTACHMENT_ID: &str = "attachment_id";
+    pub const ATTACHMENT_NAME: &str = "attachment_name";
+    pub const ATTACHMENT_SIZE: &str = "attachment_size";
+    pub const ATTACHMENT_MIME: &str = "attachment_mime";
+    pub const ATTACHMENT_SHA256: &str = "attachment_sha256";
 }
 
 /// `room_meta` 表：单行，记着本库属于哪个房间。
@@ -38,7 +43,7 @@ mod room_meta {
 const ROOM_ROW: i32 = 1;
 
 /// 读消息时统一选出的列，顺序与 [`row_to_message`] 的下标一一对应。
-const MESSAGE_COLUMNS: [&str; 7] = [
+const MESSAGE_COLUMNS: [&str; 12] = [
     messages::SEQ,
     messages::MSG_ID,
     messages::SENDER,
@@ -46,6 +51,11 @@ const MESSAGE_COLUMNS: [&str; 7] = [
     messages::KIND,
     messages::BODY,
     messages::SERVER_TS,
+    messages::ATTACHMENT_ID,
+    messages::ATTACHMENT_NAME,
+    messages::ATTACHMENT_SIZE,
+    messages::ATTACHMENT_MIME,
+    messages::ATTACHMENT_SHA256,
 ];
 
 pub struct SqliteStore {
@@ -101,6 +111,11 @@ impl SqliteStore {
             .col(ColumnDef::new(messages::KIND).text().not_null())
             .col(ColumnDef::new(messages::BODY).text().not_null())
             .col(ColumnDef::new(messages::SERVER_TS).big_integer().not_null())
+            .col(ColumnDef::new(messages::ATTACHMENT_ID).text())
+            .col(ColumnDef::new(messages::ATTACHMENT_NAME).text())
+            .col(ColumnDef::new(messages::ATTACHMENT_SIZE).big_integer())
+            .col(ColumnDef::new(messages::ATTACHMENT_MIME).text())
+            .col(ColumnDef::new(messages::ATTACHMENT_SHA256).text())
             .primary_key(Index::create().col(messages::ROOM_ID).col(messages::SEQ))
             .to_owned();
 
@@ -194,7 +209,11 @@ impl MessageStore for SqliteStore {
                 .map_err(db_err)?
             {
                 let stored = row_to_message(room, &row)?;
-                if stored.text != msg.text || stored.kind != msg.kind {
+                if stored.text != msg.text
+                    || stored.kind != msg.kind
+                    || stored.attachment.as_ref().map(|a| &a.sha256)
+                        != msg.attachment.as_ref().map(|a| &a.sha256)
+                {
                     return Err(ChatError::Protocol("消息标识与原始内容不一致".into()));
                 }
                 return Ok(AppendResult {
@@ -222,6 +241,7 @@ impl MessageStore for SqliteStore {
                 sender_name: msg.sender_name,
                 kind: msg.kind,
                 text: msg.text,
+                attachment: msg.attachment,
                 server_ts_ms: now_ms(),
             };
 
@@ -236,6 +256,11 @@ impl MessageStore for SqliteStore {
                     messages::KIND,
                     messages::BODY,
                     messages::SERVER_TS,
+                    messages::ATTACHMENT_ID,
+                    messages::ATTACHMENT_NAME,
+                    messages::ATTACHMENT_SIZE,
+                    messages::ATTACHMENT_MIME,
+                    messages::ATTACHMENT_SHA256,
                 ])
                 .values_panic([
                     stored.room.to_string().into(),
@@ -246,6 +271,11 @@ impl MessageStore for SqliteStore {
                     kind_str(stored.kind).into(),
                     stored.text.clone().into(),
                     stored.server_ts_ms.into(),
+                    stored.attachment.as_ref().map(|a| a.id.to_string()).into(),
+                    stored.attachment.as_ref().map(|a| a.name.clone()).into(),
+                    stored.attachment.as_ref().map(|a| a.size as i64).into(),
+                    stored.attachment.as_ref().map(|a| a.mime.clone()).into(),
+                    stored.attachment.as_ref().map(|a| a.sha256.clone()).into(),
                 ])
                 .build(SqliteQueryBuilder);
 
@@ -336,6 +366,38 @@ impl MessageStore for SqliteStore {
             .map_err(db_err)?;
         Ok(row.get::<Option<i64>, _>(0).unwrap_or(0))
     }
+
+    async fn attachment(&self, room: RoomId, id: AttachmentId) -> Result<Option<Attachment>> {
+        let (sql, values) = Query::select()
+            .columns(MESSAGE_COLUMNS)
+            .from(messages::TABLE)
+            .and_where(Expr::col(messages::ROOM_ID).eq(room.to_string()))
+            .and_where(Expr::col(messages::ATTACHMENT_ID).eq(id.to_string()))
+            .build(SqliteQueryBuilder);
+        let row = bind(sqlx::query(&sql), values)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        match row {
+            Some(row) => Ok(row_to_message(room, &row)?.attachment),
+            None => Ok(None),
+        }
+    }
+}
+
+fn row_to_attachment(row: &sqlx::sqlite::SqliteRow) -> Result<Option<Attachment>> {
+    let Some(id) = row.get::<Option<String>, _>(7) else {
+        return Ok(None);
+    };
+    Ok(Some(Attachment {
+        id: id
+            .parse()
+            .map_err(|e| ChatError::Storage(format!("附件标识无效: {e}")))?,
+        name: row.get::<Option<String>, _>(8).unwrap_or_default(),
+        size: row.get::<Option<i64>, _>(9).unwrap_or(0).max(0) as u64,
+        mime: row.get::<Option<String>, _>(10).unwrap_or_default(),
+        sha256: row.get::<Option<String>, _>(11).unwrap_or_default(),
+    }))
 }
 
 fn row_to_message(room: RoomId, row: &sqlx::sqlite::SqliteRow) -> Result<Message> {
@@ -353,6 +415,7 @@ fn row_to_message(room: RoomId, row: &sqlx::sqlite::SqliteRow) -> Result<Message
         sender_name: row.get(3),
         kind: kind_from_str(&row.get::<String, _>(4)),
         text: row.get(5),
+        attachment: row_to_attachment(row)?,
         server_ts_ms: row.get(6),
     })
 }
@@ -360,12 +423,14 @@ fn row_to_message(room: RoomId, row: &sqlx::sqlite::SqliteRow) -> Result<Message
 fn kind_str(kind: MessageKind) -> &'static str {
     match kind {
         MessageKind::Text => "text",
+        MessageKind::File => "file",
         MessageKind::System => "system",
     }
 }
 
 fn kind_from_str(text: &str) -> MessageKind {
     match text {
+        "file" => MessageKind::File,
         "system" => MessageKind::System,
         _ => MessageKind::Text,
     }
@@ -411,6 +476,7 @@ mod tests {
             sender_name: "Alice".into(),
             kind: MessageKind::Text,
             text: text.into(),
+            attachment: None,
         }
     }
 

@@ -17,6 +17,8 @@ use gpui::{
 
 use crate::app::theme;
 
+use chat_core::Attachment;
+
 use super::{ChatApp, ChatLine, DiscoveredRoom, HostedRoom};
 
 /// 给关键布局节点挂上固定标识，供无头 UI 测试查询边界。
@@ -114,10 +116,93 @@ fn button(
         .into_any_element()
 }
 
+/// 文件消息的保存动作。
+pub(crate) type SaveHandler = Box<dyn Fn(&MouseUpEvent, &mut Window, &mut App) + 'static>;
+
+/// 字节数转成便于阅读的大小。
+pub(crate) fn human_size(bytes: u64) -> String {
+    const KB: f64 = 1024.;
+    const MB: f64 = KB * 1024.;
+    const GB: f64 = MB * 1024.;
+    let bytes = bytes as f64;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes / GB)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes / MB)
+    } else if bytes >= KB {
+        format!("{:.0} KB", bytes / KB)
+    } else {
+        format!("{bytes:.0} B")
+    }
+}
+
+/// 文件消息的内容块：类型标签 + 文件名 + 大小，点一下另存。
+fn attachment_body(attachment: &Attachment, save: Option<SaveHandler>) -> AnyElement {
+    let card = div()
+        .id("file-card")
+        .test_id("file-card")
+        .max_w(px(420.))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .px_3()
+        .py_2()
+        .rounded_md()
+        .bg(rgb(theme::FIELD))
+        .child(
+            div()
+                .flex_none()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(rgb(theme::ACCENT_SOFT))
+                .text_xs()
+                .text_color(rgb(theme::ACCENT))
+                .child("文件"),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .truncate()
+                        .text_sm()
+                        .text_color(rgb(theme::TEXT))
+                        .child(attachment.name.clone()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::MUTED))
+                        .child(human_size(attachment.size)),
+                ),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text_xs()
+                .text_color(rgb(theme::ACCENT))
+                .child("保存"),
+        );
+
+    match save {
+        Some(save) => card
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::HOVER)))
+            .on_mouse_up(MouseButton::Left, save)
+            .into_any_element(),
+        None => card.into_any_element(),
+    }
+}
+
 /// 一条消息。
 ///
 /// 自己发的靠右并带强调底色，别人的靠左只留文字，视觉噪声更低。
-fn render_line(line: &ChatLine) -> AnyElement {
+fn render_line(line: &ChatLine, save: Option<SaveHandler>) -> AnyElement {
     if line.system {
         return div()
             .w_full()
@@ -138,14 +223,18 @@ fn render_line(line: &ChatLine) -> AnyElement {
         (line.sender.as_str(), theme::MUTED)
     };
 
-    let body = div()
-        .max_w(px(520.))
-        .text_sm()
-        .text_color(rgb(theme::TEXT))
-        .child(line.text.clone())
-        .when(line.mine, |this| {
-            this.px_3().py_2().rounded_md().bg(rgb(theme::ACCENT_SOFT))
-        });
+    let body = match &line.attachment {
+        Some(attachment) => attachment_body(attachment, save),
+        None => div()
+            .max_w(px(520.))
+            .text_sm()
+            .text_color(rgb(theme::TEXT))
+            .child(line.text.clone())
+            .when(line.mine, |this| {
+                this.px_3().py_2().rounded_md().bg(rgb(theme::ACCENT_SOFT))
+            })
+            .into_any_element(),
+    };
 
     div()
         .w_full()
@@ -189,13 +278,15 @@ mod perf {
                     seq: Some(i as i64 + 1),
                     sender: "某人".into(),
                     text: format!("这是第 {i} 条消息，长度大约二十来个字"),
+                    attachment: None,
                     mine: i % 2 == 0,
                     system: false,
                 })
                 .collect();
 
             let started = Instant::now();
-            let elements: Vec<AnyElement> = lines.iter().map(render_line).collect();
+            let elements: Vec<AnyElement> =
+                lines.iter().map(|line| render_line(line, None)).collect();
             let elapsed = started.elapsed();
             println!(
                 "{count:>7} 条 → 构造元素 {elapsed:>10.2?}（{:.2}µs/条）",

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use crate::proto::{ClientRequest, Profile, RoomId, Seq, ServerEvent};
+use crate::proto::{Attachment, AttachmentId, ClientRequest, Profile, RoomId, Seq, ServerEvent};
 use crate::{Connection, Result};
 
 #[derive(Clone)]
@@ -54,6 +54,32 @@ impl Client {
                 text: text.into(),
             })
             .await
+    }
+
+    /// 发送一条文件消息；附件内容需先用 [`Client::upload`] 上传完成。
+    pub async fn send_file(
+        &self,
+        room: RoomId,
+        client_msg_id: Uuid,
+        attachment: Attachment,
+    ) -> Result<()> {
+        self.conn
+            .request(ClientRequest::SendFile {
+                room,
+                client_msg_id,
+                attachment,
+            })
+            .await
+    }
+
+    /// 上传附件内容。元数据里的 `size` 与 `sha256` 必须与 `data` 一致。
+    pub async fn upload(&self, room: RoomId, attachment: Attachment, data: Vec<u8>) -> Result<()> {
+        self.conn.upload(room, attachment, data).await
+    }
+
+    /// 下载附件内容。
+    pub async fn download(&self, room: RoomId, id: AttachmentId) -> Result<Vec<u8>> {
+        self.conn.download(room, id).await
     }
 
     pub async fn history(&self, room: RoomId, before: Option<Seq>, limit: u32) -> Result<()> {

@@ -140,9 +140,18 @@ chat-cli       命令行 host / join
 struct NewMessage {
     client_msg_id: Uuid,   // 客户端生成，用于幂等去重
     sender: UserId,
-    kind: MessageKind,     // Text / Image / Video / Sticker / System
-    body: MessageBody,
+    kind: MessageKind,     // Text / File / System
+    text: String,          // 文件消息为空串
+    attachment: Option<Attachment>,
     client_ts: Timestamp,
+}
+
+struct Attachment {        // 内容不随消息下发，按 id 单独取
+    id: AttachmentId,
+    name: String,
+    size: u64,             // 上限 64 MiB
+    mime: String,
+    sha256: String,        // 内容摘要，用于校验与去重
 }
 
 // 服务端落库后
@@ -200,7 +209,8 @@ struct StoredMessage {
 
 统一用 `sea-query` + `sqlx`，SQL 一律经 builder 构造，不拼字符串。
 
-- `messages(room_id, seq, msg_id, sender, sender_name, kind, body, server_ts)`，PK `(room_id, seq)`。
+- `messages(room_id, seq, msg_id, sender, sender_name, kind, body, server_ts, attachment_id, attachment_name, attachment_size, attachment_mime, attachment_sha256)`，PK `(room_id, seq)`；附件内容单独存放。
+- 附件内容按 `sha256` 命名，放在 `~/.lib-chat/rooms/room-<广播端口>.files/`：同一份文件被多次发送只落一份，清空房间时整目录删除。
 - `room_meta(id = 1, room_id)`：单行，记着本库属于哪个房间 —— **这就是「重启后还是同一个房间」的依据**。
 - 消息**全部落盘，进程内不留副本**，所以房间历史再长也不会把内存撑爆。
 - 序号在写锁内按 `MAX(seq) + 1` 分配，避免两条连接抢到同一个 `seq`。
@@ -309,6 +319,7 @@ struct StoredMessage {
 | **本机房间入口** | **完成** | 重开后侧栏提示「我的房间」，点它续用原房间；「新建房间」清空重建 |
 | **布局稳定性** | **完成** | 顶栏/侧栏底部固定，长文本省略；无头 UI 测试保证默认与矮窗口下完整可见 |
 | **测试流水线** | **完成** | `scripts/verify.sh` 串起格式、Clippy、全量测试、UI 布局与后端压测；规范见 `docs/testing.md` |
+| **文件消息** | **完成** | 发送任意文件（≤64 MiB）：独立 QUIC 流分块传输、内容按 SHA-256 去重落盘、点击另存；仅成员可收发 |
 | M3 单聊与多会话 | 未开始 | |
 | M4 富媒体 | 未开始 | |
 | M5 万人群 | 未开始 | |
@@ -509,3 +520,4 @@ quinn 默认 `max_idle_timeout = 30s` 且**不发保活包**，而安静房间�
 - **重连窗口 60 秒**：断开后自动重连并恢复身份；超过窗口则回到大厅并提示「连接已断开，可重新加入」，不会无限停在「正在重连」。
 - **单会话**：界面同一时刻只连接一个房间。切换房间会**先退出旧房间**再连新的，在线人数立刻回落；自己创建的房间在切换后仍继续广播与监听，直到再次「创建房间」或关闭应用。
 - **房主仲裁未实现**：`DeviceId` 最小者优先的规则尚未落地，当前由用户手动创建房间。
+- **文件消息**：不显示图片/视频缩略图，附件一律以文件卡片呈现；上传下载在内存中整体缓冲（上限 64 MiB），没有断点续传与进度百分比；附件只存在房主磁盘上，房主换机或清空房间后历史附件不可再取。

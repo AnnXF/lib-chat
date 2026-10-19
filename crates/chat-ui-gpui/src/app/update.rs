@@ -7,6 +7,8 @@ use gpui::ListOffset;
 
 use crate::service::UiEvent;
 
+use chat_core::Attachment;
+
 use super::{ChatApp, ChatLine, DiscoveredRoom, HostedRoom, RoomView};
 
 impl ChatApp {
@@ -169,9 +171,10 @@ impl ChatApp {
                 sender_id,
                 sender,
                 text,
+                attachment,
             } => {
                 if self.showing(room).is_some() {
-                    let line = chat_line(seq, sender_id, sender, text, self.my_id);
+                    let line = chat_line(seq, sender_id, sender, text, attachment, self.my_id);
                     self.push_line(line);
                 }
             }
@@ -188,7 +191,7 @@ impl ChatApp {
                 let my_id = self.my_id;
                 let lines = messages
                     .into_iter()
-                    .map(|m| chat_line(m.seq, m.sender_id, m.sender, m.text, my_id))
+                    .map(|m| chat_line(m.seq, m.sender_id, m.sender, m.text, m.attachment, my_id))
                     .collect();
                 // 比当前会话更早，插到最前才是正确的时间顺序
                 self.prepend_lines(lines);
@@ -200,7 +203,7 @@ impl ChatApp {
                 let my_id = self.my_id;
                 let lines = messages
                     .into_iter()
-                    .map(|m| chat_line(m.seq, m.sender_id, m.sender, m.text, my_id))
+                    .map(|m| chat_line(m.seq, m.sender_id, m.sender, m.text, m.attachment, my_id))
                     .collect();
                 self.push_lines(lines);
             }
@@ -326,6 +329,7 @@ impl ChatApp {
             seq: None,
             sender: "系统".into(),
             text,
+            attachment: None,
             mine: false,
             system: true,
         });
@@ -337,12 +341,14 @@ fn chat_line(
     sender_id: UserId,
     sender: String,
     text: String,
+    attachment: Option<Attachment>,
     mine: Option<UserId>,
 ) -> ChatLine {
     ChatLine {
         seq: Some(seq),
         sender,
         text,
+        attachment,
         mine: mine == Some(sender_id),
         system: false,
     }

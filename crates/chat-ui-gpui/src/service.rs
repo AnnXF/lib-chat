@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chat_core::Client;
+use chat_core::{Attachment, AttachmentId};
 use chat_core::{ChatError, Connection, ConnectionAcceptor};
 use chat_core::{LobbyInfo, Message, RoomId, Seq, ServerEvent, UserId};
 use chat_discovery::{RoomAnnouncer, RoomBrowser};
@@ -119,6 +120,7 @@ pub struct HistoryMessage {
     pub sender_id: UserId,
     pub sender: String,
     pub text: String,
+    pub attachment: Option<Attachment>,
 }
 
 #[derive(Clone, Debug)]
@@ -172,6 +174,7 @@ pub enum UiEvent {
         sender_id: UserId,
         sender: String,
         text: String,
+        attachment: Option<Attachment>,
     },
     /// 取回的一页历史（比当前会话更早），界面应插到列表最前。
     History {
@@ -233,6 +236,15 @@ pub enum UiCommand {
     Leave,
     Send {
         text: String,
+    },
+    /// 发送一个本地文件。
+    SendFile {
+        path: PathBuf,
+    },
+    /// 把聊天里的附件另存到本地。
+    SaveFile {
+        id: AttachmentId,
+        path: PathBuf,
     },
     /// 往前翻一页更早的历史。
     LoadOlder,
@@ -675,6 +687,28 @@ async fn run(
                     send_session(session, SessionCmd::LoadOlder, &events).await;
                 }
             }
+
+            UiCommand::SendFile { path } => match &active {
+                Some(session) => {
+                    send_session(session, SessionCmd::SendFile(path), &events).await;
+                }
+                None => {
+                    let _ = events
+                        .send_async(UiEvent::Error("还没有连上房间".into()))
+                        .await;
+                }
+            },
+
+            UiCommand::SaveFile { id, path } => match &active {
+                Some(session) => {
+                    send_session(session, SessionCmd::SaveFile { id, path }, &events).await;
+                }
+                None => {
+                    let _ = events
+                        .send_async(UiEvent::Error("还没有连上房间".into()))
+                        .await;
+                }
+            },
         }
     }
 }

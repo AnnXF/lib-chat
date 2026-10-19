@@ -4,4 +4,4 @@ mod server;
 mod store;
 
 pub use server::{Acceptor, ConnId, InProcConnection, Server, ServerHandle};
-pub use store::{InMemoryStore, SqliteStore};
+pub use store::{BlobStore, DiskBlobs, InMemoryStore, MemoryBlobs, SqliteStore};

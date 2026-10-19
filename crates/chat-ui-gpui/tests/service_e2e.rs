@@ -1383,3 +1383,69 @@ fn switching_rooms_does_not_leak_old_presence() {
         }
     }
 }
+
+/// 通过界面指令发送文件：本机房主自己加入后发文件，再另存回来。
+#[test]
+fn sends_and_saves_a_file_through_the_service() {
+    let (_guard, beacon_port) = serial();
+    let dir = test_data_dir(beacon_port);
+    let payload: Vec<u8> = (0..70_000u32).map(|i| (i % 253) as u8).collect();
+    let source = dir.join("资料.txt");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(&source, &payload).unwrap();
+
+    let (cmds, events) = spawn_with_data(beacon_port, Liveness::default(), dir.clone());
+    cmds.send(UiCommand::Host {
+        name: "文件房间".into(),
+    })
+    .unwrap();
+    recv_until(&events, |e| matches!(e, UiEvent::Lobby { .. }));
+    cmds.send(UiCommand::Join {
+        name: "Alice".into(),
+    })
+    .unwrap();
+    recv_until(&events, |e| matches!(e, UiEvent::Joined { .. }));
+
+    cmds.send(UiCommand::SendFile { path: source }).unwrap();
+    let attachment = match recv_until(&events, |e| {
+        matches!(
+            e,
+            UiEvent::Message {
+                attachment: Some(_),
+                ..
+            }
+        )
+    }) {
+        UiEvent::Message {
+            attachment: Some(attachment),
+            ..
+        } => attachment,
+        other => panic!("期望文件消息，实际 {other:?}"),
+    };
+    assert_eq!(attachment.size, payload.len() as u64);
+    assert_eq!(attachment.name, "资料.txt");
+    assert_eq!(attachment.mime, "text/plain");
+
+    let target = dir.join("另存为.txt");
+    cmds.send(UiCommand::SaveFile {
+        id: attachment.id,
+        path: target.clone(),
+    })
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(saved) = std::fs::read(&target)
+            && saved == payload
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "等待附件保存超时，目标文件未写入"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        // 同时把事件消化掉，避免通道堆满
+        let _ = events.recv_timeout(Duration::from_millis(10));
+    }
+}

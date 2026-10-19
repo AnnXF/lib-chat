@@ -5,9 +5,11 @@
 //!
 //! 服务端只认 `Arc<dyn MessageStore>`，换实现不动房间逻辑。
 
+mod blobs;
 mod memory;
 mod sqlite;
 
+pub use blobs::{BlobStore, DiskBlobs, MemoryBlobs};
 pub use memory::InMemoryStore;
 pub use sqlite::SqliteStore;
 

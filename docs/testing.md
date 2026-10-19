@@ -31,6 +31,7 @@ cargo test -p chat-server --test load -- --nocapture
 | 后端集成 | `crates/chat-server/tests/e2e.rs` | 加入/退出、扇出、历史、同步、慢客户端、幂等 | 任何服务端行为变化 |
 | 传输集成 | `crates/chat-transport-quic/tests/` | 真实 QUIC 握手、证书指纹、保活、断线 | 传输参数、超时、TLS 相关改动 |
 | 后端压测 | `crates/chat-server/tests/load.rs` | 并发顺序、去重、无丢失、时延与吞吐 | 改动锁、队列、存储或广播路径 |
+| 附件传输 | `crates/chat-server/tests/e2e.rs`、`crates/chat-transport-quic/tests/quic_e2e.rs`、`crates/chat-ui-gpui/tests/service_e2e.rs` | 成员校验、摘要/大小校验、内容去重、上传下载往返、另存到本地 | 任何附件、文件消息或存储布局改动 |
 | 服务集成 | `crates/chat-ui-gpui/tests/service_e2e.rs` | 连接、重连、托管、信任、切房、历史补齐 | 改动 `service/` 任一模块 |
 | UI 布局 | `crates/chat-ui-gpui/tests/ui_layout.rs` | 默认窗口与小窗口下各区域完整可见 | 改动 `app/`、`views/`、样式或文案长度 |
 
@@ -40,6 +41,7 @@ cargo test -p chat-server --test load -- --nocapture
 2. **后端行为**：在 `chat-server/tests/e2e.rs` 增加一条端到端用例，名字写清「什么条件下必须发生什么」，例如 `duplicate_message_replies_to_sender_without_broadcast_or_new_seq`。
 3. **资源与并发**：若新增队列、锁或后台任务，同时在 `load.rs` 补一条并发用例，断言顺序、去重与不丢失；时延阈值放宽到不会被 CI 抖动误判。
 4. **传输相关**：改握手、超时、证书时补 `chat-transport-quic/tests/`，用真实 QUIC 而不是 mock。
+   - 附件/文件消息改动额外覆盖：非成员被拒、摘要或大小不符被拒、同一内容不重复占盘、跨连接下载内容一致。
 5. **服务层**：改 `service/`（连接、重连、托管、信任）必须在 `service_e2e.rs` 覆盖成功与失败两条路径；失败路径要断言「旧会话仍可用」。
 6. **界面**：改 `app/` 或 `views/` 时，为关键布局节点保留或新增 `test_id`，并在 `ui_layout.rs` 断言其边界仍在窗口内。
 7. **文档**：能力进入 `plan.md` 的进度表，行为边界（例如「进程重启后待发送不恢复」）一并写明。

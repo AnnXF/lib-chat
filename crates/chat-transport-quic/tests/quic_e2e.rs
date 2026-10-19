@@ -3,9 +3,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chat_core::Client;
-use chat_core::ConnectionAcceptor;
-use chat_core::ServerEvent;
+use chat_core::{
+    guess_mime, sha256_hex, Attachment, AttachmentId, Client, ConnectionAcceptor, ServerEvent,
+};
 use chat_server::{Acceptor, Server};
 use chat_transport_quic::{connect, QuicServer, SelfSignedCert};
 
@@ -105,4 +105,55 @@ fn identity_survives_restart_and_missing_identity_is_rejected() {
     std::fs::remove_file(&path).unwrap();
     assert!(SelfSignedCert::load_or_create(&path, false).is_err());
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn transfers_attachment_over_dedicated_stream() {
+    let (server, _quic, addr, fingerprint) = start_server().await;
+    let room = server.room();
+
+    let sender = Client::new(Arc::new(
+        connect(addr, &fingerprint).await.expect("发送端连接失败"),
+    ));
+    let receiver = Client::new(Arc::new(
+        connect(addr, &fingerprint).await.expect("接收端连接失败"),
+    ));
+    for (client, name) in [(&sender, "Alice"), (&receiver, "Bob")] {
+        client.join(room, name).await.unwrap();
+        wait_for(client, |e| matches!(e, ServerEvent::Joined { .. })).await;
+    }
+
+    let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let attachment = Attachment {
+        id: AttachmentId::new(),
+        name: "blob.bin".into(),
+        size: data.len() as u64,
+        mime: guess_mime("blob.bin").into(),
+        sha256: sha256_hex(&data),
+    };
+
+    sender
+        .upload(room, attachment.clone(), data.clone())
+        .await
+        .expect("上传失败");
+    sender
+        .send_file(room, uuid::Uuid::new_v4(), attachment.clone())
+        .await
+        .unwrap();
+    match wait_for(&receiver, |e| matches!(e, ServerEvent::Message { .. })).await {
+        ServerEvent::Message { message } => {
+            assert_eq!(
+                message.attachment.as_ref().map(|a| a.id),
+                Some(attachment.id)
+            );
+        }
+        _ => unreachable!(),
+    }
+
+    let downloaded = receiver
+        .download(room, attachment.id)
+        .await
+        .expect("下载失败");
+    assert_eq!(downloaded, data);
+    assert_eq!(sha256_hex(&downloaded), attachment.sha256);
 }

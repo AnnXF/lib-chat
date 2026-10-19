@@ -8,8 +8,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chat_core::{ChatError, Connection, ConnectionAcceptor, EventStream, Result};
-use chat_core::{ClientRequest, DeviceId, RoomInfo, ServerEvent};
+use chat_core::{
+    Attachment, AttachmentId, ClientRequest, DeviceId, RoomId, RoomInfo, ServerEvent,
+    MAX_ATTACHMENT_BYTES,
+};
+use chat_core::{ChatError, Connection, ConnectionAcceptor, EventStream, RequestSink, Result};
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig};
 use sha2::{Digest, Sha256};
@@ -26,6 +29,10 @@ pub use trust::{validate_fingerprint, TrustStore};
 
 /// 单帧上限，防止畸形长度导致巨额分配。
 const MAX_FRAME: usize = 4 * 1024 * 1024;
+/// 附件分块大小。分块传输避免一次性占满帧上限。
+const BLOB_CHUNK: usize = 64 * 1024;
+/// 单次附件传输的总期限，避免对端失联时无限等待。
+const BLOB_TIMEOUT: Duration = Duration::from_secs(120);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn transport_err(e: impl std::fmt::Display) -> ChatError {
@@ -92,6 +99,28 @@ enum ServerFrame {
     Event(ServerEvent),
 }
 
+/// 附件流的第一帧：说明这条流要做什么。
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
+enum BlobRequest {
+    Upload {
+        room: RoomId,
+        attachment: Attachment,
+    },
+    Download {
+        room: RoomId,
+        id: AttachmentId,
+    },
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
+enum BlobReply {
+    Done,
+    Begin { size: u64 },
+    Error { message: String },
+}
+
 async fn write_frame<T: serde::Serialize>(send: &mut quinn::SendStream, frame: &T) -> Result<()> {
     let payload = serde_json::to_vec(frame).map_err(|e| ChatError::Protocol(e.to_string()))?;
     if payload.len() > MAX_FRAME {
@@ -114,6 +143,30 @@ async fn read_frame<T: serde::de::DeserializeOwned>(recv: &mut quinn::RecvStream
     let mut buf = vec![0u8; len];
     recv.read_exact(&mut buf).await.map_err(transport_err)?;
     serde_json::from_slice(&buf).map_err(|e| ChatError::Protocol(e.to_string()))
+}
+
+/// 写一块附件数据。长度为 0 表示传输结束。
+async fn write_chunk(send: &mut quinn::SendStream, data: &[u8]) -> Result<()> {
+    send.write_all(&(data.len() as u32).to_be_bytes())
+        .await
+        .map_err(transport_err)?;
+    send.write_all(data).await.map_err(transport_err)?;
+    Ok(())
+}
+
+async fn read_chunk(recv: &mut quinn::RecvStream) -> Result<Vec<u8>> {
+    let mut len = [0u8; 4];
+    recv.read_exact(&mut len).await.map_err(transport_err)?;
+    let len = u32::from_be_bytes(len) as usize;
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if len > BLOB_CHUNK * 2 {
+        return Err(ChatError::Protocol("附件分块过大".into()));
+    }
+    let mut buf = vec![0u8; len];
+    recv.read_exact(&mut buf).await.map_err(transport_err)?;
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------- 证书
@@ -381,6 +434,27 @@ async fn handle_connection(
         return Err(error);
     }
 
+    // 附件走独立双向流，和聊天请求互不阻塞
+    let blob_conn = conn.clone();
+    let blob_sink = Arc::clone(&sink);
+    tokio::spawn(async move {
+        while let Ok((mut send, mut recv)) = blob_conn.accept_bi().await {
+            let sink = Arc::clone(&blob_sink);
+            tokio::spawn(async move {
+                if let Err(error) = serve_blob_stream(&mut send, &mut recv, sink.as_ref()).await {
+                    let _ = write_frame(
+                        &mut send,
+                        &BlobReply::Error {
+                            message: error.to_string(),
+                        },
+                    )
+                    .await;
+                    let _ = send.finish();
+                }
+            });
+        }
+    });
+
     let writer = tokio::spawn(async move {
         while let Some(ev) = events.recv().await {
             if !matches!(
@@ -418,8 +492,48 @@ async fn handle_connection(
     Ok(())
 }
 
-// ---------------------------------------------------------------- 客户端
+/// 处理一条附件流：上传或下载。
+async fn serve_blob_stream(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    sink: &dyn RequestSink,
+) -> Result<()> {
+    match read_frame::<BlobRequest>(recv).await? {
+        BlobRequest::Upload { room, attachment } => {
+            let mut data = Vec::with_capacity(attachment.size.min(MAX_ATTACHMENT_BYTES) as usize);
+            loop {
+                let chunk = read_chunk(recv).await?;
+                if chunk.is_empty() {
+                    break;
+                }
+                if (data.len() + chunk.len()) as u64 > MAX_ATTACHMENT_BYTES {
+                    return Err(ChatError::Protocol("附件超过大小上限".into()));
+                }
+                data.extend_from_slice(&chunk);
+            }
+            sink.upload(room, attachment, data).await?;
+            write_frame(send, &BlobReply::Done).await?;
+        }
+        BlobRequest::Download { room, id } => {
+            let data = sink.download(room, id).await?;
+            write_frame(
+                send,
+                &BlobReply::Begin {
+                    size: data.len() as u64,
+                },
+            )
+            .await?;
+            for chunk in data.chunks(BLOB_CHUNK) {
+                write_chunk(send, chunk).await?;
+            }
+            write_chunk(send, &[]).await?;
+        }
+    }
+    let _ = send.finish();
+    Ok(())
+}
 
+// ---------------------------------------------------------------- 客户端
 /// 使用经带外核对或已固定的指纹建立 QUIC 连接。
 pub async fn connect(addr: SocketAddr, expected_fingerprint: &str) -> Result<QuicConnection> {
     connect_with(addr, expected_fingerprint, Liveness::default()).await
@@ -507,6 +621,7 @@ pub async fn connect_with(
         room,
         write: Mutex::new(send),
         events: Mutex::new(events),
+        conn,
         endpoint,
         closed: AtomicBool::new(false),
     })
@@ -517,6 +632,8 @@ pub struct QuicConnection {
     room: RoomInfo,
     write: Mutex<quinn::SendStream>,
     events: Mutex<EventStream>,
+    /// 保留连接句柄，附件走额外的双向流。
+    conn: quinn::Connection,
     endpoint: Endpoint,
     closed: AtomicBool,
 }
@@ -547,5 +664,64 @@ impl Connection for QuicConnection {
         self.closed.store(true, Ordering::SeqCst);
         self.endpoint.close(0u32.into(), b"bye");
         Ok(())
+    }
+
+    async fn upload(&self, room: RoomId, attachment: Attachment, data: Vec<u8>) -> Result<()> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(ChatError::Closed);
+        }
+        let (mut send, mut recv) = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.conn.open_bi())
+            .await
+            .map_err(|_| ChatError::Protocol("打开附件流超时".into()))?
+            .map_err(transport_err)?;
+        let transfer = async {
+            write_frame(&mut send, &BlobRequest::Upload { room, attachment }).await?;
+            for chunk in data.chunks(BLOB_CHUNK) {
+                write_chunk(&mut send, chunk).await?;
+            }
+            write_chunk(&mut send, &[]).await?;
+            match read_frame::<BlobReply>(&mut recv).await? {
+                BlobReply::Done => Ok(()),
+                BlobReply::Error { message } => Err(ChatError::Protocol(message)),
+                _ => Err(ChatError::Protocol("附件上传应答异常".into())),
+            }
+        };
+        tokio::time::timeout(BLOB_TIMEOUT, transfer)
+            .await
+            .map_err(|_| ChatError::Protocol("附件上传超时".into()))?
+    }
+
+    async fn download(&self, room: RoomId, id: AttachmentId) -> Result<Vec<u8>> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(ChatError::Closed);
+        }
+        let (mut send, mut recv) = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.conn.open_bi())
+            .await
+            .map_err(|_| ChatError::Protocol("打开附件流超时".into()))?
+            .map_err(transport_err)?;
+        let transfer = async {
+            write_frame(&mut send, &BlobRequest::Download { room, id }).await?;
+            match read_frame::<BlobReply>(&mut recv).await? {
+                BlobReply::Begin { size } => {
+                    let mut data = Vec::with_capacity(size.min(MAX_ATTACHMENT_BYTES) as usize);
+                    loop {
+                        let chunk = read_chunk(&mut recv).await?;
+                        if chunk.is_empty() {
+                            break;
+                        }
+                        if (data.len() + chunk.len()) as u64 > MAX_ATTACHMENT_BYTES {
+                            return Err(ChatError::Protocol("附件超过大小上限".into()));
+                        }
+                        data.extend_from_slice(&chunk);
+                    }
+                    Ok(data)
+                }
+                BlobReply::Error { message } => Err(ChatError::Protocol(message)),
+                _ => Err(ChatError::Protocol("附件下载应答异常".into())),
+            }
+        };
+        tokio::time::timeout(BLOB_TIMEOUT, transfer)
+            .await
+            .map_err(|_| ChatError::Protocol("附件下载超时".into()))?
     }
 }

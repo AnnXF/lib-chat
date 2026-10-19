@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chat_core::{
-    ChatError, ClientRequest, Connection, ConnectionAcceptor, DeviceId, EventStream, RequestSink,
-    Result, RoomInfo, ServerEvent,
+    Attachment, AttachmentId, ChatError, ClientRequest, Connection, ConnectionAcceptor, DeviceId,
+    EventStream, RequestSink, Result, RoomId, RoomInfo, ServerEvent,
 };
 use tokio::sync::{mpsc, Mutex, Notify};
 
@@ -43,6 +43,20 @@ impl RequestSink for ServerHandle {
     async fn detach(&self) {
         self.server.disconnect(self.conn).await;
     }
+
+    async fn upload(&self, room: RoomId, attachment: Attachment, data: Vec<u8>) -> Result<()> {
+        if room != self.server.room() {
+            return Err(chat_core::ChatError::Protocol("房间不存在".into()));
+        }
+        self.server.upload(self.conn, attachment, data).await
+    }
+
+    async fn download(&self, room: RoomId, id: AttachmentId) -> Result<Vec<u8>> {
+        if room != self.server.room() {
+            return Err(chat_core::ChatError::Protocol("房间不存在".into()));
+        }
+        self.server.download(self.conn, id).await
+    }
 }
 
 /// 把服务端暴露成传输层可用的接入点。
@@ -57,9 +71,9 @@ impl ConnectionAcceptor for Acceptor {
         }
     }
 
-    async fn accept(&self, device: DeviceId) -> (Box<dyn RequestSink>, EventStream) {
+    async fn accept(&self, device: DeviceId) -> (Arc<dyn RequestSink>, EventStream) {
         let (handle, rx) = self.0.attach(device).await;
-        (Box::new(handle), rx)
+        (Arc::new(handle), rx)
     }
 }
 
@@ -110,6 +124,20 @@ impl Connection for InProcConnection {
             self.handle.detach().await;
         }
         Ok(())
+    }
+
+    async fn upload(&self, room: RoomId, attachment: Attachment, data: Vec<u8>) -> Result<()> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(ChatError::Closed);
+        }
+        self.handle.upload(room, attachment, data).await
+    }
+
+    async fn download(&self, room: RoomId, id: AttachmentId) -> Result<Vec<u8>> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(ChatError::Closed);
+        }
+        self.handle.download(room, id).await
     }
 }
 

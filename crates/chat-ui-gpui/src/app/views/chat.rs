@@ -24,8 +24,19 @@ impl ChatApp {
         // 只渲染可见范围那几条，消息再多每帧成本也不变
         let this = cx.entity();
         let messages = list(self.list.clone(), move |ix, _window, cx| {
-            let lines = &this.read(cx).lines;
-            render_line(&lines[ix])
+            let (line, attachment) = {
+                let app = this.read(cx);
+                (app.lines[ix].clone(), app.lines[ix].attachment.clone())
+            };
+            let save = attachment.map(|attachment| {
+                let entity = this.clone();
+                Box::new(move |_: &MouseUpEvent, _: &mut Window, cx: &mut App| {
+                    entity.update(cx, |app, cx| {
+                        app.save_attachment(attachment.clone(), cx);
+                    });
+                }) as SaveHandler
+            });
+            render_line(&line, save)
         })
         .flex_1();
 
@@ -89,6 +100,12 @@ impl ChatApp {
                     .border_t_1()
                     .border_color(rgb(theme::BORDER))
                     .child(div().flex_1().child(self.message.clone()))
+                    .child(button(
+                        "文件",
+                        false,
+                        false,
+                        cx.listener(Self::on_pick_file),
+                    ))
                     .child(button("发送", true, false, cx.listener(Self::on_send))),
             )
             .into_any_element()

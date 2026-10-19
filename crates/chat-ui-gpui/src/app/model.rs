@@ -2,7 +2,7 @@
 //!
 //! 与协议 DTO 分开：这里只描述「界面要用到的形状」，不掺网络语义。
 
-use chat_core::{RoomId, Seq};
+use chat_core::{Attachment, RoomId, Seq};
 #[derive(Clone)]
 pub struct DiscoveredRoom {
     pub(crate) id: RoomId,
@@ -57,10 +57,13 @@ impl HostedRoom {
     }
 }
 
+#[derive(Clone)]
 pub struct ChatLine {
     pub(crate) seq: Option<Seq>,
     pub(crate) sender: String,
     pub(crate) text: String,
+    /// 文件消息附带的元数据；文本消息为 `None`。
+    pub(crate) attachment: Option<Attachment>,
     /// 是否由自己发出，决定气泡靠哪一边。
     pub(crate) mine: bool,
     pub(crate) system: bool,

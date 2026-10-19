@@ -36,6 +36,7 @@ async fn history_cost() {
                         sender_name: "某人".into(),
                         kind: MessageKind::Text,
                         text: format!("这是第 {i} 条消息，长度大约二十来个字"),
+                        attachment: None,
                     },
                 )
                 .await
@@ -160,6 +161,7 @@ async fn message_footprint() {
                     sender_name: "某人".into(),
                     kind: MessageKind::Text,
                     text: format!("这是第 {i} 条消息，长度大约二十来个字"),
+                    attachment: None,
                 },
             )
             .await

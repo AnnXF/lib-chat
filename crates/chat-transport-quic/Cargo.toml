@@ -13,7 +13,7 @@ tokio.workspace = true
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "logging"] }
 rcgen = "0.14.10"
-sha2 = "0.10"
+sha2.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

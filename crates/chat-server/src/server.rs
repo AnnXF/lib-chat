@@ -9,12 +9,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use chat_core::{
-    ClientRequest, DeviceId, ErrorCode, LobbyInfo, MessageKind, MessageStore, NewMessage, Result,
-    RoomId, ServerEvent, UserId, EVENT_QUEUE_CAPACITY,
+    sha256_hex, validate_attachment, Attachment, AttachmentId, ChatError, ClientRequest, DeviceId,
+    ErrorCode, LobbyInfo, MessageKind, MessageStore, NewMessage, Result, RoomId, ServerEvent,
+    UserId, EVENT_QUEUE_CAPACITY,
 };
 use tokio::sync::{mpsc, Mutex, RwLock};
 
-use crate::store::InMemoryStore;
+use crate::store::{BlobStore, InMemoryStore, MemoryBlobs};
 
 const MAX_TEXT_BYTES: usize = 8 * 1024;
 
@@ -47,6 +48,7 @@ pub struct Server {
     room: RoomId,
     name: String,
     store: Arc<dyn MessageStore>,
+    blobs: Arc<dyn BlobStore>,
     conns: RwLock<HashMap<ConnId, Conn>>,
     publish: Mutex<()>,
     next_conn: AtomicU64,
@@ -68,10 +70,21 @@ impl Server {
         name: impl Into<String>,
         store: Arc<dyn MessageStore>,
     ) -> Arc<Self> {
+        Self::with_blobs(room, name, store, Arc::new(MemoryBlobs::default()))
+    }
+
+    /// 同时指定附件存储；房主落盘时用磁盘实现。
+    pub fn with_blobs(
+        room: RoomId,
+        name: impl Into<String>,
+        store: Arc<dyn MessageStore>,
+        blobs: Arc<dyn BlobStore>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             room,
             name: name.into(),
             store,
+            blobs,
             conns: RwLock::new(HashMap::new()),
             publish: Mutex::new(()),
             next_conn: AtomicU64::new(1),
@@ -341,6 +354,7 @@ impl Server {
                             sender_name: name,
                             kind: MessageKind::Text,
                             text: text.to_string(),
+                            attachment: None,
                         },
                     )
                     .await
@@ -367,6 +381,70 @@ impl Server {
                             "消息标识与原消息内容不一致",
                         )
                         .await
+                    }
+                    Err(_) => {
+                        self.error_to(conn, ErrorCode::Internal, "消息保存失败")
+                            .await
+                    }
+                }
+            }
+
+            ClientRequest::SendFile {
+                room,
+                client_msg_id,
+                attachment,
+            } => {
+                if room != self.room {
+                    self.error_to(conn, ErrorCode::RoomMismatch, "房间不存在")
+                        .await;
+                    return Ok(());
+                }
+                let Some((user, name)) = self.member_of(conn).await else {
+                    self.error_to(conn, ErrorCode::NotJoined, "未加入房间")
+                        .await;
+                    return Ok(());
+                };
+                if let Err(e) = validate_attachment(&attachment) {
+                    self.error_to(conn, ErrorCode::InvalidRequest, &e.to_string())
+                        .await;
+                    return Ok(());
+                }
+                // 只广播已经落盘的附件，避免接收方拿到一个取不到的引用
+                if !self.blobs.contains(&attachment.sha256).await {
+                    self.error_to(conn, ErrorCode::NotFound, "附件尚未上传完成")
+                        .await;
+                    return Ok(());
+                }
+                let _publish = self.publish.lock().await;
+                match self
+                    .store
+                    .append(
+                        self.room,
+                        NewMessage {
+                            client_msg_id,
+                            sender: user,
+                            sender_name: name,
+                            kind: MessageKind::File,
+                            text: String::new(),
+                            attachment: Some(attachment),
+                        },
+                    )
+                    .await
+                {
+                    Ok(result) if result.inserted => {
+                        self.broadcast_to_members(ServerEvent::Message {
+                            message: result.message,
+                        })
+                        .await;
+                    }
+                    Ok(result) => {
+                        self.send_to(
+                            conn,
+                            ServerEvent::Message {
+                                message: result.message,
+                            },
+                        )
+                        .await;
                     }
                     Err(_) => {
                         self.error_to(conn, ErrorCode::Internal, "消息保存失败")
@@ -448,6 +526,32 @@ impl Server {
             }
         }
         Ok(())
+    }
+
+    /// 接收附件内容。只有房间成员可以上传，且大小与摘要必须与声明一致。
+    pub async fn upload(&self, conn: ConnId, attachment: Attachment, data: Vec<u8>) -> Result<()> {
+        if self.member_of(conn).await.is_none() {
+            return Err(ChatError::Protocol("未加入房间".into()));
+        }
+        validate_attachment(&attachment)?;
+        if data.len() as u64 != attachment.size {
+            return Err(ChatError::Protocol("附件大小与声明不一致".into()));
+        }
+        if sha256_hex(&data) != attachment.sha256 {
+            return Err(ChatError::Protocol("附件内容与摘要不一致".into()));
+        }
+        self.blobs.put(&attachment.sha256, &data).await
+    }
+
+    /// 读取附件内容。仅成员可取，且房间内必须存在该附件。
+    pub async fn download(&self, conn: ConnId, id: AttachmentId) -> Result<Vec<u8>> {
+        if self.member_of(conn).await.is_none() {
+            return Err(ChatError::Protocol("未加入房间".into()));
+        }
+        let Some(attachment) = self.store.attachment(self.room, id).await? else {
+            return Err(ChatError::Protocol("附件不存在".into()));
+        };
+        self.blobs.get(&attachment.sha256).await
     }
 
     /// 只发给已加入的连接——消息内容不对房间外的人可见。

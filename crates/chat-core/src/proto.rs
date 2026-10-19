@@ -44,6 +44,10 @@ macro_rules! id_type {
 id_type!(UserId);
 id_type!(DeviceId);
 id_type!(RoomId);
+id_type!(AttachmentId);
+
+/// 单个附件的上限。超过就拒绝，避免一次传输把房间拖死。
+pub const MAX_ATTACHMENT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Profile {
@@ -54,7 +58,21 @@ pub struct Profile {
 #[serde(rename_all = "snake_case")]
 pub enum MessageKind {
     Text,
+    File,
     System,
+}
+
+/// 附件元数据。内容本身不随消息下发，按 `id` 单独取。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub id: AttachmentId,
+    /// 原始文件名，仅用于展示与保存时的默认名。
+    pub name: String,
+    pub size: u64,
+    /// 按扩展名猜测的 MIME；猜不出时用 `application/octet-stream`。
+    pub mime: String,
+    /// 内容 SHA-256（十六进制小写），用于校验与去重。
+    pub sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -65,7 +83,10 @@ pub struct Message {
     pub sender: UserId,
     pub sender_name: String,
     pub kind: MessageKind,
+    /// 文本内容；文件消息为空串。
     pub text: String,
+    /// 文件消息附带元数据。
+    pub attachment: Option<Attachment>,
     pub server_ts_ms: i64,
 }
 
@@ -103,6 +124,12 @@ pub enum ClientRequest {
         room: RoomId,
         client_msg_id: Uuid,
         text: String,
+    },
+    /// 文件消息：附件内容必须已经上传完成，服务端只校验并广播元数据。
+    SendFile {
+        room: RoomId,
+        client_msg_id: Uuid,
+        attachment: Attachment,
     },
     History {
         room: RoomId,
@@ -163,5 +190,9 @@ pub enum ErrorCode {
     AlreadyJoined,
     RoomMismatch,
     InvalidRequest,
+    /// 附件超过 [`MAX_ATTACHMENT_BYTES`]。
+    TooLarge,
+    /// 附件不存在或尚未上传完成。
+    NotFound,
     Internal,
 }

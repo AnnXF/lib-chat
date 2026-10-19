@@ -7,6 +7,11 @@ fn room_db_path(data_dir: &Path, beacon_port: u16) -> PathBuf {
     data_dir.join(format!("room-{beacon_port}.db"))
 }
 
+/// 每个房间独立的附件目录；清空房间时整目录删除，不影响同机其它房间。
+fn room_files_dir(data_dir: &Path, beacon_port: u16) -> PathBuf {
+    data_dir.join(format!("room-{beacon_port}.files"))
+}
+
 /// 看一眼本机是否已经有这个端口的房间；有就返回它的房间标识与消息条数。
 ///
 /// 只做探测，绝不新建文件——没房间时返回 `None`，不会凭空留下一个空库。
@@ -34,6 +39,7 @@ pub(super) struct RoomHostLock {
     _file: std::fs::File,
     db_path: PathBuf,
     identity_path: PathBuf,
+    files_dir: PathBuf,
 }
 
 /// 抢占本机房间的房主位置；已经被别的实例占着就返回 `Err`。
@@ -53,6 +59,7 @@ pub(super) fn claim_local_room(data_dir: &Path, beacon_port: u16) -> Result<Room
             _file: file,
             db_path: room_db_path(data_dir, beacon_port),
             identity_path: data_dir.join(format!("room-{beacon_port}.identity")),
+            files_dir: room_files_dir(data_dir, beacon_port),
         }),
         Err(std::fs::TryLockError::WouldBlock) => Err("本机已有实例开着这个房间".into()),
         Err(std::fs::TryLockError::Error(e)) => Err(format!("锁定本机房间失败: {e}")),
@@ -73,6 +80,10 @@ impl RoomHostLock {
         if self.identity_path.exists() {
             std::fs::remove_file(&self.identity_path)
                 .map_err(|e| format!("清空房间身份失败: {e}"))?;
+        }
+        if self.files_dir.exists() {
+            std::fs::remove_dir_all(&self.files_dir)
+                .map_err(|e| format!("清空房间附件失败: {e}"))?;
         }
         Ok(())
     }
@@ -133,10 +144,18 @@ pub(super) async fn start_host(
             .await
             .map_err(|e| format!("打开消息库失败: {e}"))?,
     );
-    let server = Server::with_room(
+    let blobs = Arc::new(
+        chat_server::DiskBlobs::new(room_files_dir(
+            path.parent().ok_or("缺少房间数据目录")?,
+            beacon_port,
+        ))
+        .map_err(|e| format!("打开附件目录失败: {e}"))?,
+    );
+    let server = Server::with_blobs(
         store.room(),
         name,
         Arc::clone(&store) as Arc<dyn MessageStore>,
+        blobs,
     );
     let endpoint = Arc::new(
         QuicServer::bind_with_cert(SocketAddr::from(([0, 0, 0, 0], 0)), liveness, identity)

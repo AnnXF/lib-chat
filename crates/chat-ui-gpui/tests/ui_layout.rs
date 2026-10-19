@@ -4,7 +4,7 @@
 
 #![cfg(feature = "ui-test")]
 
-use chat_core::{RoomId, UserId};
+use chat_core::{Attachment, AttachmentId, RoomId, UserId};
 use chat_ui_gpui::app::ChatApp;
 use chat_ui_gpui::service::UiEvent;
 use gpui::{Bounds, Entity, Pixels, TestAppContext, VisualTestContext, px, size};
@@ -324,4 +324,64 @@ fn long_status_text_cannot_widen_the_window() {
 
     let main = bounds(cx, "chat-main");
     assert!((f32::from(main.size.width) - (WINDOW_WIDTH - SIDEBAR_WIDTH)).abs() <= 1.);
+}
+
+/// 文件消息卡片不能把聊天气泡区撑出窗口，输入条仍要可见。
+#[test]
+fn file_message_renders_inside_the_window() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    let room = RoomId::new();
+
+    apply(
+        &view,
+        cx,
+        UiEvent::Lobby {
+            room,
+            name: "文件房间".into(),
+            addr: "192.168.1.5:52000".into(),
+            online: 1,
+        },
+    );
+    apply(
+        &view,
+        cx,
+        UiEvent::Joined {
+            room,
+            you: UserId::new(),
+            online: 1,
+        },
+    );
+    apply(
+        &view,
+        cx,
+        UiEvent::Message {
+            room,
+            seq: 1,
+            sender_id: UserId::new(),
+            sender: "Bob".into(),
+            text: String::new(),
+            attachment: Some(Attachment {
+                id: AttachmentId::new(),
+                name: "一个名字很长很长很长的报告文件.pdf".into(),
+                size: 3 * 1024 * 1024,
+                mime: "application/pdf".into(),
+                sha256: "ab".repeat(32),
+            }),
+        },
+    );
+
+    let card = bounds(cx, "file-card");
+    assert_inside(&card, "file-card");
+    assert!(
+        f32::from(card.size.width) <= WINDOW_WIDTH - SIDEBAR_WIDTH,
+        "文件卡片宽度超出聊天区"
+    );
+
+    let composer = bounds(cx, "composer");
+    assert_inside(&composer, "composer");
+    assert!(
+        bottom(&card) <= f32::from(composer.origin.y) + 0.5,
+        "文件卡片压到了输入条"
+    );
 }

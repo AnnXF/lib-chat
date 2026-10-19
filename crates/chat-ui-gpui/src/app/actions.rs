@@ -1,7 +1,7 @@
 //! 用户操作：提交服务指令，必要的即时视图变化交给 `update`。
 
-use chat_core::RoomId;
-use gpui::{Context, MouseUpEvent, Window};
+use chat_core::{Attachment, RoomId};
+use gpui::{Context, MouseUpEvent, PathPromptOptions, Window};
 
 use crate::service::UiCommand;
 
@@ -156,6 +156,55 @@ impl ChatApp {
 
     pub(crate) fn on_send(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.submit_message(cx);
+    }
+
+    /// 选一个本地文件发出去。
+    pub(crate) fn on_pick_file(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("选择要发送的文件".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let path = match picked.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                Ok(Ok(None)) => None,
+                Ok(Err(e)) => {
+                    let _ = this.update(cx, |app, cx| {
+                        app.status = format!("⚠ 打开文件选择器失败: {e}");
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(_) => None,
+            };
+            if let Some(path) = path {
+                let _ = this.update(cx, |app, cx| {
+                    app.tell(UiCommand::SendFile { path }, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// 把聊天里的附件另存到本地。
+    pub(crate) fn save_attachment(&mut self, attachment: Attachment, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_new_path(&std::env::temp_dir(), Some(&attachment.name));
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(path))) = picked.await {
+                let id = attachment.id;
+                let _ = this.update(cx, |app, cx| {
+                    app.tell(UiCommand::SaveFile { id, path }, cx);
+                });
+            }
+        })
+        .detach();
     }
 
     pub(crate) fn on_connect_click(

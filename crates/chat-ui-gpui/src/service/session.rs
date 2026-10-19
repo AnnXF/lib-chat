@@ -2,6 +2,10 @@ use std::collections::VecDeque;
 
 use uuid::Uuid;
 
+use chat_core::{
+    Attachment, AttachmentId, MAX_ATTACHMENT_BYTES, guess_mime, sha256_hex, validate_attachment,
+};
+
 use super::protocol::{await_lobby, map_event};
 use super::*;
 
@@ -10,6 +14,13 @@ pub(super) enum SessionCmd {
     Join(String),
     Leave,
     Send(String),
+    /// 发送本地文件。
+    SendFile(PathBuf),
+    /// 把附件另存到本地。
+    SaveFile {
+        id: AttachmentId,
+        path: PathBuf,
+    },
     /// 往前翻一页更早的历史。
     LoadOlder,
     /// 结束会话：先退出房间再关闭连接。
@@ -385,6 +396,10 @@ impl Session {
                         }
                     },
                     Ok(SessionCmd::LoadOlder) => self.load_older(client).await,
+                    Ok(SessionCmd::SendFile(path)) => self.upload_file(client, path),
+                    Ok(SessionCmd::SaveFile { id, path }) => {
+                        self.download_file(client, id, path)
+                    }
                 },
             }
         }
@@ -523,6 +538,43 @@ impl Session {
         let _ = client.close().await;
     }
 
+    /// 后台上传：读文件、算摘要、传内容，最后发一条文件消息。
+    ///
+    /// 放到独立任务里，避免大文件把事件循环堵住、收不到别人发的消息。
+    fn upload_file(&self, client: &Client, path: PathBuf) {
+        let client = client.clone();
+        let events = self.events.clone();
+        let room = self.target.room;
+        tokio::spawn(async move {
+            if let Err(error) = send_file(&client, room, &path).await {
+                let _ = events
+                    .send_async(UiEvent::Error(format!("发送文件失败: {error}")))
+                    .await;
+            }
+        });
+    }
+
+    /// 后台下载并写盘。
+    fn download_file(&self, client: &Client, id: AttachmentId, path: PathBuf) {
+        let client = client.clone();
+        let events = self.events.clone();
+        let room = self.target.room;
+        tokio::spawn(async move {
+            match save_attachment(&client, room, id, &path).await {
+                Ok(()) => {
+                    let _ = events
+                        .send_async(UiEvent::Status(format!("已保存到 {}", path.display())))
+                        .await;
+                }
+                Err(error) => {
+                    let _ = events
+                        .send_async(UiEvent::Error(format!("保存附件失败: {error}")))
+                        .await;
+                }
+            }
+        });
+    }
+
     /// 重连前的退避等待。返回 `false` 表示界面要求结束会话。
     ///
     /// 断线期间保留身份变更，并将待发消息有界缓存到同房间重连成功之后。
@@ -545,6 +597,12 @@ impl Session {
                         })
                         .await;
                 }
+                Ok(Ok(SessionCmd::SendFile(_)) | Ok(SessionCmd::SaveFile { .. })) => {
+                    let _ = self
+                        .events
+                        .send_async(UiEvent::Error("尚未重新连接，文件功能暂不可用".into()))
+                        .await;
+                }
                 Ok(Ok(SessionCmd::Send(text))) => {
                     if let Err(reason) = self.enqueue(text) {
                         let _ = self
@@ -559,6 +617,67 @@ impl Session {
             }
         }
     }
+}
+
+/// 读取本地文件并作为一条文件消息发出。
+async fn send_file(client: &Client, room: RoomId, path: &Path) -> Result<(), String> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("文件名无效")?
+        .to_string();
+    let size = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| format!("读取文件失败: {e}"))?
+        .len();
+    if size > MAX_ATTACHMENT_BYTES {
+        return Err(format!(
+            "文件超过 {} MiB 上限",
+            MAX_ATTACHMENT_BYTES / 1024 / 1024
+        ));
+    }
+    let data = tokio::fs::read(path)
+        .await
+        .map_err(|e| format!("读取文件失败: {e}"))?;
+    let attachment = Attachment {
+        id: AttachmentId::new(),
+        mime: guess_mime(&name).to_string(),
+        name,
+        size: data.len() as u64,
+        sha256: sha256_hex(&data),
+    };
+    validate_attachment(&attachment).map_err(|e| e.to_string())?;
+    client
+        .upload(room, attachment.clone(), data)
+        .await
+        .map_err(|e| format!("上传失败: {e}"))?;
+    client
+        .send_file(room, uuid::Uuid::new_v4(), attachment)
+        .await
+        .map_err(|e| format!("发送失败: {e}"))
+}
+
+/// 下载附件并写到指定路径。
+async fn save_attachment(
+    client: &Client,
+    room: RoomId,
+    id: AttachmentId,
+    path: &Path,
+) -> Result<(), String> {
+    let data = client
+        .download(room, id)
+        .await
+        .map_err(|e| format!("下载失败: {e}"))?;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("创建目录失败: {e}"))?;
+    }
+    tokio::fs::write(path, data)
+        .await
+        .map_err(|e| format!("写入失败: {e}"))
 }
 
 #[cfg(test)]
@@ -627,6 +746,7 @@ mod tests {
             sender_name: "Alice".into(),
             kind: chat_core::MessageKind::Text,
             text: format!("m{seq}"),
+            attachment: None,
             server_ts_ms: 0,
         }
     }
