@@ -30,26 +30,43 @@ impl ChatApp {
         .flex_1();
 
         div()
+            .id("chat-main")
+            .test_id("chat-main")
             .flex_1()
+            .min_w(px(0.))
             .flex()
             .flex_col()
             .child(
                 div()
+                    .id("chat-header")
+                    .test_id("chat-header")
+                    .flex_none()
                     .flex()
                     .flex_row()
                     .items_center()
                     .justify_between()
+                    .gap_3()
                     .px_5()
                     .py_3()
                     .border_b_1()
                     .border_color(rgb(theme::BORDER))
                     .child(
+                        // 房间标识和地址都是长文本，必须允许缩到 0 再省略，否则会把窗口撑宽
                         div()
+                            .flex_1()
+                            .min_w(px(0.))
                             .flex()
                             .flex_col()
-                            .child(div().text_base().text_color(rgb(theme::TEXT)).child(title))
                             .child(
                                 div()
+                                    .truncate()
+                                    .text_base()
+                                    .text_color(rgb(theme::TEXT))
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
                                     .text_xs()
                                     .text_color(rgb(theme::MUTED))
                                     .child(subtitle),
@@ -60,6 +77,9 @@ impl ChatApp {
             .child(messages)
             .child(
                 div()
+                    .id("composer")
+                    .test_id("composer")
+                    .flex_none()
                     .flex()
                     .flex_row()
                     .items_center()

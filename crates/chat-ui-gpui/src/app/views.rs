@@ -11,12 +11,48 @@ mod header;
 mod sidebar;
 
 use gpui::{
-    AnyElement, App, Context, MouseButton, MouseUpEvent, Window, div, list, prelude::*, px, rgb,
+    AnyElement, App, Context, Div, MouseButton, MouseUpEvent, Window, div, list, prelude::*, px,
+    rgb,
 };
 
 use crate::app::theme;
 
 use super::{ChatApp, ChatLine, DiscoveredRoom};
+
+/// 给关键布局节点挂上固定标识，供无头 UI 测试查询边界。
+///
+/// 只在测试构建里真正记录，正式构建零成本。
+pub(crate) trait TestIdExt: Sized {
+    fn test_id(self, id: &'static str) -> Self;
+}
+
+#[cfg(any(test, feature = "ui-test"))]
+impl TestIdExt for Div {
+    fn test_id(self, id: &'static str) -> Self {
+        self.debug_selector(move || id.to_string())
+    }
+}
+
+#[cfg(not(any(test, feature = "ui-test")))]
+impl TestIdExt for Div {
+    fn test_id(self, _id: &'static str) -> Self {
+        self
+    }
+}
+
+#[cfg(any(test, feature = "ui-test"))]
+impl TestIdExt for gpui::Stateful<Div> {
+    fn test_id(self, id: &'static str) -> Self {
+        self.debug_selector(move || id.to_string())
+    }
+}
+
+#[cfg(not(any(test, feature = "ui-test")))]
+impl TestIdExt for gpui::Stateful<Div> {
+    fn test_id(self, _id: &'static str) -> Self {
+        self
+    }
+}
 
 /// 侧栏的小节标题。
 fn section_label(text: &str) -> AnyElement {

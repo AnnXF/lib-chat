@@ -20,5 +20,9 @@ flume = "0.12.0"
 if-addrs = "0.15.0"
 uuid.workspace = true
 
+[features]
+# 无头 UI 布局测试：启用 gpui 的测试平台与元素边界查询。
+ui-test = ["gpui/test-support"]
+
 [dev-dependencies]
 async-trait.workspace = true

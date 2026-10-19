@@ -8,7 +8,9 @@ pub type Seq = i64;
 
 macro_rules! id_type {
     ($name:ident) => {
-        #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+        #[derive(
+            Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize,
+        )]
         pub struct $name(pub Uuid);
 
         impl $name {
@@ -87,9 +89,16 @@ pub struct RoomInfo {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientRequest {
     /// 查询大厅摘要，无需加入。
-    Lobby { room: RoomId },
-    Join { room: RoomId, profile: Profile },
-    Leave { room: RoomId },
+    Lobby {
+        room: RoomId,
+    },
+    Join {
+        room: RoomId,
+        profile: Profile,
+    },
+    Leave {
+        room: RoomId,
+    },
     Send {
         room: RoomId,
         client_msg_id: Uuid,
@@ -141,7 +150,10 @@ pub enum ServerEvent {
         room: RoomId,
         online_count: u32,
     },
-    Error { code: ErrorCode, message: String },
+    Error {
+        code: ErrorCode,
+        message: String,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]

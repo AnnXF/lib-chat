@@ -29,6 +29,7 @@ use gpui::{Context, Entity, ListAlignment, ListState, Render, Window, div, prelu
 
 use crate::service::{self, UiCommand};
 
+use self::views::TestIdExt;
 use self::widgets::text_input::{TextInput, TextInputSubmitted};
 
 pub struct ChatApp {
@@ -72,7 +73,28 @@ impl ChatApp {
 
     pub fn new(cx: &mut Context<Self>) -> Self {
         let (cmd_tx, events) = service::spawn();
+        Self::with_channels(cmd_tx, events, cx)
+    }
 
+    /// 不启动后端、只构造界面。供无头 UI 测试验证布局与状态渲染。
+    #[cfg(any(test, feature = "ui-test"))]
+    pub fn for_test(cx: &mut Context<Self>) -> Self {
+        let (cmd_tx, _cmd_rx) = flume::bounded(1);
+        let (_event_tx, events) = flume::bounded(1);
+        Self::with_channels(cmd_tx, events, cx)
+    }
+
+    /// 直接投递一条服务事件，等价于后端事件泵收到它。
+    #[cfg(any(test, feature = "ui-test"))]
+    pub fn debug_apply(&mut self, event: service::UiEvent) {
+        self.apply(event);
+    }
+
+    fn with_channels(
+        cmd_tx: flume::Sender<UiCommand>,
+        events: flume::Receiver<service::UiEvent>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let nickname = cx.new(|cx| {
             let mut input = TextInput::new("你的昵称", cx);
             input.set_content("我", cx);
@@ -148,6 +170,8 @@ impl Render for ChatApp {
         let main = self.render_main(cx);
 
         div()
+            .id("app-root")
+            .test_id("app-root")
             .size_full()
             .flex()
             .flex_col()
@@ -155,7 +179,18 @@ impl Render for ChatApp {
             .text_color(rgb(theme::TEXT))
             .text_sm()
             .child(header)
-            .child(div().flex().flex_row().flex_1().child(sidebar).child(main))
+            .child(
+                div()
+                    .id("app-body")
+                    .test_id("app-body")
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .min_w(px(0.))
+                    .child(sidebar)
+                    .child(main),
+            )
     }
 }
 

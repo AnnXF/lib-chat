@@ -212,7 +212,8 @@ impl quinn::rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
         let actual = fingerprint_of(end_entity);
         if self.expected != actual {
             return Err(quinn::rustls::Error::General(format!(
-                "证书指纹不匹配: 期望 {}, 实际 {actual}", self.expected
+                "证书指纹不匹配: 期望 {}, 实际 {actual}",
+                self.expected
             )));
         }
         Ok(quinn::rustls::client::danger::ServerCertVerified::assertion())

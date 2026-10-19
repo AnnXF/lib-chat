@@ -12,7 +12,7 @@ use std::time::Duration;
 use chat_core::Client;
 use chat_core::ConnectionAcceptor;
 use chat_server::{Acceptor, Server};
-use chat_transport_quic::{Liveness, QuicServer, connect_with};
+use chat_transport_quic::{connect_with, Liveness, QuicServer};
 
 async fn start_server(liveness: Liveness) -> (Arc<Server>, std::net::SocketAddr, String) {
     let server = Server::new("安静的房间");
@@ -28,7 +28,10 @@ async fn start_server(liveness: Liveness) -> (Arc<Server>, std::net::SocketAddr,
 /// 吃掉一次查询的应答，确保后续断言拿到的不是残留事件。
 async fn eat_reply(client: &Client) {
     let reply = tokio::time::timeout(Duration::from_secs(2), client.next_event()).await;
-    assert!(matches!(reply, Ok(Ok(_))), "应收到首次查询的应答: {reply:?}");
+    assert!(
+        matches!(reply, Ok(Ok(_))),
+        "应收到首次查询的应答: {reply:?}"
+    );
 }
 
 /// 有保活：沉默远超空闲超时之后，连接依然完整可用。

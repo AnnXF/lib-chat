@@ -23,87 +23,108 @@ impl ChatApp {
             })
             .collect();
 
+        // 侧栏固定 240px、不参与伸缩；只有主体滚动，底部连接区始终留在窗口内。
+        // 房间身份和信任指纹都是长文本，以前放在可滚动的整列里，窗口不够高时会把
+        // 「直接连接 / 新建房间」挤到视口之外。
         div()
             .id("sidebar")
+            .test_id("sidebar")
             .w(px(240.))
-            .overflow_y_scroll()
+            .flex_none()
+            .h_full()
             .flex()
             .flex_col()
-            .py_3()
             .bg(rgb(theme::SURFACE))
             .border_r_1()
             .border_color(rgb(theme::BORDER))
-            .child(section_label("局域网房间"))
             .child(
                 div()
-                    .id("rooms")
+                    .id("sidebar-body")
+                    .test_id("sidebar-body")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
-                    .max_h(px(200.))
-                    .overflow_y_scroll()
-                    .children(rows)
-                    .when(empty, |this| this.child(hint("未发现房间，可手动连接"))),
+                    .py_3()
+                    .when_some(
+                        self.pending_trust.clone(),
+                        |this, (room, addr, fingerprint)| {
+                            this.child(section_label("首次信任：向房主核对"))
+                                .child(hint(&format!("房间: {room}")))
+                                .child(hint(&format!("地址: {addr}")))
+                                .child(hint(&format!(
+                                    "SHA-256:\n{}",
+                                    fingerprint
+                                        .as_bytes()
+                                        .chunks(16)
+                                        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                )))
+                                .child(padded(button(
+                                    "已核对并信任",
+                                    false,
+                                    true,
+                                    cx.listener(Self::on_confirm_trust),
+                                )))
+                                .child(padded(button(
+                                    "取消",
+                                    false,
+                                    true,
+                                    cx.listener(Self::on_cancel_trust),
+                                )))
+                        },
+                    )
+                    .child(section_label("局域网房间"))
+                    .child(
+                        div()
+                            .id("rooms")
+                            .flex()
+                            .flex_col()
+                            .children(rows)
+                            .when(empty, |this| this.child(hint("未发现房间，可手动连接"))),
+                    )
+                    // 本机那个房间不在局域网里——它要点了才会被广播出去。
+                    // 已经待在这个房间里（可能是本机另一个实例开着、我们接过去）就别再摆入口了
+                    .when(local_row, |this| {
+                        this.child(section_label("本机房间"))
+                            .child(local_room_row(local.unwrap_or(0), cx))
+                    })
+                    .when_some(self.hosted.clone(), |this, hosted| {
+                        this.child(section_label("我的房间身份"))
+                            .child(hint(&hosted))
+                    }),
             )
-            // 本机那个房间不在局域网里——它要点了才会被广播出去。
-            // 已经待在这个房间里（可能是本机另一个实例开着、我们接过去）就别再摆入口了
-            .when(local_row, |this| {
-                this.child(section_label("本机房间"))
-                    .child(local_room_row(local.unwrap_or(0), cx))
-            })
-            .when_some(self.hosted.clone(), |this, hosted| {
-                this.child(section_label("我的房间身份"))
-                    .child(hint(&hosted))
-            })
-            .child(div().flex_1())
-            .child(section_label("直接连接"))
-            .child(padded(self.addr_input.clone()))
-            .child(padded(self.fingerprint_input.clone()))
-            .child(padded(button(
-                "连接",
-                false,
-                true,
-                cx.listener(Self::on_connect_click),
-            )))
-            .when_some(
-                self.pending_trust.clone(),
-                |this, (room, addr, fingerprint)| {
-                    this.child(section_label("首次信任：向房主核对"))
-                        .child(hint(&format!("房间: {room}")))
-                        .child(hint(&format!("地址: {addr}")))
-                        .child(hint(&format!(
-                            "SHA-256:\n{}",
-                            fingerprint
-                                .as_bytes()
-                                .chunks(16)
-                                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        )))
-                        .child(padded(button(
-                            "已核对并信任",
-                            false,
-                            true,
-                            cx.listener(Self::on_confirm_trust),
-                        )))
-                        .child(padded(button(
-                            "取消",
-                            false,
-                            true,
-                            cx.listener(Self::on_cancel_trust),
-                        )))
-                },
+            .child(
+                div()
+                    .id("sidebar-footer")
+                    .test_id("sidebar-footer")
+                    .flex_none()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(rgb(theme::BORDER))
+                    .child(section_label("直接连接"))
+                    .child(padded(self.addr_input.clone()))
+                    .child(padded(self.fingerprint_input.clone()))
+                    .child(padded(button(
+                        "连接",
+                        false,
+                        true,
+                        cx.listener(Self::on_connect_click),
+                    )))
+                    .child(section_label("昵称"))
+                    .child(padded(self.nickname.clone()))
+                    .child(padded(button(
+                        "新建房间",
+                        true,
+                        true,
+                        cx.listener(Self::on_new_room),
+                    )))
+                    .when(local_exists, |this| {
+                        this.child(hint("新建会清空本机房间的历史"))
+                    }),
             )
-            .child(section_label("昵称"))
-            .child(padded(self.nickname.clone()))
-            .child(padded(button(
-                "新建房间",
-                true,
-                true,
-                cx.listener(Self::on_new_room),
-            )))
-            .when(local_exists, |this| {
-                this.child(hint("新建会清空本机房间的历史"))
-            })
             .into_any_element()
     }
 }
