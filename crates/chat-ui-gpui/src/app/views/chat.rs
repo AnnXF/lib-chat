@@ -8,10 +8,10 @@ impl ChatApp {
         };
         let subtitle = match &self.room {
             Some(room) => format!("{}    在线 {} 人", room.addr, room.online),
-            None => self
-                .hosted
-                .clone()
-                .unwrap_or_else(|| "从左侧选择房间，或创建自己的房间".to_string()),
+            None => self.hosted.as_ref().map_or_else(
+                || "从左侧选择房间，或创建自己的房间".to_string(),
+                |hosted| format!("本机已创建「{}」，加入后可聊天", hosted.name),
+            ),
         };
 
         // 没连上房间时不摆「加入」：那会儿点下去什么也不会发生，只会让人以为界面卡住了

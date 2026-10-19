@@ -17,7 +17,7 @@ use gpui::{
 
 use crate::app::theme;
 
-use super::{ChatApp, ChatLine, DiscoveredRoom};
+use super::{ChatApp, ChatLine, DiscoveredRoom, HostedRoom};
 
 /// 给关键布局节点挂上固定标识，供无头 UI 测试查询边界。
 ///

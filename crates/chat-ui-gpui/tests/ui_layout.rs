@@ -150,6 +150,37 @@ fn long_identity_text_keeps_the_layout_inside_the_window() {
     assert!((f32::from(sidebar.size.width) - SIDEBAR_WIDTH).abs() <= 1.);
     assert_inside(&sidebar, "sidebar");
 
+    // 默认只留摘要：完整标识与 64 位指纹折行会把侧栏堆满
+    let collapsed = bounds(cx, "hosted-room");
+    assert!(
+        f32::from(collapsed.size.height) < 80.,
+        "房间身份摘要过高: {}",
+        f32::from(collapsed.size.height)
+    );
+    assert!(
+        cx.debug_bounds("identity-details").is_none(),
+        "完整身份默认应收起"
+    );
+
+    // 交互层由 actions 单测覆盖；这里只验证展开后的布局
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| app.debug_toggle_identity(cx));
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("identity-details").is_some(),
+        "点「详情」后应展开完整身份"
+    );
+    // 展开后的内容在侧栏主体里滚动，允许超出视口；但不能挤走底部操作区
+    let expanded = bounds(cx, "hosted-room");
+    assert!(
+        f32::from(expanded.size.height) > f32::from(collapsed.size.height),
+        "展开后的身份卡片应更高"
+    );
+    let body = bounds(cx, "sidebar-body");
+    assert_inside(&body, "sidebar-body");
+
     let footer = bounds(cx, "sidebar-footer");
     assert_inside(&footer, "sidebar-footer");
     assert!(f32::from(footer.size.height) > 0.);

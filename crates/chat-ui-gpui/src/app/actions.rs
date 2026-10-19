@@ -54,6 +54,27 @@ impl ChatApp {
         }
     }
 
+    /// 展开/收起「我的房间」的完整标识与指纹。
+    pub(crate) fn toggle_identity(&mut self, cx: &mut Context<Self>) {
+        self.show_identity = !self.show_identity;
+        cx.notify();
+    }
+
+    pub(crate) fn on_toggle_identity(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_identity(cx);
+    }
+
+    /// 供无头测试直接切换展开状态。
+    #[cfg(any(test, feature = "ui-test"))]
+    pub fn debug_toggle_identity(&mut self, cx: &mut Context<Self>) {
+        self.toggle_identity(cx);
+    }
+
     pub(crate) fn connect(
         &mut self,
         addr: String,

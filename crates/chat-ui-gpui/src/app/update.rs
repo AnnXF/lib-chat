@@ -7,7 +7,7 @@ use gpui::ListOffset;
 
 use crate::service::UiEvent;
 
-use super::{ChatApp, ChatLine, DiscoveredRoom, RoomView};
+use super::{ChatApp, ChatLine, DiscoveredRoom, HostedRoom, RoomView};
 
 impl ChatApp {
     pub(crate) fn begin_loading_older(&mut self) -> bool {
@@ -87,16 +87,14 @@ impl ChatApp {
                 addrs,
                 fingerprint,
             } => {
-                let rows = fingerprint
-                    .as_bytes()
-                    .chunks(16)
-                    .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                self.hosted = Some(format!(
-                    "已创建「{name}」\n房间 {room}\n地址 {}\n证书 SHA-256:\n{rows}",
-                    addrs.join("  /  ")
-                ));
+                self.hosted = Some(HostedRoom {
+                    name,
+                    room,
+                    addrs,
+                    fingerprint,
+                });
+                // 换了房间就收起到摘要，别把上一间的详情状态带过来
+                self.show_identity = false;
                 // 已经在用这个房间了，侧栏那个「回到我的房间」入口就该收起来
                 self.local_room = None;
                 self.local_room_id = None;

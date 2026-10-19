@@ -13,6 +13,7 @@ impl ChatApp {
         // 「回到我的房间」那一行：本机有房间、且界面不是正待在这个房间里时才摆
         let local_row = local.is_some() && current != self.local_room_id;
         let joined = self.room.as_ref().map(|view| view.joined).unwrap_or(false);
+        let identity_open = self.show_identity;
 
         let rows: Vec<AnyElement> = items
             .into_iter()
@@ -92,8 +93,11 @@ impl ChatApp {
                             .child(local_room_row(local.unwrap_or(0), cx))
                     })
                     .when_some(self.hosted.clone(), |this, hosted| {
-                        this.child(section_label("我的房间身份"))
-                            .child(hint(&hosted))
+                        this.child(section_label("我的房间")).child(identity_card(
+                            hosted,
+                            identity_open,
+                            cx,
+                        ))
                     }),
             )
             .child(
@@ -127,6 +131,91 @@ impl ChatApp {
             )
             .into_any_element()
     }
+}
+
+/// 本机房间摘要：名字 + 房间短标识 + 一个可用地址，完整信息按需展开。
+///
+/// 完整标识与 64 位指纹常驻侧栏会把「直接连接 / 新建房间」挤下去，也压过了房间列表的视觉重心。
+fn identity_card(hosted: HostedRoom, expanded: bool, cx: &mut Context<ChatApp>) -> AnyElement {
+    let summary = format!("{} · {}", hosted.short_room(), hosted.summary_addr());
+    let toggle = div()
+        .id("identity-toggle")
+        .test_id("identity-toggle")
+        .flex_none()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_xs()
+        .text_color(rgb(theme::ACCENT))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(theme::HOVER)))
+        .on_mouse_up(MouseButton::Left, cx.listener(ChatApp::on_toggle_identity))
+        .child(if expanded { "收起" } else { "详情" });
+
+    let mut card = div()
+        .id("hosted-room")
+        .test_id("hosted-room")
+        .px_5()
+        .pb_2()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_sm()
+                        .text_color(rgb(theme::TEXT))
+                        .child(hosted.name.clone()),
+                )
+                .child(toggle),
+        )
+        .child(
+            div()
+                .truncate()
+                .text_xs()
+                .text_color(rgb(theme::FAINT))
+                .child(summary),
+        );
+
+    if expanded {
+        card = card.child(
+            div()
+                .id("identity-details")
+                .test_id("identity-details")
+                .flex()
+                .flex_col()
+                .child(identity_detail("房间", hosted.room.to_string()))
+                .child(identity_detail("地址", hosted.addrs.join("\n")))
+                .child(identity_detail("证书 SHA-256", hosted.fingerprint_rows())),
+        );
+    }
+
+    card.into_any_element()
+}
+
+/// 展开态的一行：小标题在上，值在下。
+fn identity_detail(label: &str, value: String) -> AnyElement {
+    div()
+        .mt_1()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::FAINT))
+                .child(label.to_string()),
+        )
+        .child(div().text_xs().text_color(rgb(theme::MUTED)).child(value))
+        .into_any_element()
 }
 
 /// 侧栏里「回到本机房间」的一行：点一下就把它重新开张，历史都还在。

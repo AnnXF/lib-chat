@@ -20,7 +20,7 @@ mod update;
 mod views;
 pub mod widgets;
 
-pub use model::{ChatLine, DiscoveredRoom, RoomView};
+pub use model::{ChatLine, DiscoveredRoom, HostedRoom, RoomView};
 
 use std::collections::HashSet;
 
@@ -50,7 +50,9 @@ pub struct ChatApp {
     /// 有一页更早的历史还在路上；避免滚动回调反复发同一个请求。
     loading_older: bool,
     status: String,
-    hosted: Option<String>,
+    hosted: Option<HostedRoom>,
+    /// 是否展开「我的房间」的完整标识与指纹；默认收起，避免侧栏堆满长文本。
+    show_identity: bool,
     /// 本机已有一个可恢复的房间，存了多少条消息；`None` 表示还没有，或已经在用。
     local_room: Option<u64>,
     /// 本机房间的房间标识：拿它判断界面是不是正待在这个房间里，免得再摆一个入口。
@@ -156,6 +158,7 @@ impl ChatApp {
             loading_older: false,
             status: "正在搜索局域网房间…".into(),
             hosted: None,
+            show_identity: false,
             local_room: None,
             local_room_id: None,
             my_id: None,
