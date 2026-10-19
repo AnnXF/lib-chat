@@ -105,6 +105,26 @@ fn default_layout_fills_the_window() {
         (bottom(&composer) - bottom(&main)).abs() <= 1.,
         "输入条应贴住聊天区底边"
     );
+
+    // 结构：工具条在上，输入区在下并留出足够高度
+    let tools = bounds(cx, "composer-tools");
+    assert_inside(&tools, "composer-tools");
+    assert!(
+        f32::from(tools.origin.y) - f32::from(composer.origin.y) <= 16.,
+        "工具条应贴在输入条顶部"
+    );
+
+    let input = bounds(cx, "composer-input");
+    assert_inside(&input, "composer-input");
+    assert!(
+        f32::from(input.size.height) >= 96.,
+        "输入区高度不足: {}",
+        f32::from(input.size.height)
+    );
+    assert!(
+        f32::from(input.origin.y) >= bottom(&tools) - 0.5,
+        "输入区应位于工具条下方"
+    );
 }
 
 /// 房主身份、信任指纹等长文本不能把侧栏撑宽，也不能把底部按钮挤出窗口。

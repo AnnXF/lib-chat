@@ -199,6 +199,24 @@ fn attachment_body(attachment: &Attachment, save: Option<SaveHandler>) -> AnyEle
     }
 }
 
+/// 输入区工具条上的功能按钮：无边框，悬停才出现底色。
+fn tool_button(
+    text: &str,
+    on_click: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_xs()
+        .text_color(rgb(theme::MUTED))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(theme::HOVER)).text_color(rgb(theme::TEXT)))
+        .on_mouse_up(MouseButton::Left, on_click)
+        .child(text.to_string())
+        .into_any_element()
+}
+
 /// 一条消息。
 ///
 /// 自己发的靠右并带强调底色，别人的靠左只留文字，视觉噪声更低。

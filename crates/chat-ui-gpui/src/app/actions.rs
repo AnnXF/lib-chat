@@ -1,7 +1,7 @@
 //! 用户操作：提交服务指令，必要的即时视图变化交给 `update`。
 
 use chat_core::{Attachment, RoomId};
-use gpui::{Context, MouseUpEvent, PathPromptOptions, Window};
+use gpui::{Context, Focusable as _, MouseUpEvent, PathPromptOptions, Window};
 
 use crate::service::UiCommand;
 
@@ -156,6 +156,27 @@ impl ChatApp {
 
     pub(crate) fn on_send(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.submit_message(cx);
+    }
+
+    /// 打开系统表情面板，插入到输入框光标处。
+    pub(crate) fn on_open_emojis(
+        &mut self,
+        _: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.message.read(cx).focus_handle(cx).focus(window);
+        window.show_character_palette();
+    }
+
+    /// 点输入区就让输入框获得焦点。
+    pub(crate) fn on_focus_composer(
+        &mut self,
+        _: &gpui::MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.message.read(cx).focus_handle(cx).focus(window);
     }
 
     /// 选一个本地文件发出去。

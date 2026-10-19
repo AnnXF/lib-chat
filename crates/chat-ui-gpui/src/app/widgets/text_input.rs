@@ -95,6 +95,8 @@ pub struct TextInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    /// 不带自带底色与内边距，交给外层容器排版（用于聊天输入区）。
+    bare: bool,
 }
 
 impl TextInput {
@@ -685,10 +687,9 @@ impl Render for TextInput {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_key_down(cx.listener(Self::on_key_down))
             .w_full()
-            .px_3()
-            .py_2()
-            .rounded_md()
-            .bg(rgb(theme::FIELD))
+            .when(!self.bare, |this| {
+                this.px_3().py_2().rounded_md().bg(rgb(theme::FIELD))
+            })
             .line_height(px(20.))
             .text_size(px(14.))
             .child(div().w_full().child(TextElement {
@@ -725,7 +726,14 @@ impl TextInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
+            bare: false,
         }
+    }
+
+    /// 去掉自带底色与内边距，由外层容器控制外观。
+    pub fn set_bare(&mut self, cx: &mut Context<Self>) {
+        self.bare = true;
+        cx.notify();
     }
 
     /// 当前内容。

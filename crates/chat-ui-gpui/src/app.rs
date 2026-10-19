@@ -104,7 +104,12 @@ impl ChatApp {
         });
         let addr_input = cx.new(|cx| TextInput::new("如 192.168.1.5:52000", cx));
         let fingerprint_input = cx.new(|cx| TextInput::new("房主提供的完整 SHA-256 指纹", cx));
-        let message = cx.new(|cx| TextInput::new("输入消息，回车发送", cx));
+        let message = cx.new(|cx| {
+            let mut input = TextInput::new("输入消息，Enter 发送", cx);
+            // 外观由输入区容器负责，控件本身不再带底色与内边距
+            input.set_bare(cx);
+            input
+        });
 
         cx.subscribe(&message, |this, _, _: &TextInputSubmitted, cx| {
             this.submit_message(cx);

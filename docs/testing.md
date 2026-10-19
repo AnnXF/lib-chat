@@ -68,7 +68,8 @@ cargo test -p chat-server --test load -- --nocapture
 ### UI
 
 - 只在测试构建注册选择器，避免正式包开销：`#[cfg(any(test, feature = "ui-test"))]`。
-- 选择器名与用途一致（`sidebar`、`sidebar-footer`、`chat-main`、`composer`），新增区域沿用同一套命名。
+- 选择器名与用途一致（`sidebar`、`sidebar-footer`、`chat-main`、`composer`、`composer-input`、`composer-tools`），新增区域沿用同一套命名。
+- 输入区是「大输入框 + 工具条」两段结构：改布局时同时断言输入区高度不小于下限、工具条位于输入区下方且不超出输入条。
 - 布局断言检查：是否在窗口内、宽度是否符合设计、关键区域高度是否大于 0、底部区域是否贴底。
 - 长文本（房间名、地址、指纹、昵称）是必测场景：它们是侧栏/标题栏溢出的主要来源。
 

@@ -92,21 +92,69 @@ impl ChatApp {
                     .test_id("composer")
                     .flex_none()
                     .flex()
-                    .flex_row()
-                    .items_center()
+                    .flex_col()
                     .gap_2()
                     .px_5()
-                    .py_3()
+                    .pt_3()
+                    .pb_4()
                     .border_t_1()
                     .border_color(rgb(theme::BORDER))
-                    .child(div().flex_1().child(self.message.clone()))
-                    .child(button(
-                        "文件",
-                        false,
-                        false,
-                        cx.listener(Self::on_pick_file),
-                    ))
-                    .child(button("发送", true, false, cx.listener(Self::on_send))),
+                    // 工具条在上：左侧功能入口，右侧快捷键与发送；
+                    // 新增表情/图片只是在左侧再加一个入口，不挤占输入区
+                    .child(
+                        div()
+                            .id("composer-tools")
+                            .test_id("composer-tools")
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .pb_2()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(tool_button("表情", cx.listener(Self::on_open_emojis)))
+                                    .child(tool_button("文件", cx.listener(Self::on_pick_file))),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(theme::FAINT))
+                                            .child("Enter 发送"),
+                                    )
+                                    .child(button("发送", true, false, cx.listener(Self::on_send))),
+                            ),
+                    )
+                    // 输入区在下：大块留白，后续多行输入、@ 提及都在这里长高
+                    .child(
+                        div()
+                            .id("composer-input")
+                            .test_id("composer-input")
+                            .w_full()
+                            .flex_1()
+                            .min_h(px(96.))
+                            .flex()
+                            .items_start()
+                            .px_3()
+                            .py_2()
+                            .rounded_lg()
+                            .bg(rgb(theme::FIELD))
+                            .border_1()
+                            .border_color(rgb(theme::BORDER))
+                            // 点输入区任意位置都能聚焦，不必正好点到文字行
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_focus_composer))
+                            .child(self.message.clone()),
+                    ),
             )
             .into_any_element()
     }
