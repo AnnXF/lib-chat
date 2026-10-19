@@ -65,7 +65,9 @@ pub trait Connection: Send + Sync {
 }
 
 /// 服务端向某条连接推送事件的口子。
-pub const EVENT_QUEUE_CAPACITY: usize = 32;
+///
+/// 容量要能吸收一次突发广播：32 太浅，客户端只落后一帧就可能被判定为慢连接而清退。
+pub const EVENT_QUEUE_CAPACITY: usize = 256;
 pub type EventStream = mpsc::Receiver<ServerEvent>;
 
 /// 一条连接的请求入口，传输层把收到的请求交给它。
