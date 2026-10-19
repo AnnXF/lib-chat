@@ -1,13 +1,13 @@
-//! 通过真实 QUIC 连接跑通 V1 链路，验证传输层与 TOFU 校验。
+//! 通过真实 QUIC 连接验证消息传输和证书指纹匹配。
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use chat_client::Client;
+use chat_core::Client;
 use chat_core::ConnectionAcceptor;
-use chat_proto::ServerEvent;
+use chat_core::ServerEvent;
 use chat_server::{Acceptor, Server};
-use chat_transport_quic::{connect, QuicServer};
+use chat_transport_quic::{connect, QuicServer, SelfSignedCert};
 
 async fn wait_for<F>(client: &Client, pred: F) -> ServerEvent
 where
@@ -43,10 +43,10 @@ async fn remote_clients_chat_over_quic() {
     let room = server.room();
 
     let a = Client::new(Arc::new(
-        connect(addr, Some(&fingerprint)).await.expect("A 连接失败"),
+        connect(addr, &fingerprint).await.expect("A 连接失败"),
     ));
     let b = Client::new(Arc::new(
-        connect(addr, Some(&fingerprint)).await.expect("B 连接失败"),
+        connect(addr, &fingerprint).await.expect("B 连接失败"),
     ));
 
     // 未加入时只能看到摘要
@@ -89,6 +89,20 @@ async fn rejects_mismatched_fingerprint() {
     let (_server, _quic, addr, _fingerprint) = start_server().await;
 
     let wrong = "00".repeat(32);
-    let result = connect(addr, Some(&wrong)).await;
+    let result = connect(addr, &wrong).await;
     assert!(result.is_err(), "证书指纹不匹配时必须拒绝连接");
+}
+
+#[test]
+fn identity_survives_restart_and_missing_identity_is_rejected() {
+    let dir = std::env::temp_dir().join(format!("libchat-cert-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("room.identity");
+    let first = SelfSignedCert::load_or_create(&path, true).unwrap();
+    let original = first.fingerprint().to_string();
+    let second = SelfSignedCert::load_or_create(&path, false).unwrap();
+    assert_eq!(second.fingerprint(), original);
+    std::fs::remove_file(&path).unwrap();
+    assert!(SelfSignedCert::load_or_create(&path, false).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
 }

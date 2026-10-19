@@ -21,15 +21,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use chat_client::Client;
+use chat_core::Client;
 use chat_core::{ChatError, Connection, ConnectionAcceptor};
+use chat_core::{LobbyInfo, Message, RoomId, Seq, ServerEvent, UserId};
 use chat_discovery::{RoomAnnouncer, RoomBrowser};
-use chat_proto::{LobbyInfo, Message, RoomId, Seq, ServerEvent, UserId};
 use chat_server::{Acceptor, Server};
-use chat_transport_quic::{Liveness, QuicConnection, QuicServer, connect, connect_with};
+use chat_transport_quic::{
+    Liveness, QuicConnection, QuicServer, TrustStore, connect, connect_with, validate_fingerprint,
+};
 use discovery::{DiscoveredRooms, browse_loop};
 use flume::{Receiver, Sender};
-use hosting::{Hosting, claim_local_room, local_room, reset_local_room, start_host};
+use hosting::{Hosting, RoomHostLock, claim_local_room, local_room, start_host};
 use session::{Active, SessionCmd, open_session};
 
 /// 房间列表的人数复查间隔。房间要在未加入时也能看到人数，只能周期性探测。
@@ -44,9 +46,9 @@ async fn start_hosting(
     events: &Sender<UiEvent>,
     beacon_port: u16,
     liveness: Liveness,
-    data_dir: &Path,
+    lock: RoomHostLock,
 ) -> Result<(Hosting, Option<Active>), String> {
-    let started = start_host(name, events, beacon_port, liveness, data_dir).await?;
+    let started = start_host(name, events, beacon_port, liveness, lock).await?;
 
     let alive = Arc::new(AtomicBool::new(true));
     let visible = Arc::new(AtomicBool::new(true));
@@ -61,21 +63,34 @@ async fn start_hosting(
     let hosting = Hosting {
         room: started.server.room(),
         endpoint: Arc::clone(&started.endpoint),
+        store: started.store,
         _announcer: started.announcer,
         alive,
         visible,
-        _lock: started.lock,
+        lock: started.lock,
     };
 
     // 房主自己也接入房间，否则同一个窗口里无法参与聊天
-    let session =
-        match open_session(&started.addr, Some(&started.fingerprint), events, liveness).await {
-            Ok(session) => Some(session),
-            Err(e) => {
-                let _ = events.send(UiEvent::Error(e));
-                None
-            }
-        };
+    let session = match open_session(
+        &started.addr,
+        Some(&started.fingerprint),
+        events,
+        liveness,
+        Some(started.server.room()),
+        None,
+        None,
+    )
+    .await
+    {
+        Ok((session, lobby)) => {
+            let _ = events.send_async(lobby).await;
+            Some(session)
+        }
+        Err(e) => {
+            let _ = events.send_async(UiEvent::Error(e)).await;
+            None
+        }
+    };
 
     Ok((hosting, session))
 }
@@ -100,6 +115,7 @@ const SYNC_LIMIT: u32 = 200;
 /// 一条补齐回来的消息。
 #[derive(Clone, Debug)]
 pub struct HistoryMessage {
+    pub seq: Seq,
     pub sender_id: UserId,
     pub sender: String,
     pub text: String,
@@ -109,6 +125,11 @@ pub struct HistoryMessage {
 pub enum UiEvent {
     Status(String),
     Error(String),
+    TrustRequired {
+        room: RoomId,
+        addr: String,
+        fingerprint: String,
+    },
     /// 局域网里发现（或刷新到）的房间。同一房间可能经多条通道被播报，按 `room` 去重。
     RoomFound {
         room: RoomId,
@@ -119,6 +140,7 @@ pub enum UiEvent {
     },
     /// 本机已作为房主启动。
     Hosting {
+        room: RoomId,
         name: String,
         addrs: Vec<String>,
         fingerprint: String,
@@ -146,6 +168,7 @@ pub enum UiEvent {
     },
     Message {
         room: RoomId,
+        seq: Seq,
         sender_id: UserId,
         sender: String,
         text: String,
@@ -161,6 +184,9 @@ pub enum UiEvent {
     Missed {
         room: RoomId,
         messages: Vec<HistoryMessage>,
+    },
+    HistoryCancelled {
+        room: RoomId,
     },
     Presence {
         room: RoomId,
@@ -190,6 +216,16 @@ pub enum UiCommand {
     Connect {
         addr: String,
         fingerprint: Option<String>,
+    },
+    ConnectDiscovered {
+        room: RoomId,
+        addr: String,
+        fingerprint: String,
+    },
+    ConfirmTrust {
+        room: RoomId,
+        addr: String,
+        fingerprint: String,
     },
     Join {
         name: String,
@@ -228,8 +264,8 @@ pub fn spawn_with_data(
     liveness: Liveness,
     data_dir: PathBuf,
 ) -> (Sender<UiCommand>, Receiver<UiEvent>) {
-    let (cmd_tx, cmd_rx) = flume::unbounded();
-    let (ev_tx, ev_rx) = flume::unbounded();
+    let (cmd_tx, cmd_rx) = flume::bounded(128);
+    let (ev_tx, ev_rx) = flume::bounded(512);
 
     // 运行时建不起来也要把原因告诉界面，而不是安静地少掉一个后端线程
     let report = ev_tx.clone();
@@ -241,7 +277,7 @@ pub fn spawn_with_data(
                 .worker_threads(2)
                 .build();
             let Ok(runtime) = runtime else {
-                let _ = report.send(UiEvent::Error("后端运行时启动失败".into()));
+                let _ = report.try_send(UiEvent::Error("后端运行时启动失败".into()));
                 return;
             };
             runtime.block_on(run(ev_tx, cmd_rx, beacon_port, liveness, data_dir));
@@ -259,9 +295,14 @@ fn default_data_dir() -> PathBuf {
     base.join(".lib-chat").join("rooms")
 }
 
-/// 建房：先回收旧资源（旧房间的 endpoint、广播、人数定时器），再启动新的托管。
+enum RoomRequest {
+    Reopen(String),
+    New(String),
+}
+
+/// 建房或重建房间：从抢锁到重新托管始终持有同一把锁。
 async fn start_new_room(
-    name: String,
+    request: RoomRequest,
     hosting: &mut Option<Hosting>,
     active: &mut Option<Active>,
     events: &Sender<UiEvent>,
@@ -269,27 +310,54 @@ async fn start_new_room(
     liveness: Liveness,
     data_dir: &Path,
 ) {
-    // 顺序不能反：先把会话优雅结束掉，再关托管。反过来的话连接会先断，
-    // 会话会先去重连，`end()` 就得等它退避一轮，甚至卡在握手上。
+    let (name, reset) = match request {
+        RoomRequest::Reopen(name) => (name, false),
+        RoomRequest::New(name) => (name, true),
+    };
+    let lock = if hosting.is_none() {
+        match claim_local_room(data_dir, beacon_port) {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                let _ = events.send_async(UiEvent::Error(e)).await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     if let Some(previous) = active.take() {
         previous.end().await;
     }
-    if let Some(previous) = hosting.take() {
-        previous.shutdown(events);
+    let lock = if let Some(previous) = hosting.take() {
+        previous.shutdown(events).await
+    } else {
+        lock.expect("必须持有房主锁才能建房")
+    };
+
+    if reset && let Err(e) = lock.reset() {
+        let _ = events.send_async(UiEvent::Error(e)).await;
+        return;
     }
 
-    match start_hosting(&name, events, beacon_port, liveness, data_dir).await {
+    match start_hosting(&name, events, beacon_port, liveness, lock).await {
         Ok((started, session)) => {
             *hosting = Some(started);
             *active = session;
         }
         Err(e) => {
-            let _ = events.send(UiEvent::Error(e));
+            let _ = events.send_async(UiEvent::Error(e)).await;
         }
     }
 }
 
-/// 进入一个房间：旧会话先结束，本机托管不动——自己建过的房间不该因为切走就消失。
+struct ConnectPolicy<'a> {
+    expected_room: Option<RoomId>,
+    trust: &'a TrustStore,
+    rooms: &'a DiscoveredRooms,
+}
+
+/// 候选房间准备好后再关闭旧会话；失败时仍留在原房间。
 async fn take_room(
     addr: &str,
     fingerprint: Option<&str>,
@@ -297,18 +365,28 @@ async fn take_room(
     active: &mut Option<Active>,
     events: &Sender<UiEvent>,
     liveness: Liveness,
+    policy: &ConnectPolicy<'_>,
 ) -> Result<RoomId, String> {
+    let (session, lobby) = open_session(
+        addr,
+        fingerprint,
+        events,
+        liveness,
+        policy.expected_room,
+        Some(policy.trust),
+        Some(policy.rooms.clone()),
+    )
+    .await?;
     if let Some(previous) = active.take() {
         previous.end().await;
     }
-    let session = open_session(addr, fingerprint, events, liveness).await?;
-    // 界面正在展示这个房间时，本机托管的人数上报才有意义
     if let Some(current) = hosting.as_ref() {
         current
             .visible
             .store(current.room == session.room, Ordering::Relaxed);
     }
     let room = session.room;
+    let _ = events.send_async(lobby).await;
     *active = Some(session);
     Ok(room)
 }
@@ -321,9 +399,20 @@ async fn connect_room(
     active: &mut Option<Active>,
     events: &Sender<UiEvent>,
     liveness: Liveness,
+    policy: &ConnectPolicy<'_>,
 ) {
-    if let Err(e) = take_room(&addr, fingerprint.as_deref(), hosting, active, events, liveness).await {
-        let _ = events.send(UiEvent::Error(e));
+    if let Err(e) = take_room(
+        &addr,
+        fingerprint.as_deref(),
+        hosting,
+        active,
+        events,
+        liveness,
+        policy,
+    )
+    .await
+    {
+        let _ = events.send_async(UiEvent::Error(e)).await;
     }
 }
 
@@ -367,9 +456,21 @@ async fn adopt_local_room(
 
     loop {
         if let Some((addr, fingerprint)) = rooms.host_of(room).await
-            && take_room(&addr, Some(&fingerprint), hosting, active, events, liveness)
-                .await
-                .is_ok()
+            && take_room(
+                &addr,
+                Some(&fingerprint),
+                hosting,
+                active,
+                events,
+                liveness,
+                &ConnectPolicy {
+                    expected_room: Some(room),
+                    trust: &TrustStore::new(data_dir),
+                    rooms,
+                },
+            )
+            .await
+            .is_ok()
         {
             return true;
         }
@@ -391,15 +492,24 @@ async fn run(
     data_dir: PathBuf,
 ) {
     let rooms = DiscoveredRooms::default();
-    tokio::spawn(browse_loop(events.clone(), beacon_port, rooms.clone()));
+    tokio::spawn(browse_loop(
+        events.clone(),
+        beacon_port,
+        rooms.clone(),
+        data_dir.clone(),
+    ));
 
     // 本机是不是已经有这个端口的房间了？有就在侧栏给一个「回到我的房间」的入口
     if let Some((room, messages)) = local_room(&data_dir, beacon_port).await {
-        let _ = events.send(UiEvent::LocalRoom { room, messages });
+        let _ = events
+            .send_async(UiEvent::LocalRoom { room, messages })
+            .await;
     }
 
     let mut active: Option<Active> = None;
     let mut hosting: Option<Hosting> = None;
+    let trust = TrustStore::new(&data_dir);
+    let mut pending_trust: Option<(RoomId, String, String)> = None;
 
     while let Ok(cmd) = cmds.recv_async().await {
         match cmd {
@@ -417,7 +527,7 @@ async fn run(
                 .await;
                 if !adopted {
                     start_new_room(
-                        name,
+                        RoomRequest::Reopen(name),
                         &mut hosting,
                         &mut active,
                         &events,
@@ -430,65 +540,150 @@ async fn run(
             }
 
             UiCommand::NewRoom { name } => {
-                // 同上：先结束会话再关托管，别让连接先断
-                if let Some(previous) = active.take() {
-                    previous.end().await;
-                }
-                if let Some(previous) = hosting.take() {
-                    previous.shutdown(&events);
-                }
-
-                match reset_local_room(&data_dir, beacon_port) {
-                    Ok(()) => {
-                        start_new_room(
-                            name,
-                            &mut hosting,
-                            &mut active,
-                            &events,
-                            beacon_port,
-                            liveness,
-                            &data_dir,
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        let _ = events.send(UiEvent::Error(e));
-                    }
-                }
+                start_new_room(
+                    RoomRequest::New(name),
+                    &mut hosting,
+                    &mut active,
+                    &events,
+                    beacon_port,
+                    liveness,
+                    &data_dir,
+                )
+                .await;
             }
 
             UiCommand::Connect { addr, fingerprint } => {
-                connect_room(addr, fingerprint, &mut hosting, &mut active, &events, liveness).await;
+                pending_trust = None;
+                connect_room(
+                    addr,
+                    fingerprint,
+                    &mut hosting,
+                    &mut active,
+                    &events,
+                    liveness,
+                    &ConnectPolicy {
+                        expected_room: None,
+                        trust: &trust,
+                        rooms: &rooms,
+                    },
+                )
+                .await;
+            }
+            UiCommand::ConnectDiscovered {
+                room,
+                addr,
+                fingerprint,
+            } => {
+                pending_trust = None;
+                if let Err(e) = validate_fingerprint(&fingerprint) {
+                    let _ = events.send_async(UiEvent::Error(e.to_string())).await;
+                    continue;
+                }
+                let fingerprint = fingerprint.to_ascii_lowercase();
+                match trust.get(room) {
+                    Ok(Some(pinned)) if pinned != fingerprint => {
+                        let _ = events
+                            .send_async(UiEvent::Error(format!(
+                                "房间 {room} 的证书指纹已变更，已拒绝连接"
+                            )))
+                            .await;
+                    }
+                    Ok(Some(_)) => {
+                        connect_room(
+                            addr,
+                            Some(fingerprint),
+                            &mut hosting,
+                            &mut active,
+                            &events,
+                            liveness,
+                            &ConnectPolicy {
+                                expected_room: Some(room),
+                                trust: &trust,
+                                rooms: &rooms,
+                            },
+                        )
+                        .await
+                    }
+                    Ok(None) => {
+                        pending_trust = Some((room, addr.clone(), fingerprint.clone()));
+                        let _ = events
+                            .send_async(UiEvent::TrustRequired {
+                                room,
+                                addr,
+                                fingerprint,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = events.send_async(UiEvent::Error(e.to_string())).await;
+                    }
+                }
+            }
+            UiCommand::ConfirmTrust {
+                room,
+                addr,
+                fingerprint,
+            } => {
+                if pending_trust.take() == Some((room, addr.clone(), fingerprint.clone())) {
+                    connect_room(
+                        addr,
+                        Some(fingerprint),
+                        &mut hosting,
+                        &mut active,
+                        &events,
+                        liveness,
+                        &ConnectPolicy {
+                            expected_room: Some(room),
+                            trust: &trust,
+                            rooms: &rooms,
+                        },
+                    )
+                    .await;
+                } else {
+                    let _ = events
+                        .send_async(UiEvent::Error("待确认房间已失效，请重新选择".into()))
+                        .await;
+                }
             }
 
             UiCommand::Join { name } => match &active {
                 Some(session) => {
-                    let _ = session.tx.send(SessionCmd::Join(name));
+                    send_session(session, SessionCmd::Join(name), &events).await;
                 }
                 // 没有会话时点「加入」不能一声不吭，否则看起来就是界面卡住了
                 None => {
-                    let _ = events.send(UiEvent::Error("还没有连上房间".into()));
+                    let _ = events
+                        .send_async(UiEvent::Error("还没有连上房间".into()))
+                        .await;
                 }
             },
 
             UiCommand::Leave => {
                 if let Some(session) = &active {
-                    let _ = session.tx.send(SessionCmd::Leave);
+                    send_session(session, SessionCmd::Leave, &events).await;
                 }
             }
 
             UiCommand::Send { text } => {
                 if let Some(session) = &active {
-                    let _ = session.tx.send(SessionCmd::Send(text));
+                    send_session(session, SessionCmd::Send(text), &events).await;
                 }
             }
 
             UiCommand::LoadOlder => {
                 if let Some(session) = &active {
-                    let _ = session.tx.send(SessionCmd::LoadOlder);
+                    send_session(session, SessionCmd::LoadOlder, &events).await;
                 }
             }
         }
+    }
+}
+
+async fn send_session(session: &Active, cmd: SessionCmd, events: &Sender<UiEvent>) {
+    if session.tx.try_send(cmd).is_err() {
+        let _ = events
+            .send_async(UiEvent::Error("会话繁忙或已断开，请稍后重试".into()))
+            .await;
     }
 }
 
@@ -515,7 +710,7 @@ fn spawn_presence_ticker(
                 room,
                 online: server.online_count().await,
             };
-            if events.send(event).is_err() {
+            if events.send_async(event).await.is_err() {
                 return;
             }
         }

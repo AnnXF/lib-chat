@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use chat_proto::RoomId;
+use chat_core::RoomId;
 use chat_transport_quic::Liveness;
 use chat_ui_gpui::service::{UiCommand, UiEvent, spawn_with_data};
 
@@ -93,8 +93,9 @@ fn host_then_connect_join_send() {
         name: "测试房间".into(),
     })
     .unwrap();
-    let UiEvent::Hosting { addrs, .. } =
-        recv_until(&events, |e| matches!(e, UiEvent::Hosting { .. }))
+    let UiEvent::Hosting {
+        addrs, fingerprint, ..
+    } = recv_until(&events, |e| matches!(e, UiEvent::Hosting { .. }))
     else {
         unreachable!()
     };
@@ -103,10 +104,11 @@ fn host_then_connect_join_send() {
         .find(|a| a.starts_with("127.0.0.1"))
         .expect("应提供回环地址便于单机自测")
         .clone();
+    recv_until(&events, |e| matches!(e, UiEvent::Lobby { .. }));
 
     cmds.send(UiCommand::Connect {
         addr,
-        fingerprint: None,
+        fingerprint: Some(fingerprint),
     })
     .unwrap();
     match recv_until(&events, |e| matches!(e, UiEvent::Lobby { .. })) {
@@ -183,7 +185,7 @@ fn two_instances_discover_each_other_on_one_host() {
     else {
         unreachable!()
     };
-    assert!(!fingerprint.is_empty(), "应带证书指纹以便 TOFU 校验");
+    assert!(!fingerprint.is_empty(), "应带证书指纹供用户首次核对");
 
     cmds_b
         .send(UiCommand::Connect {
@@ -218,6 +220,82 @@ fn two_instances_discover_each_other_on_one_host() {
     }
 }
 
+#[test]
+fn discovery_requires_confirmation_then_persists_trust() {
+    use chat_transport_quic::TrustStore;
+
+    let (_guard, beacon_port) = serial();
+    let root = test_data_dir(beacon_port);
+    let owner_dir = root.join("owner");
+    let guest_dir = root.join("guest");
+    let (owner, owner_events) = spawn_with_data(beacon_port, Liveness::default(), owner_dir);
+    owner
+        .send(UiCommand::Host {
+            name: "需要验证的房间".into(),
+        })
+        .unwrap();
+    let fingerprint = match recv_until(&owner_events, |e| matches!(e, UiEvent::Hosting { .. })) {
+        UiEvent::Hosting { fingerprint, .. } => fingerprint,
+        _ => unreachable!(),
+    };
+    let room = match recv_until(&owner_events, |e| matches!(e, UiEvent::Lobby { .. })) {
+        UiEvent::Lobby { room, .. } => room,
+        _ => unreachable!(),
+    };
+    let (guest, guest_events) =
+        spawn_with_data(beacon_port, Liveness::default(), guest_dir.clone());
+    let addr = match recv_until(
+        &guest_events,
+        |e| matches!(e, UiEvent::RoomFound { room: found, .. } if *found == room),
+    ) {
+        UiEvent::RoomFound { addr, .. } => addr,
+        _ => unreachable!(),
+    };
+    guest
+        .send(UiCommand::ConnectDiscovered {
+            room,
+            addr: addr.clone(),
+            fingerprint: fingerprint.clone(),
+        })
+        .unwrap();
+    let pending = recv_until(&guest_events, |e| {
+        matches!(e, UiEvent::TrustRequired { .. })
+    });
+    assert!(matches!(pending, UiEvent::TrustRequired { room: r, .. } if r == room));
+    assert_eq!(TrustStore::new(&guest_dir).get(room).unwrap(), None);
+
+    guest
+        .send(UiCommand::ConfirmTrust {
+            room,
+            addr: addr.clone(),
+            fingerprint: fingerprint.clone(),
+        })
+        .unwrap();
+    recv_until(
+        &guest_events,
+        |e| matches!(e, UiEvent::Lobby { room: joined, .. } if *joined == room),
+    );
+    assert_eq!(
+        TrustStore::new(&guest_dir).get(room).unwrap(),
+        Some(fingerprint.clone())
+    );
+    guest
+        .send(UiCommand::ConnectDiscovered {
+            room,
+            addr,
+            fingerprint: "f".repeat(64),
+        })
+        .unwrap();
+    recv_until(
+        &guest_events,
+        |e| matches!(e, UiEvent::Error(message) if message.contains("指纹已变更")),
+    );
+    assert_eq!(
+        TrustStore::new(&guest_dir).get(room).unwrap(),
+        Some(fingerprint)
+    );
+}
+
 /// 切换房间（这里用「重新创建房间」触发）时会主动退出旧房间，
 /// 旧房间的在线人数必须立刻回落，不能留下任何残留计数。
 #[test]
@@ -231,13 +309,19 @@ fn leaving_on_switch_drops_online_count() {
             name: "房间A".into(),
         })
         .unwrap();
-    let addr_a = match recv_until(&events_b, |e| matches!(e, UiEvent::Hosting { .. })) {
-        UiEvent::Hosting { addrs, .. } => addrs
-            .into_iter()
-            .find(|addr| addr.starts_with("127.0.0.1"))
-            .expect("应提供回环地址"),
-        _ => unreachable!(),
-    };
+    let (addr_a, fingerprint_a) =
+        match recv_until(&events_b, |e| matches!(e, UiEvent::Hosting { .. })) {
+            UiEvent::Hosting {
+                addrs, fingerprint, ..
+            } => (
+                addrs
+                    .into_iter()
+                    .find(|addr| addr.starts_with("127.0.0.1"))
+                    .expect("应提供回环地址"),
+                fingerprint,
+            ),
+            _ => unreachable!(),
+        };
     recv_until(&events_b, |e| matches!(e, UiEvent::Lobby { .. }));
     cmds_b.send(UiCommand::Join { name: "Bob".into() }).unwrap();
     recv_until(&events_b, |e| matches!(e, UiEvent::Joined { .. }));
@@ -247,7 +331,7 @@ fn leaving_on_switch_drops_online_count() {
     cmds_a
         .send(UiCommand::Connect {
             addr: addr_a,
-            fingerprint: None,
+            fingerprint: Some(fingerprint_a),
         })
         .unwrap();
     recv_until(&events_a, |e| matches!(e, UiEvent::Lobby { .. }));
@@ -451,9 +535,10 @@ fn reopening_offers_the_local_room_back() {
             })
             .unwrap();
         }
-        recv_until(&events, |e| {
-            matches!(e, UiEvent::Message { text, .. } if text.as_str() == "第 3 句")
-        });
+        recv_until(
+            &events,
+            |e| matches!(e, UiEvent::Message { text, .. } if text.as_str() == "第 3 句"),
+        );
         drop(cmds);
         drop(events);
     }
@@ -461,19 +546,37 @@ fn reopening_offers_the_local_room_back() {
 
     // 重开：先提示本机房间还在，再点进去应看到原来的历史
     let (cmds, events) = spawn_with_data(beacon_port, Liveness::default(), dir.clone());
-    match wait_for(
+    let room = match wait_for(
         &events,
         |e| matches!(e, UiEvent::LocalRoom { .. }),
         Duration::from_secs(2),
     ) {
-        Some(UiEvent::LocalRoom { messages, .. }) => assert_eq!(messages, 3),
+        Some(UiEvent::LocalRoom { messages, room }) => {
+            assert_eq!(messages, 3);
+            room
+        }
         _ => panic!("重开后应提示本机房间还在"),
-    }
+    };
+    let fingerprint = chat_transport_quic::TrustStore::new(&dir)
+        .get(room)
+        .unwrap()
+        .unwrap();
 
     cmds.send(UiCommand::Host {
         name: "会留下的房间".into(),
     })
     .unwrap();
+    match recv_until(&events, |e| matches!(e, UiEvent::Hosting { .. })) {
+        UiEvent::Hosting {
+            room: reopened,
+            fingerprint: next,
+            ..
+        } => {
+            assert_eq!(reopened, room);
+            assert_eq!(next, fingerprint);
+        }
+        _ => unreachable!(),
+    }
     recv_until(&events, |e| matches!(e, UiEvent::Lobby { .. }));
     cmds.send(UiCommand::Join {
         name: "Alice".into(),
@@ -544,6 +647,55 @@ fn new_room_clears_the_local_history() {
     }
 }
 
+#[test]
+#[ignore]
+fn reset_development_room_from_environment() {
+    use chat_core::MessageStore;
+    use chat_server::SqliteStore;
+    use chat_transport_quic::TrustStore;
+
+    let dir = std::path::PathBuf::from(
+        std::env::var("LIBCHAT_RESET_DIR").expect("指定 LIBCHAT_RESET_DIR"),
+    );
+    let port: u16 = std::env::var("LIBCHAT_RESET_PORT")
+        .expect("指定 LIBCHAT_RESET_PORT")
+        .parse()
+        .unwrap();
+    let (cmds, events) = spawn_with_data(port, Liveness::default(), dir.clone());
+    cmds.send(UiCommand::NewRoom {
+        name: "本机房间".into(),
+    })
+    .unwrap();
+    let (room, fingerprint) = match recv_until(&events, |e| {
+        matches!(e, UiEvent::Hosting { .. } | UiEvent::Error(_))
+    }) {
+        UiEvent::Hosting {
+            room, fingerprint, ..
+        } => (room, fingerprint),
+        UiEvent::Error(reason) => panic!("重建本机房间失败: {reason}"),
+        _ => unreachable!(),
+    };
+    recv_until(
+        &events,
+        |e| matches!(e, UiEvent::Lobby { room: joined, .. } if *joined == room),
+    );
+    assert_eq!(TrustStore::new(&dir).get(room).unwrap(), Some(fingerprint));
+    drop(cmds);
+    drop(events);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let store = SqliteStore::open(&dir.join(format!("room-{port}.db")))
+            .await
+            .unwrap();
+        assert_eq!(store.room(), room);
+        assert_eq!(store.latest_seq(room).await.unwrap(), 0);
+        store.close().await;
+    });
+}
+
 /// 已经开着一个房间时再点「新建房间」，新房间必须照常可用。
 #[test]
 fn new_room_while_hosting_keeps_the_room_usable() {
@@ -607,8 +759,7 @@ fn joining_after_two_new_rooms_still_works() {
     let (cmds, events) = spawn_with_data(beacon_port, Liveness::default(), dir);
 
     for name in ["一号", "二号"] {
-        cmds.send(UiCommand::NewRoom { name: name.into() })
-            .unwrap();
+        cmds.send(UiCommand::NewRoom { name: name.into() }).unwrap();
         let hosting = wait_for(
             &events,
             |e| matches!(e, UiEvent::Hosting { .. }),
@@ -708,11 +859,7 @@ fn two_instances_sharing_the_local_room_deliver_in_real_time() {
         "A 发的消息应当实时到达 B"
     );
 
-    cmds_b
-        .send(UiCommand::Send {
-            text: "在".into(),
-        })
-        .unwrap();
+    cmds_b.send(UiCommand::Send { text: "在".into() }).unwrap();
     assert!(
         wait_for(
             &events_a,
@@ -724,6 +871,80 @@ fn two_instances_sharing_the_local_room_deliver_in_real_time() {
     );
 }
 
+#[test]
+fn second_instance_cannot_reset_a_hosted_room() {
+    use chat_core::MessageStore;
+    use chat_server::SqliteStore;
+
+    let (_guard, beacon_port) = serial();
+    let dir = test_data_dir(beacon_port);
+    let (cmds_a, events_a) = spawn_with_data(beacon_port, Liveness::default(), dir.clone());
+    cmds_a
+        .send(UiCommand::Host {
+            name: "原房间".into(),
+        })
+        .unwrap();
+    recv_until(&events_a, |e| matches!(e, UiEvent::Hosting { .. }));
+    let room = match recv_until(&events_a, |e| matches!(e, UiEvent::Lobby { .. })) {
+        UiEvent::Lobby { room, .. } => room,
+        _ => unreachable!(),
+    };
+    cmds_a
+        .send(UiCommand::Join {
+            name: "Alice".into(),
+        })
+        .unwrap();
+    recv_until(&events_a, |e| matches!(e, UiEvent::Joined { .. }));
+    cmds_a
+        .send(UiCommand::Send {
+            text: "保留的历史".into(),
+        })
+        .unwrap();
+    recv_until(
+        &events_a,
+        |e| matches!(e, UiEvent::Message { text, .. } if text == "保留的历史"),
+    );
+
+    let (cmds_b, events_b) = spawn_with_data(beacon_port, Liveness::default(), dir.clone());
+    recv_until(&events_b, |e| matches!(e, UiEvent::LocalRoom { .. }));
+    cmds_b
+        .send(UiCommand::NewRoom {
+            name: "不应创建".into(),
+        })
+        .unwrap();
+    recv_until(
+        &events_b,
+        |e| matches!(e, UiEvent::Error(message) if message.contains("本机已有实例")),
+    );
+
+    cmds_a
+        .send(UiCommand::Send {
+            text: "房间仍可用".into(),
+        })
+        .unwrap();
+    recv_until(
+        &events_a,
+        |e| matches!(e, UiEvent::Message { text, .. } if text == "房间仍可用"),
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let store = SqliteStore::open(&dir.join(format!("room-{beacon_port}.db")))
+            .await
+            .unwrap();
+        assert_eq!(store.room(), room);
+        let history = store.history(room, None, 10).await.unwrap();
+        let texts: Vec<_> = history
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(texts, ["保留的历史", "房间仍可用"]);
+    });
+}
+
 /// 重建房间后，旧房间（本机自己刚撤下的那个）必须马上离开房间列表。
 ///
 /// 列表里留一行连不上的旧房间，用户就会去点它，然后吃到一次「连接超时」。
@@ -733,8 +954,10 @@ fn rebuilding_the_local_room_drops_the_old_one_right_away() {
     let dir = test_data_dir(beacon_port);
     let (cmds, events) = spawn_with_data(beacon_port, Liveness::default(), dir);
 
-    cmds.send(UiCommand::NewRoom { name: "一号".into() })
-        .unwrap();
+    cmds.send(UiCommand::NewRoom {
+        name: "一号".into(),
+    })
+    .unwrap();
     recv_until(&events, |e| matches!(e, UiEvent::Hosting { .. }));
     // 房间标识用「自己接进自己房间」带回的那个，别拿房间列表里的：
     // mDNS 会让同网段别的房间也飘进来，抓到的可能不是自己的
@@ -743,8 +966,10 @@ fn rebuilding_the_local_room_drops_the_old_one_right_away() {
         _ => unreachable!(),
     };
 
-    cmds.send(UiCommand::NewRoom { name: "二号".into() })
-        .unwrap();
+    cmds.send(UiCommand::NewRoom {
+        name: "二号".into(),
+    })
+    .unwrap();
 
     // 旧房间的「消失」和新房间的「上线」谁先谁后都算数，所以一起收着看
     let deadline = Instant::now() + Duration::from_secs(6);
@@ -784,7 +1009,7 @@ fn connecting_to_a_dead_address_fails_quickly() {
     let started = Instant::now();
     cmds.send(UiCommand::Connect {
         addr: dead.to_string(),
-        fingerprint: None,
+        fingerprint: Some("a".repeat(64)),
     })
     .unwrap();
     let failed = wait_for(
@@ -799,6 +1024,43 @@ fn connecting_to_a_dead_address_fails_quickly() {
         elapsed < Duration::from_secs(8),
         "连不上的地址应当很快放弃，实际耗时 {elapsed:?}"
     );
+}
+
+#[test]
+fn failed_room_switch_keeps_the_old_session() {
+    let (_guard, beacon_port) = serial();
+    let (cmds, events) = spawn_test(beacon_port);
+    cmds.send(UiCommand::Host {
+        name: "原房间".into(),
+    })
+    .unwrap();
+    recv_until(&events, |e| matches!(e, UiEvent::Hosting { .. }));
+    let room = match recv_until(&events, |e| matches!(e, UiEvent::Lobby { .. })) {
+        UiEvent::Lobby { room, .. } => room,
+        _ => unreachable!(),
+    };
+    cmds.send(UiCommand::Join {
+        name: "Alice".into(),
+    })
+    .unwrap();
+    recv_until(&events, |e| matches!(e, UiEvent::Joined { .. }));
+
+    cmds.send(UiCommand::Connect {
+        addr: "127.0.0.1:0".into(),
+        fingerprint: None,
+    })
+    .unwrap();
+    recv_until(&events, |e| matches!(e, UiEvent::Error(_)));
+
+    cmds.send(UiCommand::Send {
+        text: "仍在原房间".into(),
+    })
+    .unwrap();
+    let received = recv_until(
+        &events,
+        |e| matches!(e, UiEvent::Message { room: r, text, .. } if *r == room && text == "仍在原房间"),
+    );
+    assert!(matches!(received, UiEvent::Message { .. }));
 }
 
 /// 自己建了房间，又从房间列表点进自己的房间，再点「加入房间」，也必须能加入。
@@ -859,11 +1121,17 @@ fn joining_room_loads_recent_history() {
             name: "有历史的房间".into(),
         })
         .unwrap();
-    let addr = match recv_until(&events_a, |e| matches!(e, UiEvent::Hosting { .. })) {
-        UiEvent::Hosting { addrs, .. } => addrs
-            .into_iter()
-            .find(|addr| addr.starts_with("127.0.0.1"))
-            .expect("应提供回环地址"),
+    let (addr, fingerprint) = match recv_until(&events_a, |e| matches!(e, UiEvent::Hosting { .. }))
+    {
+        UiEvent::Hosting {
+            addrs, fingerprint, ..
+        } => (
+            addrs
+                .into_iter()
+                .find(|addr| addr.starts_with("127.0.0.1"))
+                .expect("应提供回环地址"),
+            fingerprint,
+        ),
         _ => unreachable!(),
     };
     recv_until(&events_a, |e| matches!(e, UiEvent::Lobby { .. }));
@@ -884,7 +1152,7 @@ fn joining_room_loads_recent_history() {
     cmds_b
         .send(UiCommand::Connect {
             addr,
-            fingerprint: None,
+            fingerprint: Some(fingerprint),
         })
         .unwrap();
     recv_until(&events_b, |e| matches!(e, UiEvent::Lobby { .. }));
@@ -914,11 +1182,17 @@ fn rejoining_catches_up_messages_missed_while_away() {
             name: "补消息的房间".into(),
         })
         .unwrap();
-    let addr = match recv_until(&events_a, |e| matches!(e, UiEvent::Hosting { .. })) {
-        UiEvent::Hosting { addrs, .. } => addrs
-            .into_iter()
-            .find(|addr| addr.starts_with("127.0.0.1"))
-            .expect("应提供回环地址"),
+    let (addr, fingerprint) = match recv_until(&events_a, |e| matches!(e, UiEvent::Hosting { .. }))
+    {
+        UiEvent::Hosting {
+            addrs, fingerprint, ..
+        } => (
+            addrs
+                .into_iter()
+                .find(|addr| addr.starts_with("127.0.0.1"))
+                .expect("应提供回环地址"),
+            fingerprint,
+        ),
         _ => unreachable!(),
     };
     recv_until(&events_a, |e| matches!(e, UiEvent::Lobby { .. }));
@@ -932,7 +1206,7 @@ fn rejoining_catches_up_messages_missed_while_away() {
     cmds_b
         .send(UiCommand::Connect {
             addr,
-            fingerprint: None,
+            fingerprint: Some(fingerprint),
         })
         .unwrap();
     recv_until(&events_b, |e| matches!(e, UiEvent::Lobby { .. }));
@@ -973,11 +1247,17 @@ fn loading_older_walks_back_through_history() {
             name: "很长的房间".into(),
         })
         .unwrap();
-    let addr = match recv_until(&events_a, |e| matches!(e, UiEvent::Hosting { .. })) {
-        UiEvent::Hosting { addrs, .. } => addrs
-            .into_iter()
-            .find(|addr| addr.starts_with("127.0.0.1"))
-            .expect("应提供回环地址"),
+    let (addr, fingerprint) = match recv_until(&events_a, |e| matches!(e, UiEvent::Hosting { .. }))
+    {
+        UiEvent::Hosting {
+            addrs, fingerprint, ..
+        } => (
+            addrs
+                .into_iter()
+                .find(|addr| addr.starts_with("127.0.0.1"))
+                .expect("应提供回环地址"),
+            fingerprint,
+        ),
         _ => unreachable!(),
     };
     recv_until(&events_a, |e| matches!(e, UiEvent::Lobby { .. }));
@@ -996,14 +1276,15 @@ fn loading_older_walks_back_through_history() {
             })
             .unwrap();
     }
-    recv_until(&events_a, |e| {
-        matches!(e, UiEvent::Message { text, .. } if text.as_str() == "第 60 句")
-    });
+    recv_until(
+        &events_a,
+        |e| matches!(e, UiEvent::Message { text, .. } if text.as_str() == "第 60 句"),
+    );
 
     cmds_b
         .send(UiCommand::Connect {
             addr,
-            fingerprint: None,
+            fingerprint: Some(fingerprint),
         })
         .unwrap();
     recv_until(&events_b, |e| matches!(e, UiEvent::Lobby { .. }));
@@ -1061,13 +1342,19 @@ fn switching_rooms_does_not_leak_old_presence() {
             name: "房间B".into(),
         })
         .unwrap();
-    let addr_b = match recv_until(&events_b, |e| matches!(e, UiEvent::Hosting { .. })) {
-        UiEvent::Hosting { addrs, .. } => addrs
-            .into_iter()
-            .find(|addr| addr.starts_with("127.0.0.1"))
-            .expect("应提供回环地址"),
-        _ => unreachable!(),
-    };
+    let (addr_b, fingerprint_b) =
+        match recv_until(&events_b, |e| matches!(e, UiEvent::Hosting { .. })) {
+            UiEvent::Hosting {
+                addrs, fingerprint, ..
+            } => (
+                addrs
+                    .into_iter()
+                    .find(|addr| addr.starts_with("127.0.0.1"))
+                    .expect("应提供回环地址"),
+                fingerprint,
+            ),
+            _ => unreachable!(),
+        };
     let room_b = match recv_until(&events_b, |e| matches!(e, UiEvent::Lobby { .. })) {
         UiEvent::Lobby { room, .. } => room,
         _ => unreachable!(),
@@ -1078,7 +1365,7 @@ fn switching_rooms_does_not_leak_old_presence() {
     cmds_a
         .send(UiCommand::Connect {
             addr: addr_b,
-            fingerprint: None,
+            fingerprint: Some(fingerprint_b),
         })
         .unwrap();
     match recv_until(&events_a, |e| matches!(e, UiEvent::Lobby { .. })) {

@@ -4,7 +4,6 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
-chat-proto.workspace = true
 chat-core.workspace = true
 
 async-trait.workspace = true
@@ -15,7 +14,7 @@ quinn = { version = "0.11.12", default-features = false, features = ["runtime-to
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "logging"] }
 rcgen = "0.14.10"
 sha2 = "0.10"
+uuid.workspace = true
 
 [dev-dependencies]
 chat-server.workspace = true
-chat-client.workspace = true

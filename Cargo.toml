@@ -7,13 +7,10 @@ edition = "2021"
 version = "0.1.0"
 
 [workspace.dependencies]
-chat-proto = { path = "crates/chat-proto" }
 chat-core = { path = "crates/chat-core" }
 chat-server = { path = "crates/chat-server" }
-chat-client = { path = "crates/chat-client" }
 chat-discovery = { path = "crates/chat-discovery" }
 chat-transport-quic = { path = "crates/chat-transport-quic" }
-store-sqlite = { path = "crates/store-sqlite" }
 
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }

@@ -24,7 +24,9 @@ impl ChatApp {
             .collect();
 
         div()
+            .id("sidebar")
             .w(px(240.))
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .py_3()
@@ -48,15 +50,49 @@ impl ChatApp {
                 this.child(section_label("本机房间"))
                     .child(local_room_row(local.unwrap_or(0), cx))
             })
+            .when_some(self.hosted.clone(), |this, hosted| {
+                this.child(section_label("我的房间身份"))
+                    .child(hint(&hosted))
+            })
             .child(div().flex_1())
             .child(section_label("直接连接"))
             .child(padded(self.addr_input.clone()))
+            .child(padded(self.fingerprint_input.clone()))
             .child(padded(button(
                 "连接",
                 false,
                 true,
                 cx.listener(Self::on_connect_click),
             )))
+            .when_some(
+                self.pending_trust.clone(),
+                |this, (room, addr, fingerprint)| {
+                    this.child(section_label("首次信任：向房主核对"))
+                        .child(hint(&format!("房间: {room}")))
+                        .child(hint(&format!("地址: {addr}")))
+                        .child(hint(&format!(
+                            "SHA-256:\n{}",
+                            fingerprint
+                                .as_bytes()
+                                .chunks(16)
+                                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        )))
+                        .child(padded(button(
+                            "已核对并信任",
+                            false,
+                            true,
+                            cx.listener(Self::on_confirm_trust),
+                        )))
+                        .child(padded(button(
+                            "取消",
+                            false,
+                            true,
+                            cx.listener(Self::on_cancel_trust),
+                        )))
+                },
+            )
             .child(section_label("昵称"))
             .child(padded(self.nickname.clone()))
             .child(padded(button(

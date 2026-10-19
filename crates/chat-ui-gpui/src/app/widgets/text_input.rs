@@ -64,6 +64,17 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
     index
 }
 
+fn utf16_to_utf8(text: &str, offset: usize) -> usize {
+    let mut count = 0;
+    for (index, ch) in text.char_indices() {
+        if count + ch.len_utf16() > offset {
+            return index;
+        }
+        count += ch.len_utf16();
+    }
+    text.len()
+}
+
 /// 把区间夹到字符串范围内，并让两端都落在字符边界上。
 fn clamp_range(text: &str, range: Range<usize>) -> Range<usize> {
     let (low, high) = if range.start <= range.end {
@@ -274,18 +285,7 @@ impl TextInput {
     }
 
     fn offset_from_utf16(&self, offset: usize) -> usize {
-        let mut utf8_offset = 0;
-        let mut utf16_count = 0;
-
-        for ch in self.content.chars() {
-            if utf16_count >= offset {
-                break;
-            }
-            utf16_count += ch.len_utf16();
-            utf8_offset += ch.len_utf8();
-        }
-
-        utf8_offset
+        utf16_to_utf8(&self.content, offset)
     }
 
     fn offset_to_utf16(&self, offset: usize) -> usize {
@@ -405,8 +405,8 @@ impl EntityInputHandler for TextInput {
         // 选中范围是相对 new_text 的，要先在新文本内换算，再叠加本次替换的起点
         self.selected_range = match new_selected_range_utf16 {
             Some(selected) => {
-                let start = floor_char_boundary(new_text, selected.start);
-                let end = floor_char_boundary(new_text, selected.end);
+                let start = utf16_to_utf8(new_text, selected.start);
+                let end = utf16_to_utf8(new_text, selected.end);
                 let (start, end) = if start <= end {
                     (start, end)
                 } else {
@@ -774,5 +774,15 @@ mod tests {
         assert_eq!(clamp_range("ni", Range { start: 3, end: 1 }), 1..2); // 反向区间也要归一
         assert_eq!(clamp_range("", 0..7), 0..0);
         assert_eq!(clamp_range("你好", 1..3), 0..3); // 落在多字节字符中间
+    }
+
+    #[test]
+    fn converts_ime_utf16_offsets_for_chinese_and_emoji() {
+        assert_eq!(utf16_to_utf8("你a", 1), 3);
+        assert_eq!(utf16_to_utf8("😀a", 0), 0);
+        assert_eq!(utf16_to_utf8("😀a", 1), 0);
+        assert_eq!(utf16_to_utf8("😀a", 2), 4);
+        assert_eq!(utf16_to_utf8("😀a", 3), 5);
+        assert_eq!(utf16_to_utf8("😀a", 99), 5);
     }
 }

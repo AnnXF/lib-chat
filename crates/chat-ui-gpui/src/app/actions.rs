@@ -1,11 +1,6 @@
-//! 用户操作 → 服务指令。
-//!
-//! 这里只发指令、不动界面数据：真正的状态变化由服务的 [`UiEvent`] 回来驱动，
-//! 保证「界面看到的状态」只有 [`super::update`] 一个写入方。
-//!
-//! [`UiEvent`]: crate::service::UiEvent
+//! 用户操作：提交服务指令，必要的即时视图变化交给 `update`。
 
-use chat_proto::RoomId;
+use chat_core::RoomId;
 use gpui::{Context, MouseUpEvent, Window};
 
 use crate::service::UiCommand;
@@ -14,9 +9,14 @@ use super::ChatApp;
 
 impl ChatApp {
     /// 发一条指令并刷新界面。
-    fn tell(&self, cmd: UiCommand, cx: &mut Context<Self>) {
-        let _ = self.cmd_tx.send(cmd);
+    fn tell(&mut self, cmd: UiCommand, cx: &mut Context<Self>) -> bool {
+        let accepted = self.cmd_tx.try_send(cmd).is_ok();
+        if !accepted {
+            self.status = "后端繁忙或已关闭，请稍后重试".into();
+            self.loading_older = false;
+        }
         cx.notify();
+        accepted
     }
 
     /// 昵称输入框的内容；为空时用兜底名。
@@ -30,10 +30,10 @@ impl ChatApp {
     }
 
     pub(crate) fn submit_message(&mut self, cx: &mut Context<Self>) {
-        let text = self.message.update(cx, |input, cx| input.take(cx));
-        let text = text.trim().to_string();
-        if !text.is_empty() {
-            self.tell(UiCommand::Send { text }, cx);
+        let text = self.message.read(cx).content().trim().to_string();
+        if !text.is_empty() && self.tell(UiCommand::Send { text }, cx) {
+            self.message
+                .update(cx, |input, cx| input.set_content("", cx));
         }
     }
 
@@ -41,17 +41,16 @@ impl ChatApp {
     ///
     /// 这里只喊一声：能不能翻、还有没有更早的，交给会话层判断。
     pub(crate) fn load_older(&mut self, cx: &mut Context<Self>) {
-        if !self.has_older || self.loading_older {
-            return;
+        if self.begin_loading_older() {
+            self.tell(UiCommand::LoadOlder, cx);
         }
-        self.loading_older = true;
-        self.tell(UiCommand::LoadOlder, cx);
     }
 
     pub(crate) fn connect_from_input(&mut self, cx: &mut Context<Self>) {
         let addr = self.addr_input.read(cx).content().trim().to_string();
         if !addr.is_empty() {
-            self.connect(addr, None, cx);
+            let fingerprint = self.fingerprint_input.read(cx).content().trim().to_string();
+            self.connect(addr, (!fingerprint.is_empty()).then_some(fingerprint), cx);
         }
     }
 
@@ -61,12 +60,7 @@ impl ChatApp {
         fingerprint: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        // 换房间是一次明确的离开，旧房间的视图与记录先清干净
-        self.room = None;
-        self.clear_lines();
-        self.has_older = true;
-        self.loading_older = false;
-        self.status = format!("正在连接 {addr} …");
+        self.begin_connect(&addr);
         self.tell(UiCommand::Connect { addr, fingerprint }, cx);
     }
 
@@ -79,8 +73,44 @@ impl ChatApp {
     ) {
         // 已经是当前房间，重复点击不该触发一次「退出再重连」，那只会白白抖动人数
         if self.showing(room).is_none() {
-            self.connect(addr, Some(fingerprint), cx);
+            self.begin_connect(&addr);
+            self.tell(
+                UiCommand::ConnectDiscovered {
+                    room,
+                    addr,
+                    fingerprint,
+                },
+                cx,
+            );
         }
+    }
+
+    pub(crate) fn on_confirm_trust(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((room, addr, fingerprint)) = self.pending_trust.take() {
+            self.tell(
+                UiCommand::ConfirmTrust {
+                    room,
+                    addr,
+                    fingerprint,
+                },
+                cx,
+            );
+        }
+    }
+
+    pub(crate) fn on_cancel_trust(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_trust = None;
+        cx.notify();
     }
 
     pub(crate) fn on_host(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -89,12 +119,7 @@ impl ChatApp {
     }
 
     /// 清空本机房间的历史，从空白重新开一个。
-    pub(crate) fn on_new_room(
-        &mut self,
-        _: &MouseUpEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn on_new_room(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         let name = self.nickname_or("局域网聊天室", cx);
         self.tell(UiCommand::NewRoom { name }, cx);
     }

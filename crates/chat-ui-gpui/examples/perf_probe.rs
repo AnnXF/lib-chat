@@ -3,11 +3,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chat_client::Client;
+use chat_core::Client;
 use chat_core::{ConnectionAcceptor, MessageStore, NewMessage};
-use chat_proto::{DeviceId, MessageKind, RoomId, UserId};
+use chat_core::{DeviceId, MessageKind, RoomId, UserId};
 use chat_server::{Acceptor, InMemoryStore, Server};
-use chat_transport_quic::QuicServer;
+use chat_transport_quic::{Liveness, QuicServer};
 use chat_ui_gpui::service::{UiCommand, UiEvent};
 
 #[tokio::main]
@@ -59,12 +59,15 @@ async fn handshake_cost() {
     let server = Server::new("取证房间");
     let quic = Arc::new(QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap());
     let addr = quic.local_addr();
+    let fingerprint = quic.fingerprint().to_string();
     let acceptor: Arc<dyn ConnectionAcceptor> = Arc::new(Acceptor(Arc::clone(&server)));
     tokio::spawn(Arc::clone(&quic).serve(acceptor));
 
     // 先预热一次，排除首次建 socket / 证书校验的固定开销
     {
-        let conn = chat_transport_quic::connect(addr, None).await.unwrap();
+        let conn = chat_transport_quic::connect(addr, &fingerprint)
+            .await
+            .unwrap();
         let client = Client::new(Arc::new(conn));
         client.lobby(server.room()).await.unwrap();
         let _ = client.close().await;
@@ -73,7 +76,9 @@ async fn handshake_cost() {
     let rounds = 30;
     let started = Instant::now();
     for _ in 0..rounds {
-        let conn = chat_transport_quic::connect(addr, None).await.unwrap();
+        let conn = chat_transport_quic::connect(addr, &fingerprint)
+            .await
+            .unwrap();
         let client = Client::new(Arc::new(conn));
         client.lobby(server.room()).await.unwrap();
         let _ = client.close().await;
@@ -86,8 +91,7 @@ async fn handshake_cost() {
     quic.close();
 }
 
-/// 底层 `connect` 本身没有超时（探测路径由 `probe_room` 负责加超时）。
-/// 这里量出「不设超时会等多久」，用来解释为什么探测必须自带超时。
+/// 记录底层建连超时所需的时间。
 async fn unreachable_cost() {
     println!("── ④ 底层 connect 的失败耗时（探测路径已由 probe_room 加超时，见回归测试）──");
     // 192.0.2.0/24 是 TEST-NET-1，保证不会有主机应答
@@ -95,20 +99,21 @@ async fn unreachable_cost() {
     let started = Instant::now();
     let outcome = tokio::time::timeout(
         Duration::from_secs(25),
-        chat_transport_quic::connect(dead, None),
+        chat_transport_quic::connect(dead, &"0".repeat(64)),
     )
     .await;
     match outcome {
         Ok(Err(e)) => println!("  {:.2?} 后失败: {e}", started.elapsed()),
         Ok(Ok(_)) => println!("  意外连上了"),
-        Err(_) => println!("  10 秒仍未失败（要等到 QUIC 空闲超时）—— 所以探测必须自带超时"),
+        Err(_) => println!("  25 秒仍未失败，建连超时保护可能失效"),
     }
 }
 
 /// 量出界面实际发出的探测频率（每次成功探测 = 一次完整握手）。
 async fn probe_rate() {
     println!("── ③ 界面实际的探测频率（10 秒实测）──");
-    let (cmds, events) = chat_ui_gpui::service::spawn_on(53_300);
+    let dir = std::env::temp_dir().join(format!("libchat-perf-{}", uuid::Uuid::new_v4()));
+    let (cmds, events) = chat_ui_gpui::service::spawn_with_data(53_300, Liveness::default(), dir);
     cmds.send(UiCommand::Host {
         name: "频率取证".into(),
     })

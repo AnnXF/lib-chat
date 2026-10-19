@@ -150,6 +150,7 @@ mod perf {
         for count in [1_000usize, 10_000, 50_000] {
             let lines: Vec<ChatLine> = (0..count)
                 .map(|i| ChatLine {
+                    seq: Some(i as i64 + 1),
                     sender: "某人".into(),
                     text: format!("这是第 {i} 条消息，长度大约二十来个字"),
                     mine: i % 2 == 0,

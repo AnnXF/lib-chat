@@ -890,10 +890,8 @@ dependencies = [
 name = "chat-cli"
 version = "0.1.0"
 dependencies = [
- "chat-client",
  "chat-core",
  "chat-discovery",
- "chat-proto",
  "chat-server",
  "chat-transport-quic",
  "if-addrs",
@@ -901,21 +899,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "chat-client"
-version = "0.1.0"
-dependencies = [
- "chat-core",
- "chat-proto",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "chat-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "chat-proto",
+ "serde",
  "thiserror 2.0.21",
  "tokio",
  "uuid",
@@ -926,7 +914,6 @@ name = "chat-discovery"
 version = "0.1.0"
 dependencies = [
  "chat-core",
- "chat-proto",
  "if-addrs",
  "mdns-sd",
  "serde",
@@ -936,22 +923,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "chat-proto"
-version = "0.1.0"
-dependencies = [
- "serde",
- "uuid",
-]
-
-[[package]]
 name = "chat-server"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "chat-client",
  "chat-core",
- "chat-proto",
+ "sea-query",
+ "sqlx",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -959,9 +939,7 @@ name = "chat-transport-quic"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "chat-client",
  "chat-core",
- "chat-proto",
  "chat-server",
  "quinn",
  "rcgen",
@@ -970,24 +948,24 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
 name = "chat-ui-gpui"
 version = "0.1.0"
 dependencies = [
- "chat-client",
+ "async-trait",
  "chat-core",
  "chat-discovery",
- "chat-proto",
  "chat-server",
  "chat-transport-quic",
  "flume 0.12.0",
  "gpui",
  "if-addrs",
- "store-sqlite",
  "tokio",
  "unicode-segmentation",
+ "uuid",
 ]
 
 [[package]]
@@ -5565,19 +5543,6 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
-
-[[package]]
-name = "store-sqlite"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chat-core",
- "chat-proto",
- "sea-query",
- "sqlx",
- "tokio",
- "uuid",
-]
 
 [[package]]
 name = "strict-num"

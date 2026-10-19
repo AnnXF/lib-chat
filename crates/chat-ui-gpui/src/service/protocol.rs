@@ -25,6 +25,7 @@ pub(super) fn map_event(event: ServerEvent) -> UiEvent {
         ServerEvent::Left { room } => UiEvent::Left { room },
         ServerEvent::Message { message } => UiEvent::Message {
             room: message.room,
+            seq: message.seq,
             sender_id: message.sender,
             sender: message.sender_name,
             text: message.text,
@@ -52,6 +53,7 @@ pub(super) fn map_event(event: ServerEvent) -> UiEvent {
 
 fn to_history_message(message: Message) -> HistoryMessage {
     HistoryMessage {
+        seq: message.seq,
         sender_id: message.sender,
         sender: message.sender_name,
         text: message.text,

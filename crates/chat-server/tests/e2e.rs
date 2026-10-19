@@ -4,9 +4,13 @@
 
 use std::time::Duration;
 
-use chat_client::Client;
-use chat_proto::{DeviceId, ErrorCode, ServerEvent};
+use chat_core::Client;
+use chat_core::{
+    ChatError, ClientRequest, Connection, DeviceId, ErrorCode, Message, MessageStore, NewMessage,
+    RoomId, Seq, ServerEvent, EVENT_QUEUE_CAPACITY,
+};
 use chat_server::Server;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 async fn wait_for<F>(client: &Client, pred: F) -> ServerEvent
 where
@@ -204,9 +208,10 @@ async fn lobby_watcher_sees_count_changes() {
     let joiner = Client::new(server.connect(DeviceId::new()).await);
     joiner.join(room, "Alice").await.unwrap();
 
-    match wait_for(&watcher, |e| {
-        matches!(e, ServerEvent::Lobby { info } if info.online_count == 1)
-    })
+    match wait_for(
+        &watcher,
+        |e| matches!(e, ServerEvent::Lobby { info } if info.online_count == 1),
+    )
     .await
     {
         ServerEvent::Lobby { info } => assert_eq!(info.online_count, 1),
@@ -231,9 +236,10 @@ async fn leaver_sees_updated_counts() {
     wait_for(&bob, |e| matches!(e, ServerEvent::Left { .. })).await;
 
     // 退出后不应卡在 2，要立刻拿到 1
-    match wait_for(&bob, |e| {
-        matches!(e, ServerEvent::Lobby { info } if info.online_count == 1)
-    })
+    match wait_for(
+        &bob,
+        |e| matches!(e, ServerEvent::Lobby { info } if info.online_count == 1),
+    )
     .await
     {
         ServerEvent::Lobby { info } => assert_eq!(info.online_count, 1),
@@ -266,6 +272,17 @@ async fn history_returns_recent_messages() {
             assert_eq!(messages[0].text, "m3");
             assert_eq!(messages[2].text, "m5");
             assert!(has_more);
+        }
+        _ => unreachable!(),
+    }
+    a.history(room, Some(3), 2).await.unwrap();
+    match wait_for(&a, |e| matches!(e, ServerEvent::History { .. })).await {
+        ServerEvent::History {
+            messages, has_more, ..
+        } => {
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0].text, "m1");
+            assert!(!has_more, "恰好一页时已经没有更早历史");
         }
         _ => unreachable!(),
     }
@@ -313,4 +330,191 @@ async fn sync_returns_messages_after_cursor() {
         }
         _ => unreachable!(),
     }
+
+    a.sync(room, 3, 2).await.unwrap();
+    match wait_for(&a, |e| matches!(e, ServerEvent::Sync { .. })).await {
+        ServerEvent::Sync {
+            messages, has_more, ..
+        } => {
+            assert_eq!(messages.len(), 2);
+            assert!(!has_more, "恰好一页时已追到末尾");
+        }
+        _ => unreachable!(),
+    }
+}
+
+struct FailingStore {
+    fail_latest: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl MessageStore for FailingStore {
+    async fn append(&self, _: RoomId, _: NewMessage) -> chat_core::Result<chat_core::AppendResult> {
+        Err(ChatError::Storage("写入失败".into()))
+    }
+
+    async fn history(
+        &self,
+        _: RoomId,
+        _: Option<Seq>,
+        _: usize,
+    ) -> chat_core::Result<Vec<Message>> {
+        Ok(Vec::new())
+    }
+
+    async fn since(&self, _: RoomId, _: Seq, _: usize) -> chat_core::Result<Vec<Message>> {
+        Ok(Vec::new())
+    }
+
+    async fn latest_seq(&self, _: RoomId) -> chat_core::Result<Seq> {
+        if self.fail_latest.swap(false, Ordering::SeqCst) {
+            Err(ChatError::Storage("查询失败".into()))
+        } else {
+            Ok(0)
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_join_does_not_leave_a_hidden_member() {
+    let server = Server::with_store(
+        "room",
+        std::sync::Arc::new(FailingStore {
+            fail_latest: AtomicBool::new(true),
+        }),
+    );
+    let room = server.room();
+    let a = Client::new(server.connect(DeviceId::new()).await);
+
+    a.join(room, "Alice").await.unwrap();
+    match wait_for(&a, |e| matches!(e, ServerEvent::Error { .. })).await {
+        ServerEvent::Error { code, .. } => assert_eq!(code, ErrorCode::Internal),
+        _ => unreachable!(),
+    }
+    assert_eq!(server.online_count().await, 0);
+
+    a.join(room, "Alice").await.unwrap();
+    wait_for(&a, |e| matches!(e, ServerEvent::Joined { .. })).await;
+    assert_eq!(server.online_count().await, 1);
+
+    a.send_text(room, "消息").await.unwrap();
+    match wait_for(&a, |e| matches!(e, ServerEvent::Error { .. })).await {
+        ServerEvent::Error { code, message } => {
+            assert_eq!(code, ErrorCode::Internal);
+            assert!(message.contains("保存失败"));
+        }
+        _ => unreachable!(),
+    }
+    assert_eq!(server.online_count().await, 1);
+}
+
+#[tokio::test]
+async fn oversized_text_is_rejected_without_dropping_the_connection() {
+    let server = Server::new("room");
+    let room = server.room();
+    let a = Client::new(server.connect(DeviceId::new()).await);
+    a.join(room, "Alice").await.unwrap();
+    wait_for(&a, |e| matches!(e, ServerEvent::Joined { .. })).await;
+    a.send_text(room, "中".repeat(3000)).await.unwrap();
+    match wait_for(&a, |e| matches!(e, ServerEvent::Error { .. })).await {
+        ServerEvent::Error { code, .. } => assert_eq!(code, ErrorCode::InvalidRequest),
+        _ => unreachable!(),
+    }
+    a.send_text(room, "小消息").await.unwrap();
+    wait_for(
+        &a,
+        |e| matches!(e, ServerEvent::Message { message } if message.text == "小消息"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn duplicate_message_replies_to_sender_without_broadcast_or_new_seq() {
+    let server = Server::new("room");
+    let room = server.room();
+    let sender = server.connect(DeviceId::new()).await;
+    let sender_client = Client::new(sender.clone());
+    let observer = Client::new(server.connect(DeviceId::new()).await);
+    sender_client.join(room, "Alice").await.unwrap();
+    wait_for(&sender_client, |e| matches!(e, ServerEvent::Joined { .. })).await;
+    observer.join(room, "Bob").await.unwrap();
+    wait_for(&observer, |e| matches!(e, ServerEvent::Joined { .. })).await;
+
+    let id = uuid::Uuid::new_v4();
+    sender_client
+        .send_text_with_id(room, id, "一次")
+        .await
+        .unwrap();
+    wait_for(&sender_client, |e| matches!(e, ServerEvent::Message { .. })).await;
+    wait_for(&observer, |e| matches!(e, ServerEvent::Message { .. })).await;
+    sender_client
+        .send_text_with_id(room, id, "一次")
+        .await
+        .unwrap();
+    match wait_for(&sender_client, |e| matches!(e, ServerEvent::Message { .. })).await {
+        ServerEvent::Message { message } => assert_eq!(message.seq, 1),
+        _ => unreachable!(),
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), observer.next_event())
+            .await
+            .is_err()
+    );
+    sender
+        .request(ClientRequest::Send {
+            room,
+            client_msg_id: id,
+            text: "篡改".into(),
+        })
+        .await
+        .unwrap();
+    match wait_for(&sender_client, |e| matches!(e, ServerEvent::Error { .. })).await {
+        ServerEvent::Error { code, .. } => assert_eq!(code, ErrorCode::InvalidRequest),
+        _ => unreachable!(),
+    }
+    sender_client.history(room, None, 10).await.unwrap();
+    match wait_for(&sender_client, |e| matches!(e, ServerEvent::History { .. })).await {
+        ServerEvent::History { messages, .. } => assert_eq!(messages.len(), 1),
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn slow_member_is_disconnected_without_blocking_other_members() {
+    use chat_core::RequestSink;
+    let server = Server::new("room");
+    let room = server.room();
+    let (slow, mut events) = server.attach(DeviceId::new()).await;
+    slow.dispatch(ClientRequest::Join {
+        room,
+        profile: chat_core::Profile {
+            name: "slow".into(),
+        },
+    })
+    .await
+    .unwrap();
+    let fast = Client::new(server.connect(DeviceId::new()).await);
+    fast.join(room, "fast").await.unwrap();
+    wait_for(&fast, |e| matches!(e, ServerEvent::Joined { .. })).await;
+    for i in 0..EVENT_QUEUE_CAPACITY {
+        fast.send_text(room, format!("m{i}")).await.unwrap();
+        wait_for(&fast, |e| matches!(e, ServerEvent::Message { .. })).await;
+    }
+    assert_eq!(server.online_count().await, 1);
+    assert!(matches!(
+        slow.dispatch(ClientRequest::Lobby { room }).await,
+        Err(ChatError::Closed)
+    ));
+    for _ in 0..EVENT_QUEUE_CAPACITY + 2 {
+        if events.recv().await.is_none() {
+            break;
+        }
+    }
+    assert!(events.recv().await.is_none());
+    fast.send_text(room, "still online").await.unwrap();
+    wait_for(
+        &fast,
+        |e| matches!(e, ServerEvent::Message { message } if message.text == "still online"),
+    )
+    .await;
 }

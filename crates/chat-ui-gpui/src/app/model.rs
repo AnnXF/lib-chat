@@ -2,7 +2,7 @@
 //!
 //! 与协议 DTO 分开：这里只描述「界面要用到的形状」，不掺网络语义。
 
-use chat_proto::RoomId;
+use chat_core::{RoomId, Seq};
 #[derive(Clone)]
 pub struct DiscoveredRoom {
     pub(crate) id: RoomId,
@@ -21,6 +21,7 @@ pub struct RoomView {
 }
 
 pub struct ChatLine {
+    pub(crate) seq: Option<Seq>,
     pub(crate) sender: String,
     pub(crate) text: String,
     /// 是否由自己发出，决定气泡靠哪一边。

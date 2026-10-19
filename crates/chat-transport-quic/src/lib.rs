@@ -1,14 +1,15 @@
 //! QUIC 传输适配器：把服务端逻辑暴露到局域网，并给客户端提供远程连接。
 //!
-//! 自签证书 + TOFU 指纹校验，省去局域网内的 CA 依赖。
+//! 自签证书与可选指纹校验；持久信任由调用方维护。
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use chat_core::{ChatError, Connection, ConnectionAcceptor, EventStream, Result};
-use chat_proto::{ClientRequest, DeviceId, RoomInfo, ServerEvent};
+use chat_core::{ClientRequest, DeviceId, RoomInfo, ServerEvent};
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig};
 use sha2::{Digest, Sha256};
@@ -20,8 +21,12 @@ pub const ALPN: &[u8] = b"libchat/1";
 /// 协议版本，握手时校验。
 pub const PROTOCOL_VERSION: u32 = 1;
 
+mod trust;
+pub use trust::{validate_fingerprint, TrustStore};
+
 /// 单帧上限，防止畸形长度导致巨额分配。
 const MAX_FRAME: usize = 4 * 1024 * 1024;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn transport_err(e: impl std::fmt::Display) -> ChatError {
     ChatError::Transport(e.to_string())
@@ -113,7 +118,13 @@ async fn read_frame<T: serde::de::DeserializeOwned>(recv: &mut quinn::RecvStream
 
 // ---------------------------------------------------------------- 证书
 
-/// 运行时生成的自签证书。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedIdentity {
+    certificate: Vec<u8>,
+    private_key: Vec<u8>,
+}
+
+/// 房间使用的自签证书。
 pub struct SelfSignedCert {
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
@@ -125,9 +136,8 @@ impl SelfSignedCert {
         let issued = rcgen::generate_simple_self_signed(vec!["libchat.local".to_string()])
             .map_err(|e| ChatError::Transport(format!("生成证书失败: {e}")))?;
         let cert = issued.cert.der().clone();
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            issued.signing_key.serialize_der(),
-        ));
+        let key =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(issued.signing_key.serialize_der()));
         let fingerprint = fingerprint_of(&cert);
         Ok(Self {
             cert,
@@ -139,18 +149,57 @@ impl SelfSignedCert {
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
+
+    pub fn load_or_create(path: &Path, allow_new: bool) -> Result<Self> {
+        if path.exists() {
+            let data = std::fs::read(path).map_err(transport_err)?;
+            let identity: PersistedIdentity =
+                serde_json::from_slice(&data).map_err(transport_err)?;
+            let cert = CertificateDer::from(identity.certificate);
+            let fingerprint = fingerprint_of(&cert);
+            let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.private_key));
+            return Ok(Self {
+                cert,
+                key,
+                fingerprint,
+            });
+        }
+        if !allow_new {
+            return Err(ChatError::Transport(
+                "现有房间的证书身份丢失，不能沿用原房间标识重新生成".into(),
+            ));
+        }
+        let identity = Self::generate()?;
+        let data = serde_json::to_vec(&PersistedIdentity {
+            certificate: identity.cert.as_ref().to_vec(),
+            private_key: identity.key.secret_der().to_vec(),
+        })
+        .map_err(transport_err)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        use std::io::Write;
+        let mut file = options.open(path).map_err(transport_err)?;
+        file.write_all(&data).map_err(transport_err)?;
+        file.sync_all().map_err(transport_err)?;
+        Ok(identity)
+    }
 }
 
 // ---------------------------------------------------------------- 客户端校验
 
-/// 首次信任：只校验指纹（若已知），不做 CA 链校验。
+/// 对比完整证书指纹，不做 CA 链校验。
 #[derive(Debug)]
-struct TofuVerifier {
-    expected: Option<String>,
+struct FingerprintVerifier {
+    expected: String,
     provider: Arc<quinn::rustls::crypto::CryptoProvider>,
 }
 
-impl quinn::rustls::client::danger::ServerCertVerifier for TofuVerifier {
+impl quinn::rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -161,12 +210,12 @@ impl quinn::rustls::client::danger::ServerCertVerifier for TofuVerifier {
     ) -> std::result::Result<quinn::rustls::client::danger::ServerCertVerified, quinn::rustls::Error>
     {
         let actual = fingerprint_of(end_entity);
-        match &self.expected {
-            Some(expected) if expected != &actual => Err(quinn::rustls::Error::General(format!(
-                "证书指纹不匹配: 期望 {expected}, 实际 {actual}"
-            ))),
-            _ => Ok(quinn::rustls::client::danger::ServerCertVerified::assertion()),
+        if self.expected != actual {
+            return Err(quinn::rustls::Error::General(format!(
+                "证书指纹不匹配: 期望 {}, 实际 {actual}", self.expected
+            )));
         }
+        Ok(quinn::rustls::client::danger::ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -174,8 +223,10 @@ impl quinn::rustls::client::danger::ServerCertVerifier for TofuVerifier {
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &quinn::rustls::DigitallySignedStruct,
-    ) -> std::result::Result<quinn::rustls::client::danger::HandshakeSignatureValid, quinn::rustls::Error>
-    {
+    ) -> std::result::Result<
+        quinn::rustls::client::danger::HandshakeSignatureValid,
+        quinn::rustls::Error,
+    > {
         quinn::rustls::crypto::verify_tls12_signature(
             message,
             cert,
@@ -189,8 +240,10 @@ impl quinn::rustls::client::danger::ServerCertVerifier for TofuVerifier {
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &quinn::rustls::DigitallySignedStruct,
-    ) -> std::result::Result<quinn::rustls::client::danger::HandshakeSignatureValid, quinn::rustls::Error>
-    {
+    ) -> std::result::Result<
+        quinn::rustls::client::danger::HandshakeSignatureValid,
+        quinn::rustls::Error,
+    > {
         quinn::rustls::crypto::verify_tls13_signature(
             message,
             cert,
@@ -226,8 +279,14 @@ impl QuicServer {
 
     /// 指定活性参数绑定。测试用短超时验证保活行为时会用到。
     pub fn bind_with(addr: SocketAddr, liveness: Liveness) -> Result<Self> {
-        let cert = SelfSignedCert::generate()?;
+        Self::bind_with_cert(addr, liveness, SelfSignedCert::generate()?)
+    }
 
+    pub fn bind_with_cert(
+        addr: SocketAddr,
+        liveness: Liveness,
+        cert: SelfSignedCert,
+    ) -> Result<Self> {
         let mut tls = quinn::rustls::ServerConfig::builder_with_provider(crypto_provider())
             .with_protocol_versions(&[&quinn::rustls::version::TLS13])
             .map_err(transport_err)?
@@ -236,7 +295,8 @@ impl QuicServer {
             .map_err(transport_err)?;
         tls.alpn_protocols = vec![ALPN.to_vec()];
 
-        let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(transport_err)?;
+        let crypto =
+            quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(transport_err)?;
         let mut config = ServerConfig::with_crypto(Arc::new(crypto));
         config.transport_config(liveness.transport());
         let endpoint = Endpoint::server(config, addr).map_err(transport_err)?;
@@ -273,17 +333,29 @@ impl QuicServer {
     pub fn close(&self) {
         self.endpoint.close(0u32.into(), b"bye");
     }
+
+    pub async fn wait_idle(&self) {
+        self.endpoint.wait_idle().await;
+    }
 }
 
 async fn handle_connection(
     incoming: quinn::Incoming,
     acceptor: Arc<dyn ConnectionAcceptor>,
 ) -> Result<()> {
-    let conn = incoming.await.map_err(transport_err)?;
-    let (mut send, mut recv) = conn.accept_bi().await.map_err(transport_err)?;
+    let conn = tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming)
+        .await
+        .map_err(|_| ChatError::Protocol("连接握手超时".into()))?
+        .map_err(transport_err)?;
+    let (mut send, mut recv) = tokio::time::timeout(HANDSHAKE_TIMEOUT, conn.accept_bi())
+        .await
+        .map_err(|_| ChatError::Protocol("打开请求流超时".into()))?
+        .map_err(transport_err)?;
 
-    // 首帧必须是 hello，据此确定设备身份
-    let device = match read_frame::<ClientFrame>(&mut recv).await? {
+    let device = match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame::<ClientFrame>(&mut recv))
+        .await
+        .map_err(|_| ChatError::Protocol("等待 hello 超时".into()))??
+    {
         ClientFrame::Hello { device, version } if version == PROTOCOL_VERSION => device,
         ClientFrame::Hello { version, .. } => {
             return Err(ChatError::Protocol(format!("协议版本不兼容: {version}")));
@@ -295,38 +367,51 @@ async fn handle_connection(
 
     let room = acceptor.room_info();
     let (sink, mut events) = acceptor.accept(device).await;
-    write_frame(
+    if let Err(error) = write_frame(
         &mut send,
         &ServerFrame::Welcome {
             version: PROTOCOL_VERSION,
             room,
         },
     )
-    .await?;
+    .await
+    {
+        sink.detach().await;
+        return Err(error);
+    }
 
-    // 事件出口 → 连接
     let writer = tokio::spawn(async move {
         while let Some(ev) = events.recv().await {
-            if write_frame(&mut send, &ServerFrame::Event(ev)).await.is_err() {
+            if !matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    write_frame(&mut send, &ServerFrame::Event(ev))
+                )
+                .await,
+                Ok(Ok(()))
+            ) {
                 break;
             }
         }
         let _ = send.finish();
     });
-
-    // 连接 → 请求入口
+    tokio::pin!(writer);
     loop {
-        match read_frame::<ClientFrame>(&mut recv).await {
-            Ok(ClientFrame::Request(req)) => {
-                if sink.dispatch(req).await.is_err() {
-                    break;
+        tokio::select! {
+            _ = &mut writer => break,
+            request = read_frame::<ClientFrame>(&mut recv) => match request {
+                Ok(ClientFrame::Request(req)) => {
+                    if sink.dispatch(req).await.is_err() {
+                        break;
+                    }
                 }
+                Ok(ClientFrame::Hello { .. }) => {},
+                Err(_) => break,
             }
-            Ok(ClientFrame::Hello { .. }) => {}
-            Err(_) => break,
         }
     }
 
+    conn.close(0u32.into(), b"closed");
     sink.detach().await;
     writer.abort();
     Ok(())
@@ -334,30 +419,25 @@ async fn handle_connection(
 
 // ---------------------------------------------------------------- 客户端
 
-/// 建立到服务端的 QUIC 连接。
-///
-/// `expected_fingerprint` 为 `None` 时接受任意证书（首次信任），
-/// 为 `Some` 时严格比对，防止中间人。
-pub async fn connect(
-    addr: SocketAddr,
-    expected_fingerprint: Option<&str>,
-) -> Result<QuicConnection> {
+/// 使用经带外核对或已固定的指纹建立 QUIC 连接。
+pub async fn connect(addr: SocketAddr, expected_fingerprint: &str) -> Result<QuicConnection> {
     connect_with(addr, expected_fingerprint, Liveness::default()).await
 }
 
 /// 指定活性参数连接。测试用短超时验证保活行为时会用到。
 pub async fn connect_with(
     addr: SocketAddr,
-    expected_fingerprint: Option<&str>,
+    expected_fingerprint: &str,
     liveness: Liveness,
 ) -> Result<QuicConnection> {
+    validate_fingerprint(expected_fingerprint)?;
     let provider = crypto_provider();
     let mut tls = quinn::rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&quinn::rustls::version::TLS13])
         .map_err(transport_err)?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(TofuVerifier {
-            expected: expected_fingerprint.map(str::to_string),
+        .with_custom_certificate_verifier(Arc::new(FingerprintVerifier {
+            expected: expected_fingerprint.to_ascii_lowercase(),
             provider,
         }))
         .with_no_client_auth();
@@ -371,12 +451,19 @@ pub async fn connect_with(
         Endpoint::client("0.0.0.0:0".parse().expect("合法地址")).map_err(transport_err)?;
     endpoint.set_default_client_config(client_config);
 
-    let conn = endpoint
-        .connect(addr, "libchat.local")
-        .map_err(transport_err)?
+    let conn = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        endpoint
+            .connect(addr, "libchat.local")
+            .map_err(transport_err)?,
+    )
+    .await
+    .map_err(|_| ChatError::Protocol("连接超时".into()))?
+    .map_err(transport_err)?;
+    let (mut send, mut recv) = tokio::time::timeout(HANDSHAKE_TIMEOUT, conn.open_bi())
         .await
+        .map_err(|_| ChatError::Protocol("打开请求流超时".into()))?
         .map_err(transport_err)?;
-    let (mut send, mut recv) = conn.open_bi().await.map_err(transport_err)?;
 
     let device = DeviceId::new();
     write_frame(
@@ -387,17 +474,25 @@ pub async fn connect_with(
         },
     )
     .await?;
-    let room = match read_frame::<ServerFrame>(&mut recv).await? {
+    let room = match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame::<ServerFrame>(&mut recv))
+        .await
+        .map_err(|_| ChatError::Protocol("等待欢迎消息超时".into()))??
+    {
         ServerFrame::Welcome { version, room } if version == PROTOCOL_VERSION => room,
         _ => return Err(ChatError::Protocol("握手失败".into())),
     };
 
-    let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, events) = tokio::sync::mpsc::channel(chat_core::EVENT_QUEUE_CAPACITY);
+    let reader_conn = conn.clone();
     tokio::spawn(async move {
         loop {
             match read_frame::<ServerFrame>(&mut recv).await {
                 Ok(ServerFrame::Event(ev)) => {
-                    if tx.send(ev).is_err() {
+                    if !matches!(
+                        tokio::time::timeout(Duration::from_secs(5), tx.send(ev)).await,
+                        Ok(Ok(()))
+                    ) {
+                        reader_conn.close(0u32.into(), b"slow client");
                         break;
                     }
                 }

@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
+use chat_core::RoomId;
 use chat_core::{ChatError, Result};
-use chat_proto::RoomId;
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use tokio::sync::mpsc;
 
@@ -90,7 +90,7 @@ pub struct RoomBrowser {
 }
 
 impl RoomBrowser {
-    pub fn start(tx: mpsc::UnboundedSender<RoomAnnouncement>) -> Result<Self> {
+    pub fn start(tx: mpsc::Sender<RoomAnnouncement>) -> Result<Self> {
         let daemon = ServiceDaemon::new().map_err(transport_err)?;
         let events = daemon.browse(SERVICE_TYPE).map_err(transport_err)?;
 
@@ -98,7 +98,7 @@ impl RoomBrowser {
             while let Ok(event) = events.recv_async().await {
                 if let ServiceEvent::ServiceResolved(info) = event {
                     if let Some(room) = to_announcement(&info) {
-                        if tx.send(room).is_err() {
+                        if matches!(tx.try_send(room), Err(mpsc::error::TrySendError::Closed(_))) {
                             break;
                         }
                     }

@@ -10,8 +10,8 @@ pub mod mdns;
 
 use std::net::SocketAddr;
 
+use chat_core::RoomId;
 use chat_core::{ChatError, Result};
-use chat_proto::RoomId;
 use tokio::sync::mpsc;
 
 pub use mdns::SERVICE_TYPE;
@@ -76,7 +76,7 @@ impl RoomAnnouncer {
 
 /// 发现局域网房间：合并 mDNS 与 UDP 广播两条通道的结果。
 pub struct RoomBrowser {
-    rx: mpsc::UnboundedReceiver<RoomAnnouncement>,
+    rx: mpsc::Receiver<RoomAnnouncement>,
     _mdns: Option<mdns::RoomBrowser>,
     _beacon: Option<beacon::BeaconProbe>,
 }
@@ -88,7 +88,7 @@ impl RoomBrowser {
 
     /// 指定广播端口。同机需要跑多套互不干扰的实例时使用。
     pub fn start_on(beacon_port: u16) -> Result<Self> {
-        let (tx, rx) = mpsc::unbounded_channel::<RoomAnnouncement>();
+        let (tx, rx) = mpsc::channel::<RoomAnnouncement>(128);
 
         let mdns = mdns::RoomBrowser::start(tx.clone()).ok();
         let beacon = beacon::BeaconProbe::start(beacon_port, tx.clone()).ok();

@@ -1,12 +1,13 @@
-//! 客户端 SDK：对上层暴露带类型的房间操作，屏蔽具体传输实现。
+//! 客户端门面：对上层暴露带类型的房间操作，屏蔽具体传输实现。
 //!
-//! UI 只依赖本模块；换传输（进程内 / QUIC / WebSocket）不影响上层。
+//! 换传输（进程内 / QUIC / WebSocket）不影响调用方。
 
 use std::sync::Arc;
 
-use chat_core::{Connection, Result};
-use chat_proto::{ClientRequest, Profile, RoomId, Seq, ServerEvent};
 use uuid::Uuid;
+
+use crate::proto::{ClientRequest, Profile, RoomId, Seq, ServerEvent};
+use crate::{Connection, Result};
 
 #[derive(Clone)]
 pub struct Client {
@@ -37,10 +38,19 @@ impl Client {
     }
 
     pub async fn send_text(&self, room: RoomId, text: impl Into<String>) -> Result<()> {
+        self.send_text_with_id(room, Uuid::new_v4(), text).await
+    }
+
+    pub async fn send_text_with_id(
+        &self,
+        room: RoomId,
+        client_msg_id: Uuid,
+        text: impl Into<String>,
+    ) -> Result<()> {
         self.conn
             .request(ClientRequest::Send {
                 room,
-                client_msg_id: Uuid::new_v4(),
+                client_msg_id,
                 text: text.into(),
             })
             .await

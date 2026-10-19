@@ -1,8 +1,17 @@
-//! 领域模型与端口定义。上层依赖这些抽象，不依赖任何具体传输或存储实现。
+//! 核心契约：协议 DTO、端口 trait、客户端门面。
+//!
+//! 上下层只依赖这里，不依赖任何具体传输或存储实现；换传输 / 换存储都不动这一层。
+//!
+//! - `proto`：客户端与服务端共享的协议定义
+//! - 端口：`Connection` / `RequestSink` / `ConnectionAcceptor` / `MessageStore`
+//! - [`Client`]：客户端门面，把 `Connection` 收成带类型的方法
 
-use chat_proto::{
-    ClientRequest, DeviceId, Message, MessageKind, RoomId, RoomInfo, Seq, ServerEvent, UserId,
-};
+mod client;
+mod proto;
+
+pub use client::Client;
+pub use proto::*;
+
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -18,6 +27,11 @@ pub enum ChatError {
     Storage(String),
     #[error("连接已关闭")]
     Closed,
+}
+
+pub struct AppendResult {
+    pub message: Message,
+    pub inserted: bool,
 }
 
 // ---------------------------------------------------------------- 连接
@@ -36,7 +50,8 @@ pub trait Connection: Send + Sync {
 }
 
 /// 服务端向某条连接推送事件的口子。
-pub type EventStream = mpsc::UnboundedReceiver<ServerEvent>;
+pub const EVENT_QUEUE_CAPACITY: usize = 32;
+pub type EventStream = mpsc::Receiver<ServerEvent>;
 
 /// 一条连接的请求入口，传输层把收到的请求交给它。
 #[async_trait::async_trait]
@@ -69,9 +84,14 @@ pub struct NewMessage {
 #[async_trait::async_trait]
 pub trait MessageStore: Send + Sync {
     /// 追加消息，返回分配了 `seq` 的完整消息。
-    async fn append(&self, room: RoomId, msg: NewMessage) -> Result<Message>;
+    async fn append(&self, room: RoomId, msg: NewMessage) -> Result<AppendResult>;
     /// 取 `before`（不含）之前的最近 `limit` 条，按 seq 升序返回。
-    async fn history(&self, room: RoomId, before: Option<Seq>, limit: usize) -> Result<Vec<Message>>;
+    async fn history(
+        &self,
+        room: RoomId,
+        before: Option<Seq>,
+        limit: usize,
+    ) -> Result<Vec<Message>>;
     /// 取 `after`（不含）之后的、最早的 `limit` 条，按 seq 升序返回。
     async fn since(&self, room: RoomId, after: Seq, limit: usize) -> Result<Vec<Message>>;
     /// 当前最大序号，空房间为 0。

@@ -4,11 +4,10 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
-chat-proto.workspace = true
 chat-core.workspace = true
 
 async-trait.workspace = true
+sea-query.workspace = true
+sqlx.workspace = true
 tokio.workspace = true
-
-[dev-dependencies]
-chat-client.workspace = true
+uuid.workspace = true

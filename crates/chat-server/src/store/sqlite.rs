@@ -1,20 +1,18 @@
-//! 服务端消息持久化：SQLite + sea-query。
+//! 消息落库：SQLite + sea-query。
 //!
 //! 消息全部落盘，进程内不留副本——房间历史再长也不会把内存撑爆。
 //! 房间标识与消息同库保存：库在，房间就在，重启后历史仍读得回来。
 
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use chat_core::{ChatError, MessageStore, NewMessage, Result};
-use chat_proto::{Message, MessageKind, RoomId, Seq};
-use sea_query::{
-    ColumnDef, Expr, Index, Order, Query, SqliteQueryBuilder, Table, Value, Values,
-};
-use sqlx::Row;
+use chat_core::{AppendResult, ChatError, MessageStore, NewMessage, Result};
+use chat_core::{Message, MessageKind, RoomId, Seq};
+use sea_query::{ColumnDef, Expr, Index, Order, Query, SqliteQueryBuilder, Table, Value, Values};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
-use tokio::sync::Mutex;
+use sqlx::Row;
+
+use super::now_ms;
 
 /// `messages` 表。
 mod messages {
@@ -53,8 +51,6 @@ const MESSAGE_COLUMNS: [&str; 7] = [
 pub struct SqliteStore {
     pool: SqlitePool,
     room: RoomId,
-    /// 串行化「取最大序号 + 插入」，否则两条连接会抢到同一个 seq。
-    write: Mutex<()>,
 }
 
 impl SqliteStore {
@@ -78,7 +74,6 @@ impl SqliteStore {
         let store = Self {
             pool,
             room: RoomId::new(),
-            write: Mutex::new(()),
         };
         store.migrate().await?;
         let room = store.load_or_init_room().await?;
@@ -88,6 +83,10 @@ impl SqliteStore {
     /// 本库对应的房间标识。
     pub fn room(&self) -> RoomId {
         self.room
+    }
+
+    pub async fn close(&self) {
+        self.pool.close().await;
     }
 
     async fn migrate(&self) -> Result<()> {
@@ -108,14 +107,34 @@ impl SqliteStore {
         let meta_table = Table::create()
             .table(room_meta::TABLE)
             .if_not_exists()
-            .col(ColumnDef::new(room_meta::ID).integer().not_null().primary_key())
+            .col(
+                ColumnDef::new(room_meta::ID)
+                    .integer()
+                    .not_null()
+                    .primary_key(),
+            )
             .col(ColumnDef::new(room_meta::ROOM_ID).text().not_null())
             .to_owned();
 
         for statement in [messages_table, meta_table] {
             let sql = statement.build(SqliteQueryBuilder);
-            sqlx::query(&sql).execute(&self.pool).await.map_err(db_err)?;
+            sqlx::query(&sql)
+                .execute(&self.pool)
+                .await
+                .map_err(db_err)?;
         }
+        let index = Index::create()
+            .name("idx_messages_room_msg_id")
+            .table(messages::TABLE)
+            .col(messages::ROOM_ID)
+            .col(messages::MSG_ID)
+            .unique()
+            .if_not_exists()
+            .to_owned();
+        sqlx::query(&index.build(SqliteQueryBuilder))
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
         Ok(())
     }
 
@@ -156,52 +175,108 @@ impl SqliteStore {
 
 #[async_trait]
 impl MessageStore for SqliteStore {
-    async fn append(&self, room: RoomId, msg: NewMessage) -> Result<Message> {
-        let _guard = self.write.lock().await;
-
-        let stored = Message {
-            room,
-            seq: self.latest_seq(room).await? + 1,
-            client_msg_id: msg.client_msg_id,
-            sender: msg.sender,
-            sender_name: msg.sender_name,
-            kind: msg.kind,
-            text: msg.text,
-            server_ts_ms: now_ms(),
-        };
-
-        let (sql, values) = Query::insert()
-            .into_table(messages::TABLE)
-            .columns([
-                messages::ROOM_ID,
-                messages::SEQ,
-                messages::MSG_ID,
-                messages::SENDER,
-                messages::SENDER_NAME,
-                messages::KIND,
-                messages::BODY,
-                messages::SERVER_TS,
-            ])
-            .values_panic([
-                stored.room.to_string().into(),
-                stored.seq.into(),
-                stored.client_msg_id.to_string().into(),
-                stored.sender.to_string().into(),
-                stored.sender_name.clone().into(),
-                kind_str(stored.kind).into(),
-                stored.text.clone().into(),
-                stored.server_ts_ms.into(),
-            ])
-            .build(SqliteQueryBuilder);
-
-        bind(sqlx::query(&sql), values)
-            .execute(&self.pool)
+    async fn append(&self, room: RoomId, msg: NewMessage) -> Result<AppendResult> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(db_err)?;
-        Ok(stored)
+        let result: Result<AppendResult> = async {
+            let (sql, values) = Query::select()
+                .columns(MESSAGE_COLUMNS)
+                .from(messages::TABLE)
+                .and_where(Expr::col(messages::ROOM_ID).eq(room.to_string()))
+                .and_where(Expr::col(messages::MSG_ID).eq(msg.client_msg_id.to_string()))
+                .build(SqliteQueryBuilder);
+            if let Some(row) = bind(sqlx::query(&sql), values)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(db_err)?
+            {
+                let stored = row_to_message(room, &row)?;
+                if stored.text != msg.text || stored.kind != msg.kind {
+                    return Err(ChatError::Protocol("消息标识与原始内容不一致".into()));
+                }
+                return Ok(AppendResult {
+                    message: stored,
+                    inserted: false,
+                });
+            }
+
+            let (sql, values) = Query::select()
+                .expr(Expr::col(messages::SEQ).max())
+                .from(messages::TABLE)
+                .and_where(Expr::col(messages::ROOM_ID).eq(room.to_string()))
+                .build(SqliteQueryBuilder);
+            let latest = bind(sqlx::query(&sql), values)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(db_err)?
+                .get::<Option<i64>, _>(0)
+                .unwrap_or(0);
+            let stored = Message {
+                room,
+                seq: latest + 1,
+                client_msg_id: msg.client_msg_id,
+                sender: msg.sender,
+                sender_name: msg.sender_name,
+                kind: msg.kind,
+                text: msg.text,
+                server_ts_ms: now_ms(),
+            };
+
+            let (sql, values) = Query::insert()
+                .into_table(messages::TABLE)
+                .columns([
+                    messages::ROOM_ID,
+                    messages::SEQ,
+                    messages::MSG_ID,
+                    messages::SENDER,
+                    messages::SENDER_NAME,
+                    messages::KIND,
+                    messages::BODY,
+                    messages::SERVER_TS,
+                ])
+                .values_panic([
+                    stored.room.to_string().into(),
+                    stored.seq.into(),
+                    stored.client_msg_id.to_string().into(),
+                    stored.sender.to_string().into(),
+                    stored.sender_name.clone().into(),
+                    kind_str(stored.kind).into(),
+                    stored.text.clone().into(),
+                    stored.server_ts_ms.into(),
+                ])
+                .build(SqliteQueryBuilder);
+
+            bind(sqlx::query(&sql), values)
+                .execute(&mut *transaction)
+                .await
+                .map_err(db_err)?;
+            Ok(AppendResult {
+                message: stored,
+                inserted: true,
+            })
+        }
+        .await;
+        match result {
+            Ok(value) => {
+                transaction.commit().await.map_err(db_err)?;
+                Ok(value)
+            }
+            Err(error) => {
+                transaction.rollback().await.map_err(db_err)?;
+                Err(error)
+            }
+        }
     }
 
-    async fn history(&self, room: RoomId, before: Option<Seq>, limit: usize) -> Result<Vec<Message>> {
+    async fn history(
+        &self,
+        room: RoomId,
+        before: Option<Seq>,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
         // `SelectStatement` 不是 `Send`，必须在 await 之前就生成好 SQL 并丢掉它
         let (sql, values) = {
             let mut query = Query::select();
@@ -300,13 +375,6 @@ fn db_err(error: sqlx::Error) -> ChatError {
     ChatError::Storage(error.to_string())
 }
 
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 /// 把 sea-query 生成的值按顺序绑到 sqlx 语句上。
 fn bind<'a>(
     mut query: sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'a>>,
@@ -327,10 +395,10 @@ fn bind<'a>(
 
 #[cfg(test)]
 mod tests {
-    use chat_proto::UserId;
+    use chat_core::{Message, MessageKind, MessageStore, NewMessage, RoomId, UserId};
     use uuid::Uuid;
 
-    use super::*;
+    use super::SqliteStore;
 
     fn temp_path(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("libchat-store-{tag}-{}.db", std::process::id()))
@@ -354,8 +422,12 @@ mod tests {
         let room = store.room();
 
         for i in 1..=5 {
-            let stored = store.append(room, incoming(&format!("m{i}"))).await.unwrap();
-            assert_eq!(stored.seq, i);
+            let stored = store
+                .append(room, incoming(&format!("m{i}")))
+                .await
+                .unwrap();
+            assert_eq!(stored.message.seq, i);
+            assert!(stored.inserted);
         }
         assert_eq!(store.latest_seq(room).await.unwrap(), 5);
 
@@ -386,7 +458,73 @@ mod tests {
         // 重新打开：房间标识与消息都应从库里恢复
         let reopened = SqliteStore::open(&path).await.unwrap();
         assert_eq!(reopened.room(), room);
-        assert_eq!(texts(&reopened.history(room, None, 10).await.unwrap()), ["说过的话"]);
+        assert_eq!(
+            texts(&reopened.history(room, None, 10).await.unwrap()),
+            ["说过的话"]
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_message_keeps_original_seq_after_reopen() {
+        let path = temp_path("dedup");
+        let _ = std::fs::remove_file(&path);
+        let request = incoming("一次");
+        let (room, first) = {
+            let store = SqliteStore::open(&path).await.unwrap();
+            let room = store.room();
+            let first = store.append(room, request.clone()).await.unwrap();
+            assert!(first.inserted);
+            (room, first.message)
+        };
+        let store = SqliteStore::open(&path).await.unwrap();
+        let mut renamed = request.clone();
+        renamed.sender = UserId::new();
+        renamed.sender_name = "换了昵称".into();
+        let repeated = store.append(room, renamed).await.unwrap();
+        assert!(!repeated.inserted);
+        assert_eq!(repeated.message.seq, first.seq);
+        assert_eq!(repeated.message.sender_name, "Alice");
+        assert_eq!(store.latest_seq(room).await.unwrap(), 1);
+        let mut collision = request;
+        collision.text = "不同内容".into();
+        assert!(store.append(room, collision).await.is_err());
+        assert_eq!(
+            store
+                .append(room, incoming("可继续写"))
+                .await
+                .unwrap()
+                .message
+                .seq,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_stores_assign_unique_sequences_and_deduplicate() {
+        let path = std::env::temp_dir().join(format!("libchat-concurrent-{}.db", Uuid::new_v4()));
+        let first = SqliteStore::open(&path).await.unwrap();
+        let second = SqliteStore::open(&path).await.unwrap();
+        let room = first.room();
+        assert_eq!(second.room(), room);
+        let request = incoming("仅一次");
+        let (a, b) = tokio::join!(
+            first.append(room, request.clone()),
+            second.append(room, request)
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(a.message.seq, b.message.seq);
+        assert_ne!(a.inserted, b.inserted);
+        assert_eq!(first.latest_seq(room).await.unwrap(), 1);
+        let (a, b) = tokio::join!(
+            first.append(room, incoming("不同的 A")),
+            second.append(room, incoming("不同的 B")),
+        );
+        assert!(a.unwrap().inserted);
+        assert!(b.unwrap().inserted);
+        assert_eq!(second.latest_seq(room).await.unwrap(), 3);
+        first.close().await;
+        second.close().await;
+        let _ = std::fs::remove_file(path);
     }
 
     fn texts(messages: &[Message]) -> Vec<&str> {

@@ -1,9 +1,8 @@
-//! 后端事件 → 界面状态。
+//! 房间与消息视图状态：应用服务事件和交互即时反馈。
 //!
-//! 所有状态变更都收敛在这里，渲染函数只读不写。消息列表只能经 [`ChatApp`] 上那几个
-//! `*_lines` 方法改动——它们同时维护虚拟列表的项数，绕过它们就会越界。
+//! 消息列表的改动同时维护虚拟列表的项数。
 
-use chat_proto::{RoomId, UserId};
+use chat_core::{RoomId, Seq, UserId};
 use gpui::ListOffset;
 
 use crate::service::UiEvent;
@@ -11,10 +10,37 @@ use crate::service::UiEvent;
 use super::{ChatApp, ChatLine, DiscoveredRoom, RoomView};
 
 impl ChatApp {
+    pub(crate) fn begin_loading_older(&mut self) -> bool {
+        if !self.has_older
+            || self.loading_older
+            || !self.room.as_ref().is_some_and(|view| view.joined)
+            || self.lines.iter().all(|line| line.seq.is_none())
+        {
+            return false;
+        }
+        self.loading_older = true;
+        true
+    }
+
+    pub(crate) fn begin_connect(&mut self, addr: &str) {
+        self.status = format!("正在连接 {addr} …");
+    }
+
     pub(crate) fn apply(&mut self, event: UiEvent) {
         match event {
             UiEvent::Status(text) => self.status = text,
-            UiEvent::Error(text) => self.status = format!("⚠ {text}"),
+            UiEvent::TrustRequired {
+                room,
+                addr,
+                fingerprint,
+            } => {
+                self.status = "首次连接前，请向房主核对完整房间标识和证书指纹".into();
+                self.pending_trust = Some((room, addr, fingerprint));
+            }
+            UiEvent::Error(text) => {
+                self.status = format!("⚠ {text}");
+                self.loading_older = false;
+            }
             UiEvent::RoomFound {
                 room,
                 name,
@@ -25,7 +51,11 @@ impl ChatApp {
             } => {
                 // 自己就在这个房间里时，人数以房间推送为准：探测是几秒一轮的，
                 // 早于推送发出的那次探测结果回来，只会把数字倒回去
-                let online = match self.room.as_ref().filter(|view| view.id == room && view.joined) {
+                let online = match self
+                    .room
+                    .as_ref()
+                    .filter(|view| view.id == room && view.joined)
+                {
                     Some(view) => view.online,
                     None => online,
                 };
@@ -52,14 +82,19 @@ impl ChatApp {
                 }
             }
             UiEvent::Hosting {
+                room,
                 name,
                 addrs,
                 fingerprint,
             } => {
-                // 指纹是十六进制，取前 8 位足够辨认；不足 8 位就整段显示
-                let short = fingerprint.get(..8).unwrap_or(&fingerprint);
+                let rows = fingerprint
+                    .as_bytes()
+                    .chunks(16)
+                    .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 self.hosted = Some(format!(
-                    "已创建「{name}」，地址 {}（指纹 {short}…）",
+                    "已创建「{name}」\n房间 {room}\n地址 {}\n证书 SHA-256:\n{rows}",
                     addrs.join("  /  ")
                 ));
                 // 已经在用这个房间了，侧栏那个「回到我的房间」入口就该收起来
@@ -77,22 +112,34 @@ impl ChatApp {
                 addr,
                 online,
             } => {
+                self.pending_trust = None;
+                let same_room = self.showing(room).is_some();
+                let joined = same_room && self.room.as_ref().is_some_and(|view| view.joined);
                 self.room = Some(RoomView {
                     id: room,
                     name,
                     addr,
                     online,
-                    joined: false,
+                    joined,
                 });
                 self.sync_online(room, online);
-                self.clear_lines();
-                // 新房间，能不能往上翻要等它的第一页历史说了算
-                self.has_older = true;
-                self.my_id = None;
-                // 连上了就得把状态栏拉回现在：上一次连不上的错误提示不能一直挂在那儿
-                self.status = "已连接，可加入房间".into();
+                if !same_room {
+                    self.clear_lines();
+                    self.has_older = true;
+                    self.loading_older = false;
+                    self.my_id = None;
+                }
+                self.status = if joined {
+                    "已重新连接房间"
+                } else {
+                    "已连接，可加入房间"
+                }
+                .into();
             }
             UiEvent::Joined { room, you, online } => {
+                if self.showing(room).is_none() {
+                    return;
+                }
                 // 重连后服务端会重新分配身份并再发一次 Joined，措辞要区分开，
                 // 否则用户会以为自己是重新进了一次房间
                 let recovered = self.showing(room).is_some_and(|view| view.joined);
@@ -110,21 +157,23 @@ impl ChatApp {
                 self.push_system(self.status.clone());
             }
             UiEvent::Left { room } => {
-                if let Some(view) = self.showing_mut(room) {
-                    view.joined = false;
-                }
+                let Some(view) = self.showing_mut(room) else {
+                    return;
+                };
+                view.joined = false;
                 self.my_id = None;
                 self.status = "已退出房间".into();
                 self.push_system("已退出房间".into());
             }
             UiEvent::Message {
                 room,
+                seq,
                 sender_id,
                 sender,
                 text,
             } => {
                 if self.showing(room).is_some() {
-                    let line = chat_line(sender_id, sender, text, self.my_id);
+                    let line = chat_line(seq, sender_id, sender, text, self.my_id);
                     self.push_line(line);
                 }
             }
@@ -141,7 +190,7 @@ impl ChatApp {
                 let my_id = self.my_id;
                 let lines = messages
                     .into_iter()
-                    .map(|m| chat_line(m.sender_id, m.sender, m.text, my_id))
+                    .map(|m| chat_line(m.seq, m.sender_id, m.sender, m.text, my_id))
                     .collect();
                 // 比当前会话更早，插到最前才是正确的时间顺序
                 self.prepend_lines(lines);
@@ -153,9 +202,14 @@ impl ChatApp {
                 let my_id = self.my_id;
                 let lines = messages
                     .into_iter()
-                    .map(|m| chat_line(m.sender_id, m.sender, m.text, my_id))
+                    .map(|m| chat_line(m.seq, m.sender_id, m.sender, m.text, my_id))
                     .collect();
                 self.push_lines(lines);
+            }
+            UiEvent::HistoryCancelled { room } => {
+                if self.showing(room).is_some() {
+                    self.loading_older = false;
+                }
             }
             UiEvent::Presence { room, online } => {
                 if let Some(view) = self.showing_mut(room) {
@@ -199,48 +253,79 @@ impl ChatApp {
         }
     }
 
-    /// 追加一条消息。
-    pub(crate) fn push_line(&mut self, line: ChatLine) {
-        let at = self.lines.len();
-        self.lines.push(line);
+    fn insert_line(&mut self, line: ChatLine, history: bool) -> Option<usize> {
+        let at = if let Some(seq) = line.seq {
+            if !self.seen_seqs.insert(seq) {
+                return None;
+            }
+            match (
+                self.lines.iter().find_map(|line| line.seq),
+                self.lines.iter().rposition(|line| line.seq.is_some()),
+            ) {
+                (Some(first), _) if seq < first => 0,
+                (_, Some(last)) if seq > self.lines[last].seq.unwrap() => {
+                    if history {
+                        last + 1
+                    } else {
+                        self.lines.len()
+                    }
+                }
+                (Some(_), _) => self
+                    .lines
+                    .iter()
+                    .position(|line| line.seq.is_some_and(|old| old > seq))
+                    .unwrap(),
+                _ if history => 0,
+                _ => self.lines.len(),
+            }
+        } else {
+            self.lines.len()
+        };
+        self.lines.insert(at, line);
         self.list.splice(at..at, 1);
+        Some(at)
     }
 
-    /// 追加一批消息（重连补齐的漏收消息）。
+    pub(crate) fn push_line(&mut self, line: ChatLine) {
+        self.insert_line(line, false);
+    }
+
     pub(crate) fn push_lines(&mut self, lines: Vec<ChatLine>) {
-        if lines.is_empty() {
-            return;
+        for line in lines {
+            self.insert_line(line, false);
         }
-        let at = self.lines.len();
-        let added = lines.len();
-        self.lines.extend(lines);
-        self.list.splice(at..at, added);
     }
 
-    /// 在列表最前插入一批消息（加入时的历史、往上翻的更早历史）。
     pub(crate) fn prepend_lines(&mut self, lines: Vec<ChatLine>) {
         if lines.is_empty() {
             return;
         }
-        // 前插会把已有内容整体下移，先记下此刻看到的首项，插入后按新下标摆回去
         let anchor = self.list.logical_scroll_top();
-        let added = lines.len();
-        self.lines.splice(0..0, lines);
-        self.list.splice(0..0, added);
-        self.list.scroll_to(ListOffset {
-            item_ix: anchor.item_ix + added,
-            offset_in_item: anchor.offset_in_item,
-        });
+        let mut item_ix = anchor.item_ix;
+        for line in lines {
+            if let Some(at) = self.insert_line(line, true)
+                && at <= item_ix
+            {
+                item_ix += 1;
+            }
+        }
+        if item_ix != anchor.item_ix {
+            self.list.scroll_to(ListOffset {
+                item_ix,
+                offset_in_item: anchor.offset_in_item,
+            });
+        }
     }
 
-    /// 清空消息列表（切换房间）。
     pub(crate) fn clear_lines(&mut self) {
         self.lines.clear();
+        self.seen_seqs.clear();
         self.list.reset(0);
     }
 
     pub(crate) fn push_system(&mut self, text: String) {
         self.push_line(ChatLine {
+            seq: None,
             sender: "系统".into(),
             text,
             mine: false,
@@ -249,9 +334,15 @@ impl ChatApp {
     }
 }
 
-/// 把一条聊天消息转成界面行，顺带判断是不是自己发的。
-fn chat_line(sender_id: UserId, sender: String, text: String, mine: Option<UserId>) -> ChatLine {
+fn chat_line(
+    seq: Seq,
+    sender_id: UserId,
+    sender: String,
+    text: String,
+    mine: Option<UserId>,
+) -> ChatLine {
     ChatLine {
+        seq: Some(seq),
         sender,
         text,
         mine: mine == Some(sender_id),

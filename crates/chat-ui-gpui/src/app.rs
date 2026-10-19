@@ -5,13 +5,13 @@
 //! | 模块 | 职责 |
 //! |---|---|
 //! | [`model`] | 视图数据 |
-//! | [`update`] | 服务事件 → 界面状态 |
+//! | [`update`] | 服务事件与交互反馈 → 房间视图状态 |
 //! | [`actions`] | 用户操作 → 服务指令 |
 //! | [`views`] | 渲染 |
 //! | [`widgets`] | 可复用控件 |
 //! | [`theme`] | 配色 |
 //!
-//! 状态只有一个写入方（[`update`]），渲染只读，交互只发指令。
+//! 房间视图由 [`update`] 维护；输入控件由 [`actions`] 处理，渲染只读。
 
 mod actions;
 mod model;
@@ -22,7 +22,9 @@ pub mod widgets;
 
 pub use model::{ChatLine, DiscoveredRoom, RoomView};
 
-use chat_proto::{RoomId, UserId};
+use std::collections::HashSet;
+
+use chat_core::{RoomId, Seq, UserId};
 use gpui::{Context, Entity, ListAlignment, ListState, Render, Window, div, prelude::*, px, rgb};
 
 use crate::service::{self, UiCommand};
@@ -33,10 +35,13 @@ pub struct ChatApp {
     cmd_tx: flume::Sender<UiCommand>,
     nickname: Entity<TextInput>,
     addr_input: Entity<TextInput>,
+    fingerprint_input: Entity<TextInput>,
     message: Entity<TextInput>,
+    pending_trust: Option<(RoomId, String, String)>,
     rooms: Vec<DiscoveredRoom>,
     room: Option<RoomView>,
     lines: Vec<ChatLine>,
+    seen_seqs: HashSet<Seq>,
     /// 消息列表的虚拟化状态；项数必须与 `lines` 始终一致，否则渲染会越界。
     list: ListState,
     /// 服务端那边还有更早的消息可以往前翻。
@@ -74,6 +79,7 @@ impl ChatApp {
             input
         });
         let addr_input = cx.new(|cx| TextInput::new("如 192.168.1.5:52000", cx));
+        let fingerprint_input = cx.new(|cx| TextInput::new("房主提供的完整 SHA-256 指纹", cx));
         let message = cx.new(|cx| TextInput::new("输入消息，回车发送", cx));
 
         cx.subscribe(&message, |this, _, _: &TextInputSubmitted, cx| {
@@ -116,10 +122,13 @@ impl ChatApp {
             cmd_tx,
             nickname,
             addr_input,
+            fingerprint_input,
             message,
+            pending_trust: None,
             rooms: Vec::new(),
             room: None,
             lines: Vec::new(),
+            seen_seqs: HashSet::new(),
             list,
             has_older: true,
             loading_older: false,

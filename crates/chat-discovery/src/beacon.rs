@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use chat_core::RoomId;
 use chat_core::{ChatError, Result};
-use chat_proto::RoomId;
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::mpsc;
@@ -155,7 +155,7 @@ pub struct BeaconProbe {
 }
 
 impl BeaconProbe {
-    pub fn start(beacon_port: u16, tx: mpsc::UnboundedSender<RoomAnnouncement>) -> Result<Self> {
+    pub fn start(beacon_port: u16, tx: mpsc::Sender<RoomAnnouncement>) -> Result<Self> {
         let socket = bind_probe_socket(beacon_port)?;
         socket
             .set_read_timeout(Some(Duration::from_millis(200)))
@@ -225,7 +225,10 @@ impl BeaconProbe {
                     }
 
                     for announcement in found {
-                        if tx.send(announcement).is_err() {
+                        if matches!(
+                            tx.try_send(announcement),
+                            Err(mpsc::error::TrySendError::Closed(_))
+                        ) {
                             return;
                         }
                     }
@@ -264,7 +267,7 @@ mod tests {
         )
         .unwrap();
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(32);
         let _probe = BeaconProbe::start(DEFAULT_BEACON_PORT, tx).unwrap();
 
         let found = tokio::time::timeout(Duration::from_secs(10), async {

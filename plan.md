@@ -32,19 +32,21 @@
 ### 1.1 分层与依赖方向（面向接口）
 
 ```
-chat-proto     协议 DTO：客户端 <-> 服务端，与具体传输解耦（serde）
-chat-core      领域模型 + 端口 trait（连接 / 存储），无传输细节
+chat-core      核心契约：协议 DTO（与具体传输解耦）+ 端口 trait（连接 / 存储）+ 客户端门面
    ▲
-   ├── store-sqlite         消息落库（sea-query + sqlx）
-   ├── chat-server          房间状态、在线人数、扇出
+   ├── chat-server          房间状态、在线人数、扇出 + 存储实现（内存 / SQLite）
    ├── chat-discovery       局域网发现（mDNS + UDP 广播）
-   └── chat-transport-quic  QUIC 传输 + 自签证书 + TOFU
-   ▲
-chat-client    带类型的客户端 SDK
+   └── chat-transport-quic  QUIC 传输 + 固定房主证书 + 指纹校验 + 房间信任存储
    ▲
 chat-ui-gpui   桌面界面（app/ 状态与渲染、service/ 网络与托管）
 chat-cli       命令行 host / join
 ```
+
+> **crate 划分判据**：这个 crate 是不是一个「能独立拿走」的单位——别的项目要拿它，
+> 得连协议一起拿就不算。能独立存在的（协议与端口、传输、局域网发现）保持独立；
+> 只是本项目某个 trait 的一种实现（内存存储 / SQLite 存储）放在**实现方的 crate 里做模块**，
+> 换实现靠 feature 或新模块，不靠 crate 边界。所以存储的实现并进 `chat-server`，
+> 协议 DTO / 端口 trait / 客户端门面并成一个 `chat-core`。
 
 > 面向接口编程的价值从「P2P ↔ 中继切换」转变为「**单机内嵌 ↔ 集群部署**」与「**存储/总线/媒体后端可替换**」。
 
@@ -194,7 +196,7 @@ struct StoredMessage {
 - **表情包**：Unicode emoji 走字体；贴纸包为一组 blob 打包按需拉取。
 - 存储后端抽象为 `media-fs`（局域网）/ `media-s3`（公网）。
 
-### 3.6 存储（`store-sqlite`）
+### 3.6 存储（`chat-server` 的 `store` 模块）
 
 统一用 `sea-query` + `sqlx`，SQL 一律经 builder 构造，不拼字符串。
 
@@ -216,7 +218,7 @@ struct StoredMessage {
 
 - **连接管理**：多 endpoint（内网/公网）择优与故障切换；断线指数退避重连；重连后自动 `sync` 补齐。
 - **本地缓存**：SQLite 存消息与媒体索引，离线可读历史。
-- **事件流**：`chat-client` 向上暴露 `Stream<ClientEvent>`（新消息/更新摘要/连接状态），UI 只订阅它。
+- **事件流**：客户端**向上暴露事件流**（新消息 / 更新摘要 / 连接状态），UI 只订阅它，不直接碰协议。
 - **发送**：乐观插入（`client_msg_id` 占位）→ 服务端返回 `seq` 后替换/重排 → 幂等保证不重复。
 - **UI**：GPUI `List`/`UniformList` 虚拟化渲染消息列表；分页向上加载历史。
 
@@ -249,7 +251,7 @@ struct StoredMessage {
 
 ## 7. 里程碑
 
-- **M0 骨架**：workspace 分层、`chat-proto`/`chat-core` trait、单机 inproc 服务端、GPUI 空窗口 + 虚拟列表。
+- **M0 骨架**：workspace 分层、协议与端口（`chat-core`）、单机 inproc 服务端、GPUI 空窗口 + 虚拟列表。
 - **M1 局域网大厅**：mDNS 广播/发现 + `LobbyInfo` 摘要（房间名/在线人数）+ 房主内嵌托管。
 - **M2 加入/退出 + 文本群聊**：join/leave 状态机、在线人数实时推送、消息落库与扇出、群文本消息。
 - **M3 单聊与多会话**：会话列表、单聊、版本号增量同步。
@@ -283,7 +285,7 @@ struct StoredMessage {
 | 房间数量 | V1 单房间；协议保留 `room_id`，多房间无需改协议 | 先简化，预留扩展 |
 | 消息类型 | V1 纯文本 + Unicode emoji，不做图片/贴纸/视频 | 聚焦核心链路 |
 | 服务端存储 | SQLite 单机，`sea-query` + `sqlx`；后期可迁 Postgres | V1 单机足够 |
-| 传输 | QUIC（`quinn`）+ rustls 自签证书 + TOFU 指纹校验 | 自带 TLS 1.3、多路复用，免单独配 TLS |
+| 传输 | QUIC（`quinn`）+ rustls 自签证书；首次带外核对，按房间持久固定指纹 | 自带 TLS 1.3、多路复用，免单独配 TLS |
 | 端到端加密 | **不进 V1**，仅传输层加密 | 避免与搜索/审核/回放冲突 |
 | 房主仲裁 | **未实现**：当前由用户手动「创建房间」，`DeviceId` 最小者优先的规则待落地 | 避免双房主 |
 
@@ -294,12 +296,15 @@ struct StoredMessage {
 | 阶段 | 状态 | 说明 |
 |---|---|---|
 | M0 骨架 | 完成 | workspace 分层、协议、端口 trait、进程内服务端、端到端测试 |
-| M1 局域网大厅 | 完成 | mDNS 广播/发现、QUIC 传输 + TOFU 指纹校验 |
+| M1 局域网大厅 | 完成 | mDNS 广播/发现、QUIC 传输、首次确认 + 持久指纹固定 |
 | M2 加入/退出 + 文本群聊 | 完成 | 在线人数实时推送、消息扇出、历史分页 |
 | **桌面界面** | **完成** | GPUI 单窗口：房间列表、人数、加入/退出、聊天、创建房间 |
 | **连接活性** | **完成** | 保活 PING + 断线自动重连恢复身份（修复「安静房间 30 秒后所有人被弹出」） |
 | **消息补齐** | **完成** | 加入拉最近一页历史；重连/重进按 seq 补齐漏收的消息 |
-| **消息落库** | **完成** | SQLite（`store-sqlite`）；房间标识入库，重启后房间与历史延续 |
+| **消息落库** | **完成** | SQLite（`chat-server` 的 `store` 模块）；房间标识入库，重启后房间与历史延续 |
+| **连接信任** | **完成** | 房主固定证书；首次带外确认并持久固定房间指纹，变更时拒绝连接 |
+| **消息幂等** | **完成** | SQLite 事务内查重并分配序号；单次会话断线重发保留 `client_msg_id`，进程重启后待确认队列不恢复 |
+| **基础背压** | **完成** | 服务端/界面通道有界；慢连接清退，界面事件异步排队；大群压测仍属 M5 |
 | **消息列表虚拟化** | **完成** | gpui 变高虚拟列表，只渲染可见项；滑到顶加载更早历史 |
 | **本机房间入口** | **完成** | 重开后侧栏提示「我的房间」，点它续用原房间；「新建房间」清空重建 |
 | M3 单聊与多会话 | 未开始 | |
@@ -311,13 +316,10 @@ struct StoredMessage {
 
 ```
 crates/
-├── chat-proto           协议 DTO（RoomInfo / LobbyInfo / ClientRequest / ServerEvent）
-├── chat-core            端口：Connection / RequestSink / ConnectionAcceptor / MessageStore
-├── store-sqlite         消息落库 + 房间标识（sea-query + sqlx）
-├── chat-server          房间状态、在线人数、扇出
-├── chat-client          带类型的客户端 SDK
+├── chat-core            核心契约：协议 DTO（RoomInfo / LobbyInfo / ClientRequest / ServerEvent）+ 端口（Connection / RequestSink / ConnectionAcceptor / MessageStore）+ 客户端门面 Client
+├── chat-server          `server` 房间状态与连接适配；`store` 消息存储（内存 / SQLite）
 ├── chat-discovery       房间发现：mDNS + UDP 广播双通道
-├── chat-transport-quic  QUIC 传输 + 自签证书 + TOFU
+├── chat-transport-quic  QUIC 传输 + 自签证书指纹校验
 ├── chat-ui-gpui         GPUI 桌面界面（bin 只剩开窗；逻辑全在 lib 里）
 └── chat-cli             libchat host / join
 ```
@@ -330,8 +332,8 @@ chat-ui-gpui/src/
 ├── app.rs               界面根：ChatApp 状态 + 构造 + 整体组装
 ├── app/                 界面
 │   ├── model.rs         视图数据（DiscoveredRoom / RoomView / ChatLine）
-│   ├── update.rs        服务事件 → 界面状态（唯一写入方）
-│   ├── actions.rs       用户操作 → 服务指令（只发指令，不改数据）
+│   ├── update.rs        服务事件与交互即时反馈 → 房间视图状态
+│   ├── actions.rs       用户操作 → 服务指令（输入控件由本模块处理）
 │   ├── views.rs         三大区域 + 共用小件（小节标题、内边距、按钮、消息行）
 │   ├── views/
 │   │   ├── header.rs    顶栏
@@ -366,7 +368,7 @@ chat-ui-gpui/src/
 
 | 约定 | 理由 |
 |---|---|
-| 界面状态只有一个写入方（`app/update.rs`） | `actions` 只发指令、`views` 只读，不会出现两处各改一半 |
+| 房间与消息视图由 `app/update.rs` 写入 | `actions` 编排指令与输入控件，`views` 只读 |
 | 重复的判断给它起个名字（如 `ChatApp::showing(room)`） | 「事件是否属于当前房间」原来在 4 处各写一遍 |
 | 长函数拆成**有名字的阶段**，而不是加注释分层 | `session.rs` 的重连监督原是一个 135 行、三层嵌套循环的函数，现拆成 `acquire` / `handshake` / `serve` / `wait_before_retry`，最长 41 行，主循环 `run()` 读起来就是它的规格说明 |
 | 一段逻辑只在一处决定样式/状态 | 侧栏房间行的选中态原分散在 4 处 `if`，现集中算一次 |

@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chat_client::Client;
+use chat_core::Client;
 use chat_core::ConnectionAcceptor;
 use chat_server::{Acceptor, Server};
 use chat_transport_quic::{Liveness, QuicServer, connect_with};
@@ -43,7 +43,7 @@ async fn keep_alive_survives_idle_room() {
     let room = server.room();
 
     let client = Client::new(Arc::new(
-        connect_with(addr, Some(&fingerprint), liveness)
+        connect_with(addr, &fingerprint, liveness)
             .await
             .expect("连接失败"),
     ));
@@ -75,7 +75,7 @@ async fn without_keep_alive_idle_connection_dies() {
     let room = server.room();
 
     let client = Client::new(Arc::new(
-        connect_with(addr, Some(&fingerprint), liveness)
+        connect_with(addr, &fingerprint, liveness)
             .await
             .expect("连接失败"),
     ));
