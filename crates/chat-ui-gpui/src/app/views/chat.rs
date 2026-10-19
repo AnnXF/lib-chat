@@ -40,6 +40,32 @@ impl ChatApp {
         })
         .flex_1();
 
+        // 未进入房间时给一个安静的引导，而不是一大片空白
+        let body = if self.room.is_none() {
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(15.))
+                        .text_color(rgb(theme::MUTED))
+                        .child("还没有进入房间"),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(theme::FAINT))
+                        .child("从左侧选择一个房间，或创建自己的房间"),
+                )
+                .into_any_element()
+        } else {
+            messages.into_any_element()
+        };
+
         div()
             .id("chat-main")
             .test_id("chat-main")
@@ -57,8 +83,9 @@ impl ChatApp {
                     .items_center()
                     .justify_between()
                     .gap_3()
-                    .px_5()
-                    .py_3()
+                    .h(px(64.))
+                    .px_6()
+                    .bg(rgb(theme::SURFACE))
                     .border_b_1()
                     .border_color(rgb(theme::BORDER))
                     .child(
@@ -71,21 +98,22 @@ impl ChatApp {
                             .child(
                                 div()
                                     .truncate()
-                                    .text_base()
+                                    .text_size(px(15.))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(rgb(theme::TEXT))
                                     .child(title),
                             )
                             .child(
                                 div()
                                     .truncate()
-                                    .text_xs()
+                                    .text_size(px(12.))
                                     .text_color(rgb(theme::MUTED))
                                     .child(subtitle),
                             ),
                     )
                     .child(action),
             )
-            .child(messages)
+            .child(body)
             .child(
                 div()
                     .id("composer")
@@ -94,9 +122,10 @@ impl ChatApp {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .px_5()
+                    .px_6()
                     .pt_3()
-                    .pb_4()
+                    .pb_3()
+                    .bg(rgb(theme::SURFACE))
                     .border_t_1()
                     .border_color(rgb(theme::BORDER))
                     // 工具条在上：左侧功能入口，右侧快捷键与发送；
@@ -128,7 +157,7 @@ impl ChatApp {
                                     .gap_3()
                                     .child(
                                         div()
-                                            .text_xs()
+                                            .text_size(px(11.))
                                             .text_color(rgb(theme::FAINT))
                                             .child("Enter 发送"),
                                     )
@@ -147,10 +176,11 @@ impl ChatApp {
                             .items_start()
                             .px_3()
                             .py_2()
-                            .rounded_lg()
+                            .rounded_xl()
                             .bg(rgb(theme::FIELD))
                             .border_1()
                             .border_color(rgb(theme::BORDER))
+                            .hover(|style| style.border_color(rgb(theme::BORDER_STRONG)))
                             // 点输入区任意位置都能聚焦，不必正好点到文字行
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_focus_composer))
                             .child(self.message.clone()),

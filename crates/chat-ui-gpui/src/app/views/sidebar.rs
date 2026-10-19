@@ -30,7 +30,7 @@ impl ChatApp {
         div()
             .id("sidebar")
             .test_id("sidebar")
-            .w(px(240.))
+            .w(px(256.))
             .flex_none()
             .h_full()
             .flex()
@@ -47,7 +47,7 @@ impl ChatApp {
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
-                    .py_3()
+                    .pb_3()
                     .when_some(
                         self.pending_trust.clone(),
                         |this, (room, addr, fingerprint)| {
@@ -105,7 +105,8 @@ impl ChatApp {
                     .id("sidebar-footer")
                     .test_id("sidebar-footer")
                     .flex_none()
-                    .py_2()
+                    .pt_3()
+                    .pb_3()
                     .border_t_1()
                     .border_color(rgb(theme::BORDER))
                     .child(section_label("直接连接"))
@@ -231,17 +232,17 @@ fn local_room_row(messages: u64, cx: &mut Context<ChatApp>) -> AnyElement {
         .flex()
         .flex_row()
         .items_center()
-        .pl_3()
-        .pr_5()
-        .py_2()
+        .h(px(40.))
+        .pl_4()
+        .pr_4()
         .cursor_pointer()
         .hover(|style| style.bg(rgb(theme::HOVER)))
         .child(
             div()
                 .w(px(2.))
-                .h(px(14.))
+                .h(px(16.))
                 .mr_3()
-                .rounded_md()
+                .rounded_full()
                 .bg(rgb(theme::ACCENT)),
         )
         .child(
@@ -253,7 +254,7 @@ fn local_room_row(messages: u64, cx: &mut Context<ChatApp>) -> AnyElement {
         )
         .child(
             div()
-                .text_xs()
+                .text_size(px(11.))
                 .text_color(rgb(theme::FAINT))
                 .child(subtitle),
         )
@@ -272,10 +273,10 @@ fn room_row(
     cx: &mut Context<ChatApp>,
 ) -> AnyElement {
     // 选中与否决定了四处配色，集中在这里算一次
-    let (name_color, count_color, marker) = if selected {
-        (theme::ACCENT, theme::MUTED, if joined { "● " } else { "" })
+    let (name_color, count_color) = if selected {
+        (theme::TEXT, theme::MUTED)
     } else {
-        (theme::TEXT, theme::FAINT, "")
+        (theme::TEXT, theme::FAINT)
     };
     let addr = room.addr.clone();
     let fingerprint = room.fingerprint.clone();
@@ -286,33 +287,48 @@ fn room_row(
         .flex()
         .flex_row()
         .items_center()
-        .pl_3()
-        .pr_5()
-        .py_2()
+        .h(px(40.))
+        .pl_4()
+        .pr_4()
         .cursor_pointer()
-        .when(selected, |this| this.bg(rgb(theme::ACCENT_SOFT)))
+        .when(selected, |this| this.bg(rgb(theme::HOVER)))
         .hover(|style| style.bg(rgb(theme::HOVER)))
         .child(
             // 选中时显示强调色竖条；未选中留出同样宽度，避免文字左右跳动
             div()
                 .w(px(2.))
-                .h(px(14.))
+                .h(px(16.))
                 .mr_3()
-                .rounded_md()
+                .rounded_full()
                 .when(selected, |this| this.bg(rgb(theme::ACCENT))),
         )
         .child(
             div()
                 .flex_1()
+                .min_w(px(0.))
+                .truncate()
                 .text_sm()
                 .text_color(rgb(name_color))
                 .child(room.name.clone()),
         )
+        // 已加入用实心点表示，比文字更安静
+        .when(joined, |this| {
+            this.child(
+                div()
+                    .flex_none()
+                    .w(px(6.))
+                    .h(px(6.))
+                    .mr_2()
+                    .rounded_full()
+                    .bg(rgb(theme::ACCENT)),
+            )
+        })
         .child(
             div()
-                .text_xs()
+                .flex_none()
+                .text_size(px(11.))
                 .text_color(rgb(count_color))
-                .child(format!("{marker}{} 人", room.online)),
+                .child(format!("{} 人", room.online)),
         )
         .on_mouse_up(
             MouseButton::Left,

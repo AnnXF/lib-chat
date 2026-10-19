@@ -11,14 +11,16 @@ impl ChatApp {
             .items_center()
             .justify_between()
             .gap_4()
-            .h(px(44.))
+            .h(px(48.))
             .px_5()
+            .bg(rgb(theme::SURFACE))
             .border_b_1()
             .border_color(rgb(theme::BORDER))
             .child(
                 div()
                     .flex_none()
-                    .text_base()
+                    .text_size(px(15.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(rgb(theme::TEXT))
                     .child("lib-chat"),
             )
@@ -29,8 +31,13 @@ impl ChatApp {
                     .min_w(px(0.))
                     .truncate()
                     .text_right()
-                    .text_xs()
-                    .text_color(rgb(theme::MUTED))
+                    .text_size(px(12.))
+                    // 出错时用警示色，正常状态保持低对比
+                    .text_color(rgb(if self.status.starts_with('⚠') {
+                        theme::DANGER
+                    } else {
+                        theme::MUTED
+                    }))
                     .child(self.status.clone()),
             )
             .into_any_element()

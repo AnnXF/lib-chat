@@ -688,9 +688,14 @@ impl Render for TextInput {
             .on_key_down(cx.listener(Self::on_key_down))
             .w_full()
             .when(!self.bare, |this| {
-                this.px_3().py_2().rounded_md().bg(rgb(theme::FIELD))
+                this.px_3()
+                    .py_2()
+                    .rounded_lg()
+                    .bg(rgb(theme::FIELD))
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
             })
-            .line_height(px(20.))
+            .line_height(px(22.))
             .text_size(px(14.))
             .child(div().w_full().child(TextElement {
                 input: cx.entity(),

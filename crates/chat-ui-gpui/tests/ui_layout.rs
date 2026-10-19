@@ -11,7 +11,7 @@ use gpui::{Bounds, Entity, Pixels, TestAppContext, VisualTestContext, px, size};
 
 const WINDOW_WIDTH: f32 = 1024.;
 const WINDOW_HEIGHT: f32 = 700.;
-const SIDEBAR_WIDTH: f32 = 240.;
+const SIDEBAR_WIDTH: f32 = 256.;
 
 fn open_window(cx: &mut TestAppContext) -> (Entity<ChatApp>, &mut VisualTestContext) {
     open_window_sized(cx, WINDOW_WIDTH, WINDOW_HEIGHT)
@@ -340,7 +340,7 @@ fn long_status_text_cannot_widen_the_window() {
 
     let header = bounds(cx, "app-header");
     assert_inside(&header, "app-header");
-    assert!((f32::from(header.size.height) - 44.).abs() <= 1.);
+    assert!((f32::from(header.size.height) - 48.).abs() <= 1.);
 
     let main = bounds(cx, "chat-main");
     assert!((f32::from(main.size.width) - (WINDOW_WIDTH - SIDEBAR_WIDTH)).abs() <= 1.);

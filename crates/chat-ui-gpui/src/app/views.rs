@@ -56,13 +56,14 @@ impl TestIdExt for gpui::Stateful<Div> {
     }
 }
 
-/// 侧栏的小节标题。
+/// 侧栏的小节标题：字号压到 11px，靠上留白分组。
 fn section_label(text: &str) -> AnyElement {
     div()
-        .px_5()
-        .pt_3()
-        .pb_1()
-        .text_xs()
+        .px_4()
+        .pt_4()
+        .pb_2()
+        .text_size(px(11.))
+        .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(rgb(theme::FAINT))
         .child(text.to_string())
         .into_any_element()
@@ -70,15 +71,15 @@ fn section_label(text: &str) -> AnyElement {
 
 /// 侧栏内容的统一内边距。
 fn padded(child: impl IntoElement) -> AnyElement {
-    div().px_5().pb_2().child(child).into_any_element()
+    div().px_4().pb_2().child(child).into_any_element()
 }
 
 /// 侧栏提示文案。
 fn hint(text: &str) -> AnyElement {
     div()
-        .px_5()
-        .py_2()
-        .text_xs()
+        .px_4()
+        .py_1()
+        .text_size(px(11.))
         .text_color(rgb(theme::FAINT))
         .child(text.to_string())
         .into_any_element()
@@ -91,29 +92,38 @@ fn button(
     full_width: bool,
     on_click: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    let (fg, bg, hover_bg) = if primary {
-        (theme::ACCENT, theme::ACCENT_SOFT, 0x22345c)
-    } else {
-        (theme::MUTED, theme::SURFACE, theme::HOVER)
-    };
-
-    div()
+    let base = div()
+        .h(px(32.))
         .flex()
         .flex_row()
         .justify_center()
         .items_center()
         .px_3()
-        .py_2()
         .rounded_md()
-        .bg(rgb(bg))
         .text_sm()
-        .text_color(rgb(fg))
+        .font_weight(gpui::FontWeight::MEDIUM)
         .cursor_pointer()
-        .hover(move |style| style.bg(rgb(hover_bg)))
         .on_mouse_up(MouseButton::Left, on_click)
         .when(full_width, |this| this.w_full())
-        .child(text.to_string())
-        .into_any_element()
+        .child(text.to_string());
+
+    if primary {
+        base.bg(rgb(theme::ACCENT))
+            .text_color(rgb(theme::ON_ACCENT))
+            .hover(|style| style.bg(rgb(theme::ACCENT_HOVER)))
+            .into_any_element()
+    } else {
+        base.border_1()
+            .border_color(rgb(theme::BORDER))
+            .text_color(rgb(theme::MUTED))
+            .hover(|style| {
+                style
+                    .bg(rgb(theme::HOVER))
+                    .border_color(rgb(theme::BORDER_STRONG))
+                    .text_color(rgb(theme::TEXT))
+            })
+            .into_any_element()
+    }
 }
 
 /// 文件消息的保存动作。
@@ -146,20 +156,20 @@ fn attachment_body(attachment: &Attachment, save: Option<SaveHandler>) -> AnyEle
         .flex_row()
         .items_center()
         .gap_3()
-        .px_3()
-        .py_2()
-        .rounded_md()
+        .pl_3()
+        .pr_3()
+        .py_3()
+        .rounded_xl()
         .bg(rgb(theme::FIELD))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
         .child(
             div()
                 .flex_none()
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .bg(rgb(theme::ACCENT_SOFT))
-                .text_xs()
-                .text_color(rgb(theme::ACCENT))
-                .child("文件"),
+                .w(px(3.))
+                .h(px(28.))
+                .rounded_full()
+                .bg(rgb(theme::ACCENT)),
         )
         .child(
             div()
@@ -167,6 +177,7 @@ fn attachment_body(attachment: &Attachment, save: Option<SaveHandler>) -> AnyEle
                 .min_w(px(0.))
                 .flex()
                 .flex_col()
+                .gap_1()
                 .child(
                     div()
                         .truncate()
@@ -176,15 +187,16 @@ fn attachment_body(attachment: &Attachment, save: Option<SaveHandler>) -> AnyEle
                 )
                 .child(
                     div()
-                        .text_xs()
+                        .text_size(px(11.))
                         .text_color(rgb(theme::MUTED))
-                        .child(human_size(attachment.size)),
+                        .child(format!("文件 · {}", human_size(attachment.size))),
                 ),
         )
         .child(
             div()
                 .flex_none()
-                .text_xs()
+                .text_size(px(12.))
+                .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(rgb(theme::ACCENT))
                 .child("保存"),
         );
@@ -205,10 +217,13 @@ fn tool_button(
     on_click: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     div()
+        .h(px(28.))
+        .flex()
+        .flex_row()
+        .items_center()
         .px_2()
-        .py_1()
         .rounded_md()
-        .text_xs()
+        .text_size(px(12.))
         .text_color(rgb(theme::MUTED))
         .cursor_pointer()
         .hover(|style| style.bg(rgb(theme::HOVER)).text_color(rgb(theme::TEXT)))
@@ -224,12 +239,12 @@ fn render_line(line: &ChatLine, save: Option<SaveHandler>) -> AnyElement {
     if line.system {
         return div()
             .w_full()
-            .px_5()
+            .px_6()
             .py_2()
             .flex()
             .flex_row()
             .justify_center()
-            .text_xs()
+            .text_size(px(11.))
             .text_color(rgb(theme::FAINT))
             .child(line.text.clone())
             .into_any_element();
@@ -238,26 +253,38 @@ fn render_line(line: &ChatLine, save: Option<SaveHandler>) -> AnyElement {
     let (label, label_color) = if line.mine {
         ("我", theme::FAINT)
     } else {
-        (line.sender.as_str(), theme::MUTED)
+        (line.sender.as_str(), theme::FAINT)
     };
 
     let body = match &line.attachment {
         Some(attachment) => attachment_body(attachment, save),
-        None => div()
-            .max_w(px(520.))
-            .text_sm()
-            .text_color(rgb(theme::TEXT))
-            .child(line.text.clone())
-            .when(line.mine, |this| {
-                this.px_3().py_2().rounded_md().bg(rgb(theme::ACCENT_SOFT))
-            })
-            .into_any_element(),
+        None => {
+            let bubble = div()
+                .max_w(px(560.))
+                .px_4()
+                .py_3()
+                .rounded_xl()
+                .text_size(px(15.))
+                .line_height(px(24.))
+                .child(line.text.clone());
+            if line.mine {
+                bubble
+                    .bg(rgb(theme::ACCENT))
+                    .text_color(rgb(theme::ON_ACCENT))
+                    .into_any_element()
+            } else {
+                bubble
+                    .bg(rgb(theme::FIELD))
+                    .text_color(rgb(theme::TEXT))
+                    .into_any_element()
+            }
+        }
     };
 
     div()
         .w_full()
-        .px_5()
-        .py_2()
+        .px_6()
+        .py_1()
         .flex()
         .flex_col()
         .when_else(
@@ -267,8 +294,9 @@ fn render_line(line: &ChatLine, save: Option<SaveHandler>) -> AnyElement {
         )
         .child(
             div()
+                .px_1()
                 .mb_1()
-                .text_xs()
+                .text_size(px(11.))
                 .text_color(rgb(label_color))
                 .child(label.to_string()),
         )
