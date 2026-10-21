@@ -28,9 +28,8 @@ impl ChatApp {
         let local_empty = local_rooms.is_empty();
         let remote_empty = remote_rooms.is_empty();
 
-        // 侧栏固定 240px、不参与伸缩；只有主体滚动，底部连接区始终留在窗口内。
-        // 房间身份和信任指纹都是长文本，以前放在可滚动的整列里，窗口不够高时会把
-        // 「直接连接 / 新建房间」挤到视口之外。
+        // 侧栏固定 256px、不参与伸缩；只有主体滚动，底部操作区始终留在窗口内。
+        // 连接与公网表单改成从底部按钮展开的面板，底部不再常驻两个输入框。
         div()
             .id("sidebar")
             .test_id("sidebar")
@@ -52,27 +51,11 @@ impl ChatApp {
                     .flex()
                     .flex_col()
                     .pb_3()
+                    .when(self.show_connect_form, |this| {
+                        this.child(self.render_connect_panel(cx))
+                    })
                     .when(self.show_public_form, |this| {
-                        this.child(
-                            div()
-                                .id("public-form")
-                                .test_id("public-form")
-                                .flex()
-                                .flex_col()
-                                .child(section_label("公网服务端"))
-                                .child(padded(self.public_port.clone()))
-                                .child(padded(self.public_cert.clone()))
-                                .child(padded(self.public_key.clone()))
-                                .child(padded(self.public_domain.clone()))
-                                .child(padded(button(
-                                    "启动公网服务",
-                                    true,
-                                    true,
-                                    cx.listener(Self::on_start_public),
-                                )))
-                                .child(hint("证书与私钥留空时使用自签，客户端填指纹"))
-                                .child(hint("填域名后本机自动接入，并作为加入地址展示")),
-                        )
+                        this.child(self.render_public_panel(cx))
                     })
                     .when_some(
                         self.pending_trust.clone(),
@@ -103,6 +86,22 @@ impl ChatApp {
                                 )))
                         },
                     )
+                    // 「我的房间」：托管中或可恢复，放最上面
+                    .child(section_header(
+                        "我的房间",
+                        if self.show_public_form {
+                            "收起"
+                        } else {
+                            "公网服务"
+                        },
+                        cx.listener(Self::on_toggle_public_form),
+                    ))
+                    .when_some(self.hosted.clone(), |this, hosted| {
+                        this.child(identity_card(hosted, identity_open, cx))
+                    })
+                    .when(local_row, |this| {
+                        this.child(local_room_row(local.unwrap_or(0), cx))
+                    })
                     .child(section_label("局域网房间"))
                     .child(
                         div()
@@ -111,7 +110,7 @@ impl ChatApp {
                             .flex_col()
                             .children(local_rooms)
                             .when(local_empty, |this| {
-                                this.child(hint("未发现房间，可手动连接"))
+                                this.child(hint("未发现房间，点底部「手动连接」"))
                             }),
                     )
                     // 公网没有广播：这里列的是连过一次、已存进地址簿的服务器
@@ -124,19 +123,6 @@ impl ChatApp {
                                 .flex_col()
                                 .children(remote_rooms),
                         )
-                    })
-                    // 本机那个房间不在局域网里——它要点了才会被广播出去。
-                    // 已经待在这个房间里（可能是本机另一个实例开着、我们接过去）就别再摆入口了
-                    .when(local_row, |this| {
-                        this.child(section_label("本机房间"))
-                            .child(local_room_row(local.unwrap_or(0), cx))
-                    })
-                    .when_some(self.hosted.clone(), |this, hosted| {
-                        this.child(section_label("我的房间")).child(identity_card(
-                            hosted,
-                            identity_open,
-                            cx,
-                        ))
                     }),
             )
             .child(
@@ -148,16 +134,6 @@ impl ChatApp {
                     .pb_3()
                     .border_t_1()
                     .border_color(rgb(theme::BORDER))
-                    .child(section_label("直接连接"))
-                    .child(padded(self.addr_input.clone()))
-                    .child(padded(self.fingerprint_input.clone()))
-                    .child(padded(button(
-                        "连接",
-                        false,
-                        true,
-                        cx.listener(Self::on_connect_click),
-                    )))
-                    .child(section_label("昵称"))
                     .child(padded(self.nickname.clone()))
                     // 两个入口并排，矮窗口下也不额外占一行高度
                     .child(padded(
@@ -166,16 +142,20 @@ impl ChatApp {
                             .flex_row()
                             .gap_2()
                             .child(div().flex_1().child(button(
+                                if self.show_connect_form {
+                                    "收起连接"
+                                } else {
+                                    "手动连接"
+                                },
+                                false,
+                                true,
+                                cx.listener(Self::on_toggle_connect_form),
+                            )))
+                            .child(div().flex_1().child(button(
                                 "新建房间",
                                 true,
                                 true,
                                 cx.listener(Self::on_new_room),
-                            )))
-                            .child(div().flex_1().child(button(
-                                "公网服务",
-                                false,
-                                true,
-                                cx.listener(Self::on_toggle_public_form),
                             ))),
                     ))
                     .when(local_exists, |this| {
@@ -184,6 +164,138 @@ impl ChatApp {
             )
             .into_any_element()
     }
+
+    /// 手动连接：地址 + 可选指纹。从底部「连接」展开，提交后自动收起。
+    fn render_connect_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("connect-form")
+            .test_id("connect-form")
+            .flex()
+            .flex_col()
+            .bg(rgb(theme::BG))
+            .border_b_1()
+            .border_color(rgb(theme::BORDER))
+            .child(section_label("连接房间"))
+            .child(form_field("地址", self.addr_input.clone()))
+            .child(form_field(
+                "证书指纹（64 位，受信证书留空）",
+                self.fingerprint_input.clone(),
+            ))
+            .child(padded(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(div().flex_1().child(button(
+                        "连接",
+                        true,
+                        true,
+                        cx.listener(Self::on_connect_click),
+                    )))
+                    .child(div().flex_1().child(button(
+                        "取消",
+                        false,
+                        true,
+                        cx.listener(Self::on_toggle_connect_form),
+                    ))),
+            ))
+            .child(hint("自签房间填 64 位 SHA-256；受信证书留空"))
+            .into_any_element()
+    }
+
+    /// 公网托管：端口与证书；从「我的房间」右侧的「公网服务」展开。
+    fn render_public_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("public-form")
+            .test_id("public-form")
+            .flex()
+            .flex_col()
+            .bg(rgb(theme::BG))
+            .border_b_1()
+            .border_color(rgb(theme::BORDER))
+            .child(section_label("公网服务端"))
+            .child(form_field("监听端口", self.public_port.clone()))
+            .child(form_field(
+                "证书链 PEM（留空自签）",
+                self.public_cert.clone(),
+            ))
+            .child(form_field("私钥 PEM（留空自签）", self.public_key.clone()))
+            .child(form_field(
+                "域名（可选，用于自动加入）",
+                self.public_domain.clone(),
+            ))
+            .child(padded(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(div().flex_1().child(button(
+                        "启动公网服务",
+                        true,
+                        true,
+                        cx.listener(Self::on_start_public),
+                    )))
+                    .child(div().flex_1().child(button(
+                        "取消",
+                        false,
+                        true,
+                        cx.listener(Self::on_toggle_public_form),
+                    ))),
+            ))
+            .child(hint("证书与私钥留空时使用自签，客户端填指纹"))
+            .into_any_element()
+    }
+}
+
+/// 表单字段：小标题在上，输入框在下。
+fn form_field(label: &str, input: impl IntoElement) -> AnyElement {
+    div()
+        .px_4()
+        .pb_2()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .text_size(px(10.))
+                .text_color(rgb(theme::FAINT))
+                .child(label.to_string()),
+        )
+        .child(input)
+        .into_any_element()
+}
+
+/// 带右侧入口的小节标题（例如「我的房间」+「公网服务」）。
+fn section_header(
+    label: &str,
+    action: &str,
+    on_click: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .px_4()
+        .pt_3()
+        .pb_2()
+        .child(
+            div()
+                .text_size(px(11.))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(rgb(theme::FAINT))
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(theme::ACCENT))
+                .cursor_pointer()
+                .hover(|style| style.text_color(rgb(theme::ACCENT_HOVER)))
+                .on_mouse_up(MouseButton::Left, on_click)
+                .child(action.to_string()),
+        )
+        .into_any_element()
 }
 
 /// 本机房间摘要：名字 + 房间短标识 + 一个可用地址，完整信息按需展开。
@@ -388,7 +500,7 @@ fn local_room_row(messages: u64, cx: &mut Context<ChatApp>) -> AnyElement {
         .flex()
         .flex_row()
         .items_center()
-        .h(px(40.))
+        .h(px(36.))
         .pl_4()
         .pr_4()
         .cursor_pointer()
@@ -406,7 +518,7 @@ fn local_room_row(messages: u64, cx: &mut Context<ChatApp>) -> AnyElement {
                 .flex_1()
                 .text_sm()
                 .text_color(rgb(theme::TEXT))
-                .child("我的房间"),
+                .child("继续上次的房间"),
         )
         .child(
             div()
@@ -443,7 +555,7 @@ fn room_row(
         .flex()
         .flex_row()
         .items_center()
-        .h(px(40.))
+        .h(px(36.))
         .pl_4()
         .pr_4()
         .cursor_pointer()

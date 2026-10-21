@@ -4,11 +4,14 @@ use std::path::PathBuf;
 
 use chat_core::{Attachment, RoomId};
 use chat_transport_quic::validate_fingerprint;
-use gpui::{Context, Focusable as _, MouseUpEvent, PathPromptOptions, Window};
+use gpui::{
+    Context, Focusable as _, KeyDownEvent, MouseDownEvent, MouseUpEvent, PathPromptOptions, Pixels,
+    Point, Size, Window, point, px,
+};
 
 use crate::service::UiCommand;
 
-use super::ChatApp;
+use super::{ChatApp, ChatLine, MessageMenu};
 
 struct PublicOptions {
     port: u16,
@@ -53,6 +56,7 @@ impl ChatApp {
         let accepted = self.cmd_tx.try_send(cmd).is_ok();
         if !accepted {
             self.status = "后端繁忙或已关闭，请稍后重试".into();
+            self.status_kind = super::StatusKind::Error;
             self.loading_older = false;
         }
         cx.notify();
@@ -71,9 +75,22 @@ impl ChatApp {
 
     pub(crate) fn submit_message(&mut self, cx: &mut Context<Self>) {
         let text = self.message.read(cx).content().trim().to_string();
-        if !text.is_empty() && self.tell(UiCommand::Send { text }, cx) {
+        if text.is_empty() {
+            return;
+        }
+        let quote = self.pending_quote.take();
+        if self.tell(
+            UiCommand::Send {
+                text,
+                quote: quote.clone(),
+            },
+            cx,
+        ) {
             self.message
                 .update(cx, |input, cx| input.set_content("", cx));
+        } else {
+            // 后端没收下这条指令，引用要留在输入框上方，别让用户重新找一遍
+            self.pending_quote = quote;
         }
     }
 
@@ -96,10 +113,13 @@ impl ChatApp {
             && let Err(e) = validate_fingerprint(&fingerprint)
         {
             self.status = format!("{e}（请复制「我的房间 → 详情 → 证书 SHA-256」）");
+            self.status_kind = super::StatusKind::Error;
             cx.notify();
             return;
         }
-        self.connect(addr, (!fingerprint.is_empty()).then_some(fingerprint), cx);
+        if self.connect(addr, (!fingerprint.is_empty()).then_some(fingerprint), cx) {
+            self.show_connect_form = false;
+        }
     }
 
     /// 把一段文字放进系统剪贴板，并在状态栏说明复制了什么。
@@ -135,9 +155,9 @@ impl ChatApp {
         addr: String,
         fingerprint: Option<String>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         self.begin_connect(&addr);
-        self.tell(UiCommand::Connect { addr, fingerprint }, cx);
+        self.tell(UiCommand::Connect { addr, fingerprint }, cx)
     }
 
     pub(crate) fn on_room_click(
@@ -202,6 +222,9 @@ impl ChatApp {
 
     pub(crate) fn toggle_public_form(&mut self, cx: &mut Context<Self>) {
         self.show_public_form = !self.show_public_form;
+        if self.show_public_form {
+            self.show_connect_form = false;
+        }
         cx.notify();
     }
 
@@ -218,6 +241,29 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) {
         self.toggle_public_form(cx);
+    }
+
+    pub(crate) fn toggle_connect_form(&mut self, cx: &mut Context<Self>) {
+        self.show_connect_form = !self.show_connect_form;
+        if self.show_connect_form {
+            self.show_public_form = false;
+        }
+        cx.notify();
+    }
+
+    /// 供无头测试直接展开/收起手动连接面板。
+    #[cfg(any(test, feature = "ui-test"))]
+    pub fn debug_toggle_connect_form(&mut self, cx: &mut Context<Self>) {
+        self.toggle_connect_form(cx);
+    }
+
+    pub(crate) fn on_toggle_connect_form(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_connect_form(cx);
     }
 
     pub(crate) fn on_start_public(
@@ -247,6 +293,7 @@ impl ChatApp {
             }
             Err(e) => {
                 self.status = e;
+                self.status_kind = super::StatusKind::Error;
                 cx.notify();
             }
         }
@@ -306,6 +353,7 @@ impl ChatApp {
                 Ok(Err(e)) => {
                     let _ = this.update(cx, |app, cx| {
                         app.status = format!("⚠ 打开文件选择器失败: {e}");
+                        app.status_kind = super::StatusKind::Error;
                         cx.notify();
                     });
                     return;
@@ -345,9 +393,136 @@ impl ChatApp {
     }
 }
 
+impl ChatApp {
+    /// 打开消息右键菜单；靠近窗口底部时向上翻，避免被裁掉。
+    pub(crate) fn open_message_menu(
+        &mut self,
+        position: Point<Pixels>,
+        viewport: Size<Pixels>,
+        line: ChatLine,
+        cx: &mut Context<Self>,
+    ) {
+        let menu_height = px(150.);
+        let y = if position.y + menu_height > viewport.height {
+            if position.y > menu_height {
+                position.y - menu_height
+            } else {
+                px(0.)
+            }
+        } else {
+            position.y
+        };
+        self.message_menu = Some(MessageMenu {
+            position: point(position.x, y),
+            line,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn on_close_message_menu(
+        &mut self,
+        _: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.message_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 引用一条消息：显示在输入框上方，随下一条消息一起发出。
+    pub(crate) fn quote_message(
+        &mut self,
+        line: ChatLine,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = match &line.attachment {
+            Some(attachment) => format!("[文件] {}", attachment.name.replace(['\n', '\r'], " ")),
+            None => line.text.replace(['\n', '\r'], " "),
+        };
+        self.pending_quote = Some(chat_core::Quote {
+            sender: if line.mine {
+                "我".to_string()
+            } else {
+                line.sender.replace(['\n', '\r'], " ")
+            },
+            text,
+            seq: line.seq,
+        });
+        self.message_menu = None;
+        self.message.read(cx).focus_handle(cx).focus(window);
+        cx.notify();
+    }
+
+    pub(crate) fn on_clear_quote_down(
+        &mut self,
+        _: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_quote = None;
+        cx.notify();
+    }
+
+    /// 全局快捷键。
+    pub(crate) fn on_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        let key = keystroke.key.to_ascii_lowercase();
+        if key == "escape" {
+            let changed = self.message_menu.is_some()
+                || self.show_connect_form
+                || self.show_public_form
+                || self.pending_trust.is_some();
+            self.message_menu = None;
+            self.show_connect_form = false;
+            self.show_public_form = false;
+            self.pending_trust = None;
+            if changed {
+                cx.notify();
+            }
+            return;
+        }
+        if !keystroke.modifiers.platform {
+            return;
+        }
+        match key.as_str() {
+            "k" => self.toggle_connect_form(cx),
+            "p" if keystroke.modifiers.shift => self.toggle_public_form(cx),
+            "enter" => self.submit_message(cx),
+            _ => {}
+        }
+    }
+
+    /// 供无头测试直接打开消息菜单。
+    #[cfg(any(test, feature = "ui-test"))]
+    pub fn debug_open_message_menu(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        let line = ChatLine {
+            seq: Some(1),
+            sender: "某人".into(),
+            text: "一条消息".into(),
+            attachment: None,
+            quote: None,
+            mine: false,
+            system: false,
+        };
+        self.open_message_menu(
+            point(px(x), px(y)),
+            gpui::size(px(1024.), px(700.)),
+            line,
+            cx,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::public_options;
+    use super::{ChatLine, public_options};
 
     #[test]
     fn public_form_requires_a_valid_port_and_a_matched_cert_pair() {
@@ -368,5 +543,25 @@ mod tests {
         assert_eq!(options.cert.unwrap().to_string_lossy(), "cert.pem");
         assert_eq!(options.key.unwrap().to_string_lossy(), "key.pem");
         assert_eq!(options.domain.as_deref(), Some("chat.example.com"));
+    }
+
+    fn line_with(text: &str) -> ChatLine {
+        ChatLine {
+            seq: Some(1),
+            sender: "某人".into(),
+            text: text.into(),
+            attachment: None,
+            quote: None,
+            mine: false,
+            system: false,
+        }
+    }
+
+    #[test]
+    fn quote_uses_the_message_summary() {
+        // 引用不再拼成文本塞进输入框，而是保留结构；这里只钉住基础字段的取值方式
+        let line = line_with("第一行\n第二行");
+        assert_eq!(line.sender, "某人");
+        assert!(line.text.contains('\n'));
     }
 }

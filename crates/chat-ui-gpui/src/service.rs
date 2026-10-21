@@ -26,7 +26,7 @@ use std::time::Duration;
 use chat_core::Client;
 use chat_core::{Attachment, AttachmentId};
 use chat_core::{ChatError, Connection, ConnectionAcceptor};
-use chat_core::{LobbyInfo, Message, RoomId, Seq, ServerEvent, UserId};
+use chat_core::{LobbyInfo, Message, Quote, RoomId, Seq, ServerEvent, UserId};
 use chat_discovery::{RoomAnnouncer, RoomBrowser};
 use chat_server::{Acceptor, Server};
 use chat_transport_quic::{
@@ -130,6 +130,7 @@ pub struct HistoryMessage {
     pub sender: String,
     pub text: String,
     pub attachment: Option<Attachment>,
+    pub quote: Option<Quote>,
 }
 
 /// 公网托管的接入信息：客户端据此决定填域名还是填指纹。
@@ -203,6 +204,7 @@ pub enum UiEvent {
         sender: String,
         text: String,
         attachment: Option<Attachment>,
+        quote: Option<Quote>,
     },
     /// 取回的一页历史（比当前会话更早），界面应插到列表最前。
     History {
@@ -275,6 +277,8 @@ pub enum UiCommand {
     Leave,
     Send {
         text: String,
+        /// 当前输入框上方的引用；没有引用为 `None`。
+        quote: Option<Quote>,
     },
     /// 发送一个本地文件。
     SendFile {
@@ -913,9 +917,9 @@ async fn run(
                 }
             }
 
-            UiCommand::Send { text } => {
+            UiCommand::Send { text, quote } => {
                 if let Some(session) = &active {
-                    send_session(session, SessionCmd::Send(text), &events).await;
+                    send_session(session, SessionCmd::Send { text, quote }, &events).await;
                 }
             }
 

@@ -9,7 +9,7 @@ use crate::service::UiEvent;
 
 use chat_core::Attachment;
 
-use super::{ChatApp, ChatLine, DiscoveredRoom, HostedRoom, RoomSource, RoomView};
+use super::{ChatApp, ChatLine, DiscoveredRoom, HostedRoom, RoomSource, RoomView, StatusKind};
 
 impl ChatApp {
     pub(crate) fn begin_loading_older(&mut self) -> bool {
@@ -26,9 +26,16 @@ impl ChatApp {
 
     pub(crate) fn begin_connect(&mut self, addr: &str) {
         self.status = format!("正在连接 {addr} …");
+        self.status_kind = StatusKind::Info;
     }
 
     pub(crate) fn apply(&mut self, event: UiEvent) {
+        // 先说语气，再改文案：错误红、重连橙、其余灰
+        self.status_kind = match &event {
+            UiEvent::Error(_) => StatusKind::Error,
+            UiEvent::Reconnecting(_) => StatusKind::Warn,
+            _ => StatusKind::Info,
+        };
         match event {
             UiEvent::Status(text) => self.status = text,
             UiEvent::TrustRequired {
@@ -163,9 +170,11 @@ impl ChatApp {
                 sender,
                 text,
                 attachment,
+                quote,
             } => {
                 if self.showing(room).is_some() {
-                    let line = chat_line(seq, sender_id, sender, text, attachment, self.my_id);
+                    let line =
+                        chat_line(seq, sender_id, sender, text, attachment, quote, self.my_id);
                     self.push_line(line);
                 }
             }
@@ -182,7 +191,17 @@ impl ChatApp {
                 let my_id = self.my_id;
                 let lines = messages
                     .into_iter()
-                    .map(|m| chat_line(m.seq, m.sender_id, m.sender, m.text, m.attachment, my_id))
+                    .map(|m| {
+                        chat_line(
+                            m.seq,
+                            m.sender_id,
+                            m.sender,
+                            m.text,
+                            m.attachment,
+                            m.quote,
+                            my_id,
+                        )
+                    })
                     .collect();
                 // 比当前会话更早，插到最前才是正确的时间顺序
                 self.prepend_lines(lines);
@@ -194,7 +213,17 @@ impl ChatApp {
                 let my_id = self.my_id;
                 let lines = messages
                     .into_iter()
-                    .map(|m| chat_line(m.seq, m.sender_id, m.sender, m.text, m.attachment, my_id))
+                    .map(|m| {
+                        chat_line(
+                            m.seq,
+                            m.sender_id,
+                            m.sender,
+                            m.text,
+                            m.attachment,
+                            m.quote,
+                            my_id,
+                        )
+                    })
                     .collect();
                 self.push_lines(lines);
             }
@@ -370,6 +399,7 @@ impl ChatApp {
             sender: "系统".into(),
             text,
             attachment: None,
+            quote: None,
             mine: false,
             system: true,
         });
@@ -382,6 +412,7 @@ fn chat_line(
     sender: String,
     text: String,
     attachment: Option<Attachment>,
+    quote: Option<chat_core::Quote>,
     mine: Option<UserId>,
 ) -> ChatLine {
     ChatLine {
@@ -389,6 +420,7 @@ fn chat_line(
         sender,
         text,
         attachment,
+        quote,
         mine: mine == Some(sender_id),
         system: false,
     }

@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use crate::proto::{Attachment, AttachmentId, ClientRequest, Profile, RoomId, Seq, ServerEvent};
+use crate::proto::{
+    Attachment, AttachmentId, ClientRequest, Profile, Quote, RoomId, Seq, ServerEvent,
+};
 use crate::{Connection, Result};
 
 #[derive(Clone)]
@@ -47,11 +49,23 @@ impl Client {
         client_msg_id: Uuid,
         text: impl Into<String>,
     ) -> Result<()> {
+        self.send_text_quoted(room, client_msg_id, text, None).await
+    }
+
+    /// 发送文本，并可附带对被引用消息的摘要。
+    pub async fn send_text_quoted(
+        &self,
+        room: RoomId,
+        client_msg_id: Uuid,
+        text: impl Into<String>,
+        quote: Option<Quote>,
+    ) -> Result<()> {
         self.conn
             .request(ClientRequest::Send {
                 room,
                 client_msg_id,
                 text: text.into(),
+                quote,
             })
             .await
     }

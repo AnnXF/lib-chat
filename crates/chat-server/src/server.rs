@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use chat_core::{
     sha256_hex, validate_attachment, Attachment, AttachmentId, ChatError, ClientRequest, DeviceId,
-    ErrorCode, LobbyInfo, MessageKind, MessageStore, NewMessage, Result, RoomId, ServerEvent,
-    UserId, EVENT_QUEUE_CAPACITY,
+    ErrorCode, LobbyInfo, MessageKind, MessageStore, NewMessage, Quote, Result, RoomId,
+    ServerEvent, UserId, EVENT_QUEUE_CAPACITY,
 };
 use tokio::sync::{mpsc, Mutex, RwLock};
 
@@ -25,6 +25,25 @@ fn sanitize_name(raw: &str, device: DeviceId) -> String {
         format!("用户{}", &device.0.to_string()[..4])
     } else {
         trimmed.chars().take(24).collect()
+    }
+}
+
+/// 引用只保留展示所需的信息，超长部分截断。
+fn sanitize_quote(quote: Quote) -> Quote {
+    Quote {
+        sender: quote
+            .sender
+            .replace(['\n', '\r'], " ")
+            .chars()
+            .take(64)
+            .collect(),
+        text: quote
+            .text
+            .replace(['\n', '\r'], " ")
+            .chars()
+            .take(200)
+            .collect(),
+        seq: quote.seq,
     }
 }
 
@@ -326,6 +345,7 @@ impl Server {
                 room,
                 client_msg_id,
                 text,
+                quote,
             } => {
                 if room != self.room {
                     self.error_to(conn, ErrorCode::RoomMismatch, "房间不存在")
@@ -343,6 +363,7 @@ impl Server {
                         .await;
                     return Ok(());
                 }
+                let quote = quote.map(sanitize_quote);
                 let _publish = self.publish.lock().await;
                 match self
                     .store
@@ -355,6 +376,7 @@ impl Server {
                             kind: MessageKind::Text,
                             text: text.to_string(),
                             attachment: None,
+                            quote,
                         },
                     )
                     .await
@@ -427,6 +449,7 @@ impl Server {
                             kind: MessageKind::File,
                             text: String::new(),
                             attachment: Some(attachment),
+                            quote: None,
                         },
                     )
                     .await

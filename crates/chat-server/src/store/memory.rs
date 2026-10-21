@@ -33,7 +33,7 @@ impl MessageStore for InMemoryStore {
         let log = guard.entry(room).or_default();
         if let Some(&index) = log.ids.get(&msg.client_msg_id) {
             let stored = &log.messages[index];
-            if stored.text != msg.text || stored.kind != msg.kind {
+            if stored.text != msg.text || stored.kind != msg.kind || stored.quote != msg.quote {
                 return Err(ChatError::Protocol("消息标识与原始内容不一致".into()));
             }
             return Ok(AppendResult {
@@ -51,6 +51,7 @@ impl MessageStore for InMemoryStore {
             kind: msg.kind,
             text: msg.text,
             attachment: msg.attachment.clone(),
+            quote: msg.quote.clone(),
             server_ts_ms: now_ms(),
         };
         if let Some(attachment) = &stored.attachment {

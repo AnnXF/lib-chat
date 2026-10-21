@@ -108,6 +108,7 @@ pub struct NewMessage {
     pub kind: MessageKind,
     pub text: String,
     pub attachment: Option<Attachment>,
+    pub quote: Option<Quote>,
 }
 
 /// 消息持久化端口。服务端负责分配会话内单调序号。

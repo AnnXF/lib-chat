@@ -390,6 +390,7 @@ fn file_message_renders_inside_the_window() {
                 mime: "application/pdf".into(),
                 sha256: "ab".repeat(32),
             }),
+            quote: None,
         },
     );
 
@@ -572,4 +573,178 @@ fn public_identity_offers_copy_buttons_inside_the_sidebar() {
 
     let footer = bounds(cx, "sidebar-footer");
     assert_inside(&footer, "sidebar-footer");
+}
+
+/// 手动连接面板：展开后位于侧栏主体内，底部操作区仍贴底。
+#[test]
+fn connect_form_fits_inside_the_sidebar() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| app.debug_toggle_connect_form(cx));
+    });
+    cx.run_until_parked();
+
+    let form = bounds(cx, "connect-form");
+    assert_inside(&form, "connect-form");
+    assert!(
+        f32::from(form.size.width) <= SIDEBAR_WIDTH + 0.5,
+        "连接面板把侧栏撑宽了: {}",
+        f32::from(form.size.width)
+    );
+
+    let footer = bounds(cx, "sidebar-footer");
+    assert_inside(&footer, "sidebar-footer");
+    let sidebar = bounds(cx, "sidebar");
+    assert!((bottom(&footer) - bottom(&sidebar)).abs() <= 1.);
+
+    let main = bounds(cx, "chat-main");
+    assert_inside(&main, "chat-main");
+}
+
+/// 矮窗口 + 手动连接面板：主体滚动，底部操作区仍完整可见。
+#[test]
+fn short_window_with_connect_form_keeps_the_footer_visible() {
+    const HEIGHT: f32 = 420.;
+
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window_sized(&mut app_cx, WINDOW_WIDTH, HEIGHT);
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| app.debug_toggle_connect_form(cx));
+    });
+    cx.run_until_parked();
+
+    let footer = bounds(cx, "sidebar-footer");
+    assert!(
+        bottom(&footer) <= HEIGHT + 0.5,
+        "底部操作区被挤出窗口: {} > {HEIGHT}",
+        bottom(&footer)
+    );
+    let body = bounds(cx, "sidebar-body");
+    assert_inside(&body, "sidebar-body");
+    assert!(f32::from(body.size.height) > 0.);
+}
+
+/// 消息右键菜单：靠近窗口底部时向上翻，完整落在窗口内。
+#[test]
+fn message_menu_stays_inside_the_window() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| app.debug_open_message_menu(320., 620., cx));
+    });
+    cx.run_until_parked();
+
+    let menu = bounds(cx, "message-menu");
+    assert_inside(&menu, "message-menu");
+    assert!(
+        f32::from(menu.size.height) >= 64.,
+        "菜单至少应容纳两个基础项: {}",
+        f32::from(menu.size.height)
+    );
+}
+
+/// 右键菜单在窗口上方时贴着点击位置出现，不反向跳。
+#[test]
+fn message_menu_opens_near_the_pointer() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| app.debug_open_message_menu(200., 100., cx));
+    });
+    cx.run_until_parked();
+
+    let menu = bounds(cx, "message-menu");
+    assert!((f32::from(menu.origin.x) - 200.).abs() <= 1.);
+    assert!((f32::from(menu.origin.y) - 100.).abs() <= 1.);
+}
+
+/// 引用消息后输入框必须是单行：GPUI 的单行控件遇到换行会直接 panic。
+#[test]
+fn quoting_a_message_shows_a_quote_bar() {
+    use gpui::{Modifiers, point};
+
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| app.debug_open_message_menu(200., 100., cx));
+    });
+    cx.run_until_parked();
+
+    // 菜单内边距 4px、每项 32px；第二项是「引用」
+    cx.simulate_click(
+        point(px(260.), px(100. + 4. + 32. + 16.)),
+        Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    let bar = bounds(cx, "quote-bar");
+    assert_inside(&bar, "quote-bar");
+    let content = cx.update(|_window, cx| view.read(cx).debug_message_input(cx));
+    assert!(content.is_empty(), "引用不应再往输入框里塞文本: {content}");
+
+    let clear = bounds(cx, "quote-clear");
+    let x = f32::from(clear.origin.x) + f32::from(clear.size.width) / 2.;
+    let y = f32::from(clear.origin.y) + f32::from(clear.size.height) / 2.;
+    cx.simulate_click(point(px(x), px(y)), Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("quote-bar").is_none(),
+        "点 × 后引用条应消失"
+    );
+}
+
+/// 带引用的消息在气泡里显示引用块，正文仍在，且不压输入条。
+#[test]
+fn quoted_message_renders_a_quote_block() {
+    use chat_core::Quote;
+
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    let room = RoomId::new();
+
+    apply(
+        &view,
+        cx,
+        UiEvent::Lobby {
+            room,
+            name: "引用房间".into(),
+            addr: "192.168.1.5:52000".into(),
+            online: 1,
+        },
+    );
+    apply(
+        &view,
+        cx,
+        UiEvent::Joined {
+            room,
+            you: UserId::new(),
+            online: 1,
+        },
+    );
+    apply(
+        &view,
+        cx,
+        UiEvent::Message {
+            room,
+            seq: 1,
+            sender_id: UserId::new(),
+            sender: "Bob".into(),
+            text: "这是回复".into(),
+            attachment: None,
+            quote: Some(Quote {
+                sender: "Alice".into(),
+                text: "这是被引用的原文".into(),
+                seq: Some(0),
+            }),
+        },
+    );
+
+    let block = bounds(cx, "message-quote");
+    assert_inside(&block, "message-quote");
+    let composer = bounds(cx, "composer");
+    assert!(
+        bottom(&block) <= f32::from(composer.origin.y) + 0.5,
+        "引用块压到了输入条"
+    );
 }

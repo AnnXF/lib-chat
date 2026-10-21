@@ -474,6 +474,7 @@ async fn duplicate_message_replies_to_sender_without_broadcast_or_new_seq() {
             room,
             client_msg_id: id,
             text: "篡改".into(),
+            quote: None,
         })
         .await
         .unwrap();
@@ -657,6 +658,68 @@ async fn duplicate_file_message_is_stored_once() {
     client.history(room, None, 10).await.unwrap();
     match wait_for(&client, |e| matches!(e, ServerEvent::History { .. })).await {
         ServerEvent::History { messages, .. } => assert_eq!(messages.len(), 1),
+        _ => unreachable!(),
+    }
+}
+
+/// 引用随消息一起广播，并在历史里保留。
+#[tokio::test]
+async fn quoted_message_is_broadcast_and_kept_in_history() {
+    let server = Server::new("引用房间");
+    let room = server.room();
+    let a = Client::new(server.connect(DeviceId::new()).await);
+    let b = Client::new(server.connect(DeviceId::new()).await);
+    a.join(room, "Alice").await.unwrap();
+    wait_for(&a, |e| matches!(e, ServerEvent::Joined { .. })).await;
+    b.join(room, "Bob").await.unwrap();
+    wait_for(&b, |e| matches!(e, ServerEvent::Joined { .. })).await;
+
+    a.send_text(room, "原始消息").await.unwrap();
+    // 发送者自己也会收到广播，先消费掉，避免把它当成引用回复
+    wait_for(
+        &a,
+        |e| matches!(e, ServerEvent::Message { message } if message.text == "原始消息"),
+    )
+    .await;
+    let original = match wait_for(&b, |e| matches!(e, ServerEvent::Message { .. })).await {
+        ServerEvent::Message { message } => message,
+        _ => unreachable!(),
+    };
+
+    let quote = chat_core::Quote {
+        sender: original.sender_name.clone(),
+        text: original.text.clone(),
+        seq: Some(original.seq),
+    };
+    b.send_text_quoted(room, uuid::Uuid::new_v4(), "回复引用", Some(quote.clone()))
+        .await
+        .unwrap();
+
+    match wait_for(
+        &a,
+        |e| matches!(e, ServerEvent::Message { message } if message.text == "回复引用"),
+    )
+    .await
+    {
+        ServerEvent::Message { message } => {
+            assert_eq!(message.text, "回复引用");
+            assert_eq!(message.quote, Some(quote));
+        }
+        _ => unreachable!(),
+    }
+
+    a.history(room, None, 10).await.unwrap();
+    match wait_for(&a, |e| matches!(e, ServerEvent::History { .. })).await {
+        ServerEvent::History { messages, .. } => {
+            let quoted = messages
+                .iter()
+                .find(|message| message.text == "回复引用")
+                .expect("历史里应有引用消息");
+            assert_eq!(
+                quoted.quote.as_ref().map(|quote| quote.text.as_str()),
+                Some("原始消息")
+            );
+        }
         _ => unreachable!(),
     }
 }

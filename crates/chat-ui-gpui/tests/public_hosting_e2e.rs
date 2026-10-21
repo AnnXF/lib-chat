@@ -121,6 +121,7 @@ fn hosts_a_self_signed_public_room_and_accepts_a_second_client() {
     guest
         .send(UiCommand::Send {
             text: "从第二个客户端发来".into(),
+            quote: None,
         })
         .unwrap();
     match recv_until(

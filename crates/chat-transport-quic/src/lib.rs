@@ -113,6 +113,8 @@ enum ClientFrame {
     Request(ClientRequest),
 }
 
+// 帧是逐条序列化后立刻写出，不会成批囤积；装箱只多一次分配。
+#[allow(clippy::large_enum_variant)]
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum ServerFrame {

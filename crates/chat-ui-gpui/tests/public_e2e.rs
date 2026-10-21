@@ -164,6 +164,7 @@ fn connects_to_a_public_server_without_a_fingerprint() {
 
     cmds.send(UiCommand::Send {
         text: "公网你好".into(),
+        quote: None,
     })
     .unwrap();
     match recv_until(&events, |e| matches!(e, UiEvent::Message { .. })) {
@@ -260,6 +261,7 @@ fn reconnects_to_a_public_server_without_leaving_the_room() {
 
     cmds.send(UiCommand::Send {
         text: "掉线之后还能说话".into(),
+        quote: None,
     })
     .unwrap();
     match recv_until_keeping_room(&events, |e| matches!(e, UiEvent::Message { .. })) {

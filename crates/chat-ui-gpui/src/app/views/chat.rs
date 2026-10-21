@@ -9,8 +9,8 @@ impl ChatApp {
         let subtitle = match &self.room {
             Some(room) => format!("{}    在线 {} 人", room.addr, room.online),
             None => self.hosted.as_ref().map_or_else(
-                || "从左侧选择房间，或创建自己的房间".to_string(),
-                |hosted| format!("本机已创建「{}」，加入后可聊天", hosted.name),
+                || "选择左侧房间，或新建一个".to_string(),
+                |hosted| format!("「{}」已启动，用「连接」加入", hosted.name),
             ),
         };
 
@@ -36,12 +36,36 @@ impl ChatApp {
                     });
                 }) as SaveHandler
             });
-            render_line(&line, save)
+            let element = render_line(&line, save);
+
+            // 右键打开消息菜单；坐标是窗口坐标，菜单在主区上层绝对定位
+            let menu_line = line.clone();
+            let entity = this.clone();
+            div()
+                .w_full()
+                .on_mouse_up(
+                    MouseButton::Right,
+                    move |event: &MouseUpEvent, window: &mut Window, cx: &mut App| {
+                        let viewport = window.viewport_size();
+                        let position = event.position;
+                        let line = menu_line.clone();
+                        entity.update(cx, |app, cx| {
+                            app.open_message_menu(position, viewport, line, cx);
+                        });
+                    },
+                )
+                .child(element)
+                .into_any_element()
         })
         .flex_1();
 
         // 未进入房间时给一个安静的引导，而不是一大片空白
         let body = if self.room.is_none() {
+            let hint = if self.hosted.is_some() {
+                "服务已启动，点底部「手动连接」加入"
+            } else {
+                "在左侧选择房间，或点底部「新建房间」"
+            };
             div()
                 .flex_1()
                 .flex()
@@ -59,7 +83,7 @@ impl ChatApp {
                     div()
                         .text_size(px(12.))
                         .text_color(rgb(theme::FAINT))
-                        .child("从左侧选择一个房间，或创建自己的房间"),
+                        .child(hint),
                 )
                 .into_any_element()
         } else {
@@ -164,6 +188,10 @@ impl ChatApp {
                                     .child(button("发送", true, false, cx.listener(Self::on_send))),
                             ),
                     )
+                    // 引用条在输入框上方：发送后自动消失，点 × 可取消
+                    .when_some(self.pending_quote.clone(), |this, quote| {
+                        this.child(quote_bar(quote, cx))
+                    })
                     // 输入区在下：大块留白，后续多行输入、@ 提及都在这里长高
                     .child(
                         div()
@@ -188,4 +216,50 @@ impl ChatApp {
             )
             .into_any_element()
     }
+}
+
+/// 输入框上方的引用摘要：左侧强调竖线 + 发送者与正文 + 右侧清除。
+fn quote_bar(quote: chat_core::Quote, cx: &mut Context<ChatApp>) -> AnyElement {
+    div()
+        .id("quote-bar")
+        .test_id("quote-bar")
+        .w_full()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .rounded_lg()
+        .bg(rgb(theme::FIELD))
+        .border_l_2()
+        .border_color(rgb(theme::ACCENT))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .truncate()
+                .text_size(px(12.))
+                .text_color(rgb(theme::MUTED))
+                .child(format!("{}：{}", quote.sender, quote.text)),
+        )
+        .child(
+            div()
+                .id("quote-clear")
+                .test_id("quote-clear")
+                .flex_none()
+                .w(px(20.))
+                .h(px(20.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .text_size(px(12.))
+                .text_color(rgb(theme::FAINT))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(theme::HOVER)).text_color(rgb(theme::TEXT)))
+                .on_mouse_down(MouseButton::Left, cx.listener(ChatApp::on_clear_quote_down))
+                .child("×"),
+        )
+        .into_any_element()
 }

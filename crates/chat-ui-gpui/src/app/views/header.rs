@@ -32,11 +32,10 @@ impl ChatApp {
                     .truncate()
                     .text_right()
                     .text_size(px(12.))
-                    // 出错时用警示色，正常状态保持低对比
-                    .text_color(rgb(if self.status.starts_with('⚠') {
-                        theme::DANGER
-                    } else {
-                        theme::MUTED
+                    .text_color(rgb(match self.status_kind {
+                        StatusKind::Error => theme::DANGER,
+                        StatusKind::Warn => theme::WARN,
+                        StatusKind::Info => theme::MUTED,
                     }))
                     .child(self.status.clone()),
             )

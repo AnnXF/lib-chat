@@ -11,15 +11,15 @@ mod header;
 mod sidebar;
 
 use gpui::{
-    AnyElement, App, Context, Div, MouseButton, MouseUpEvent, Window, div, list, prelude::*, px,
-    rgb,
+    AnyElement, App, Context, Div, MouseButton, MouseDownEvent, MouseUpEvent, Window, div, list,
+    prelude::*, px, rgb, rgba,
 };
 
 use crate::app::theme;
 
 use chat_core::Attachment;
 
-use super::{ChatApp, ChatLine, DiscoveredRoom, HostedRoom, RoomSource};
+use super::{ChatApp, ChatLine, DiscoveredRoom, HostedRoom, MessageMenu, RoomSource, StatusKind};
 
 /// 给关键布局节点挂上固定标识，供无头 UI 测试查询边界。
 ///
@@ -60,7 +60,7 @@ impl TestIdExt for gpui::Stateful<Div> {
 fn section_label(text: &str) -> AnyElement {
     div()
         .px_4()
-        .pt_4()
+        .pt_3()
         .pb_2()
         .text_size(px(11.))
         .font_weight(gpui::FontWeight::MEDIUM)
@@ -259,6 +259,30 @@ fn render_line(line: &ChatLine, save: Option<SaveHandler>) -> AnyElement {
     let body = match &line.attachment {
         Some(attachment) => attachment_body(attachment, save),
         None => {
+            let mut content = div().flex().flex_col().gap_1();
+            if let Some(quote) = &line.quote {
+                content = content.child(
+                    div()
+                        .test_id("message-quote")
+                        .border_l_2()
+                        .border_color(if line.mine {
+                            rgba(0xffffff88)
+                        } else {
+                            rgb(theme::BORDER_STRONG)
+                        })
+                        .pl_2()
+                        .text_size(px(12.))
+                        .line_height(px(18.))
+                        .text_color(if line.mine {
+                            rgba(0xffffffcc)
+                        } else {
+                            rgb(theme::MUTED)
+                        })
+                        .child(format!("{}：{}", quote.sender, quote.text)),
+                );
+            }
+            content = content.child(div().child(line.text.clone()));
+
             let bubble = div()
                 .max_w(px(560.))
                 .px_4()
@@ -266,7 +290,7 @@ fn render_line(line: &ChatLine, save: Option<SaveHandler>) -> AnyElement {
                 .rounded_xl()
                 .text_size(px(15.))
                 .line_height(px(24.))
-                .child(line.text.clone());
+                .child(content);
             if line.mine {
                 bubble
                     .bg(rgb(theme::ACCENT))
@@ -304,6 +328,91 @@ fn render_line(line: &ChatLine, save: Option<SaveHandler>) -> AnyElement {
         .into_any_element()
 }
 
+impl ChatApp {
+    /// 消息右键菜单：复制、引用，文件消息多一项另存。
+    pub(crate) fn render_message_menu(
+        &self,
+        menu: MessageMenu,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let line = menu.line.clone();
+        let text = line.text.clone();
+        let attachment = line.attachment.clone();
+        let line_for_quote = line.clone();
+
+        div()
+            .id("message-menu-overlay")
+            .absolute()
+            .inset_0()
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_close_message_menu))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_close_message_menu))
+            .child(
+                div()
+                    .id("message-menu")
+                    .test_id("message-menu")
+                    .absolute()
+                    .left(menu.position.x)
+                    .top(menu.position.y)
+                    .w(px(168.))
+                    .flex()
+                    .flex_col()
+                    .py_1()
+                    .rounded_lg()
+                    .bg(rgb(theme::FIELD))
+                    .border_1()
+                    .border_color(rgb(theme::BORDER_STRONG))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        |_: &MouseDownEvent, _: &mut Window, cx: &mut App| cx.stop_propagation(),
+                    )
+                    .child(menu_item(
+                        "复制",
+                        cx.listener(move |this, _, _, cx| {
+                            this.copy_text(text.clone(), "消息", cx);
+                            this.message_menu = None;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(menu_item(
+                        "引用",
+                        cx.listener(move |this, _, window, cx| {
+                            this.quote_message(line_for_quote.clone(), window, cx);
+                        }),
+                    ))
+                    .when_some(attachment, |this, attachment| {
+                        this.child(menu_item(
+                            "保存附件",
+                            cx.listener(move |this, _, _, cx| {
+                                this.save_attachment(attachment.clone(), cx);
+                                this.message_menu = None;
+                                cx.notify();
+                            }),
+                        ))
+                    }),
+            )
+            .into_any_element()
+    }
+}
+
+/// 右键菜单里的一行。
+fn menu_item(
+    label: &str,
+    on_click: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .h(px(32.))
+        .flex()
+        .items_center()
+        .px_3()
+        .text_size(px(12.))
+        .text_color(rgb(theme::TEXT))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(theme::HOVER)))
+        .on_mouse_up(MouseButton::Left, on_click)
+        .child(label.to_string())
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod perf {
     use super::*;
@@ -325,6 +434,7 @@ mod perf {
                     sender: "某人".into(),
                     text: format!("这是第 {i} 条消息，长度大约二十来个字"),
                     attachment: None,
+                    quote: None,
                     mine: i % 2 == 0,
                     system: false,
                 })

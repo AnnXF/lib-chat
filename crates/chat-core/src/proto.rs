@@ -75,6 +75,16 @@ pub struct Attachment {
     pub sha256: String,
 }
 
+/// 被引用的消息摘要：只保留展示所需的最少信息，不递归展开引用链。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Quote {
+    pub sender: String,
+    /// 文本消息为正文，文件消息为文件名。
+    pub text: String,
+    /// 被引用消息的序号，便于定位与去重。
+    pub seq: Option<Seq>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Message {
     pub room: RoomId,
@@ -87,6 +97,8 @@ pub struct Message {
     pub text: String,
     /// 文件消息附带元数据。
     pub attachment: Option<Attachment>,
+    /// 这条消息引用了哪条消息；没有引用为 `None`。
+    pub quote: Option<Quote>,
     pub server_ts_ms: i64,
 }
 
@@ -124,6 +136,8 @@ pub enum ClientRequest {
         room: RoomId,
         client_msg_id: Uuid,
         text: String,
+        /// 引用某条消息时带上摘要；普通消息为 `None`。
+        quote: Option<Quote>,
     },
     /// 文件消息：附件内容必须已经上传完成，服务端只校验并广播元数据。
     SendFile {
@@ -144,6 +158,9 @@ pub enum ClientRequest {
     },
 }
 
+// 消息事件本来就带着整条消息，装箱只会给每条消息多一次分配；
+// 其余变体很小，内联更划算。
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEvent {

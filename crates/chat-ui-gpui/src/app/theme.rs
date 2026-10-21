@@ -31,3 +31,5 @@ pub const ACCENT_SOFT: u32 = 0x1b2c4d;
 pub const ON_ACCENT: u32 = 0xffffff;
 /// 警示色。
 pub const DANGER: u32 = 0xf87171;
+/// 提醒色：正在重连等「需要知道但不算失败」的状态。
+pub const WARN: u32 = 0xfbbf24;

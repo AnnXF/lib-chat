@@ -20,12 +20,15 @@ mod update;
 mod views;
 pub mod widgets;
 
-pub use model::{ChatLine, DiscoveredRoom, HostedRoom, RoomSource, RoomView};
+pub use model::{ChatLine, DiscoveredRoom, HostedRoom, RoomSource, RoomView, StatusKind};
 
 use std::collections::HashSet;
 
 use chat_core::{RoomId, Seq, UserId};
-use gpui::{Context, Entity, ListAlignment, ListState, Render, Window, div, prelude::*, px, rgb};
+use gpui::{
+    Context, Entity, ListAlignment, ListState, Pixels, Point, Render, Window, div, prelude::*, px,
+    rgb,
+};
 
 use crate::service::{self, UiCommand};
 
@@ -38,7 +41,9 @@ pub struct ChatApp {
     addr_input: Entity<TextInput>,
     fingerprint_input: Entity<TextInput>,
     message: Entity<TextInput>,
-    /// 公网托管表单是否展开。
+    /// 手动连接面板是否展开。
+    show_connect_form: bool,
+    /// 公网托管面板是否展开。
     show_public_form: bool,
     public_port: Entity<TextInput>,
     public_cert: Entity<TextInput>,
@@ -56,6 +61,7 @@ pub struct ChatApp {
     /// 有一页更早的历史还在路上；避免滚动回调反复发同一个请求。
     loading_older: bool,
     status: String,
+    status_kind: StatusKind,
     hosted: Option<HostedRoom>,
     /// 是否展开「我的房间」的完整标识与指纹；默认收起，避免侧栏堆满长文本。
     show_identity: bool,
@@ -65,6 +71,17 @@ pub struct ChatApp {
     local_room_id: Option<RoomId>,
     /// 我在当前房间的身份；用于判断消息是不是自己发的。
     my_id: Option<UserId>,
+    /// 消息右键菜单；`None` 表示没有打开。
+    message_menu: Option<MessageMenu>,
+    /// 输入框上方待发送的引用；发送成功或点 × 清除。
+    pending_quote: Option<chat_core::Quote>,
+}
+
+/// 消息右键菜单的目标与位置。
+#[derive(Clone)]
+pub(crate) struct MessageMenu {
+    pub(crate) position: Point<Pixels>,
+    pub(crate) line: ChatLine,
 }
 impl ChatApp {
     /// 事件所属的房间，正是界面此刻展示的那个吗？
@@ -96,6 +113,12 @@ impl ChatApp {
     #[cfg(any(test, feature = "ui-test"))]
     pub fn debug_apply(&mut self, event: service::UiEvent) {
         self.apply(event);
+    }
+
+    /// 当前输入框内容，供无头测试断言引用写入结果。
+    #[cfg(any(test, feature = "ui-test"))]
+    pub fn debug_message_input(&self, cx: &gpui::App) -> String {
+        self.message.read(cx).content().to_string()
     }
 
     fn with_channels(
@@ -168,6 +191,7 @@ impl ChatApp {
             addr_input,
             fingerprint_input,
             message,
+            show_connect_form: false,
             show_public_form: false,
             public_port,
             public_cert,
@@ -182,11 +206,14 @@ impl ChatApp {
             has_older: true,
             loading_older: false,
             status: "正在搜索局域网房间…".into(),
+            status_kind: StatusKind::Info,
             hosted: None,
             show_identity: false,
             local_room: None,
             local_room_id: None,
             my_id: None,
+            message_menu: None,
+            pending_quote: None,
         }
     }
 }
@@ -196,6 +223,7 @@ impl Render for ChatApp {
         let header = self.render_header();
         let sidebar = self.render_sidebar(cx);
         let main = self.render_main(cx);
+        let menu = self.message_menu.clone();
 
         div()
             .id("app-root")
@@ -206,6 +234,8 @@ impl Render for ChatApp {
             .bg(rgb(theme::BG))
             .text_color(rgb(theme::TEXT))
             .text_sm()
+            // 全局快捷键：Esc 收起浮层，Cmd/Ctrl+K 手动连接，Cmd/Ctrl+Shift+P 公网服务
+            .on_key_down(cx.listener(Self::on_key_down))
             .child(header)
             .child(
                 div()
@@ -219,6 +249,9 @@ impl Render for ChatApp {
                     .child(sidebar)
                     .child(main),
             )
+            .when_some(menu, |this, menu| {
+                this.child(self.render_message_menu(menu, cx))
+            })
     }
 }
 

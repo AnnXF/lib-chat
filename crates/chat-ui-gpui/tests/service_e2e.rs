@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use chat_core::RoomId;
+use chat_core::{Quote, RoomId};
 use chat_transport_quic::Liveness;
 use chat_ui_gpui::service::{UiCommand, UiEvent, spawn_with_data};
 
@@ -130,6 +130,7 @@ fn host_then_connect_join_send() {
 
     cmds.send(UiCommand::Send {
         text: "你好".into(),
+        quote: None,
     })
     .unwrap();
     match recv_until(&events, |e| matches!(e, UiEvent::Message { .. })) {
@@ -209,6 +210,7 @@ fn two_instances_discover_each_other_on_one_host() {
     cmds_b
         .send(UiCommand::Send {
             text: "同机也能聊".into(),
+            quote: None,
         })
         .unwrap();
     match recv_until(&events_a, |e| matches!(e, UiEvent::Message { .. })) {
@@ -461,6 +463,7 @@ fn reconnects_after_connection_drops_without_leaving_room() {
     // 重连必须恢复身份：还能正常发言，说明服务端认得这个成员
     cmds.send(UiCommand::Send {
         text: "掉线之后还能说话".into(),
+        quote: None,
     })
     .unwrap();
     match recv_until_keeping_room(&events, |e| matches!(e, UiEvent::Message { .. })) {
@@ -532,6 +535,7 @@ fn reopening_offers_the_local_room_back() {
         for i in 1..=3 {
             cmds.send(UiCommand::Send {
                 text: format!("第 {i} 句"),
+                quote: None,
             })
             .unwrap();
         }
@@ -612,6 +616,7 @@ fn new_room_clears_the_local_history() {
         recv_until(&events, |e| matches!(e, UiEvent::Joined { .. }));
         cmds.send(UiCommand::Send {
             text: "旧消息".into(),
+            quote: None,
         })
         .unwrap();
         recv_until(&events, |e| matches!(e, UiEvent::Message { .. }));
@@ -716,6 +721,7 @@ fn new_room_while_hosting_keeps_the_room_usable() {
     recv_until(&events, |e| matches!(e, UiEvent::Joined { .. }));
     cmds.send(UiCommand::Send {
         text: "旧消息".into(),
+        quote: None,
     })
     .unwrap();
     recv_until(&events, |e| matches!(e, UiEvent::Message { .. }));
@@ -847,6 +853,7 @@ fn two_instances_sharing_the_local_room_deliver_in_real_time() {
     cmds_a
         .send(UiCommand::Send {
             text: "在吗".into(),
+            quote: None,
         })
         .unwrap();
     assert!(
@@ -859,7 +866,12 @@ fn two_instances_sharing_the_local_room_deliver_in_real_time() {
         "A 发的消息应当实时到达 B"
     );
 
-    cmds_b.send(UiCommand::Send { text: "在".into() }).unwrap();
+    cmds_b
+        .send(UiCommand::Send {
+            text: "在".into(),
+            quote: None,
+        })
+        .unwrap();
     assert!(
         wait_for(
             &events_a,
@@ -898,6 +910,7 @@ fn second_instance_cannot_reset_a_hosted_room() {
     cmds_a
         .send(UiCommand::Send {
             text: "保留的历史".into(),
+            quote: None,
         })
         .unwrap();
     recv_until(
@@ -920,6 +933,7 @@ fn second_instance_cannot_reset_a_hosted_room() {
     cmds_a
         .send(UiCommand::Send {
             text: "房间仍可用".into(),
+            quote: None,
         })
         .unwrap();
     recv_until(
@@ -1054,6 +1068,7 @@ fn failed_room_switch_keeps_the_old_session() {
 
     cmds.send(UiCommand::Send {
         text: "仍在原房间".into(),
+        quote: None,
     })
     .unwrap();
     let received = recv_until(
@@ -1144,6 +1159,7 @@ fn joining_room_loads_recent_history() {
     cmds_a
         .send(UiCommand::Send {
             text: "先说的话".into(),
+            quote: None,
         })
         .unwrap();
     recv_until(&events_a, |e| matches!(e, UiEvent::Message { .. }));
@@ -1219,6 +1235,7 @@ fn rejoining_catches_up_messages_missed_while_away() {
     cmds_a
         .send(UiCommand::Send {
             text: "你刚才不在".into(),
+            quote: None,
         })
         .unwrap();
     recv_until(&events_a, |e| matches!(e, UiEvent::Message { .. }));
@@ -1273,6 +1290,7 @@ fn loading_older_walks_back_through_history() {
         cmds_a
             .send(UiCommand::Send {
                 text: format!("第 {i} 句"),
+                quote: None,
             })
             .unwrap();
     }
@@ -1447,5 +1465,44 @@ fn sends_and_saves_a_file_through_the_service() {
         std::thread::sleep(Duration::from_millis(50));
         // 同时把事件消化掉，避免通道堆满
         let _ = events.recv_timeout(Duration::from_millis(10));
+    }
+}
+
+/// 带引用的消息：服务端回显与广播都保留引用结构。
+#[test]
+fn sends_and_receives_a_quoted_message() {
+    let (_guard, beacon_port) = serial();
+    let (cmds, events) = spawn_test(beacon_port);
+
+    cmds.send(UiCommand::Host {
+        name: "引用房间".into(),
+    })
+    .unwrap();
+    recv_until(&events, |e| matches!(e, UiEvent::Lobby { .. }));
+    cmds.send(UiCommand::Join {
+        name: "Alice".into(),
+    })
+    .unwrap();
+    recv_until(&events, |e| matches!(e, UiEvent::Joined { .. }));
+
+    let quote = Quote {
+        sender: "某人".into(),
+        text: "被引用的原文".into(),
+        seq: Some(7),
+    };
+    cmds.send(UiCommand::Send {
+        text: "带引用的回复".into(),
+        quote: Some(quote.clone()),
+    })
+    .unwrap();
+
+    match recv_until(
+        &events,
+        |e| matches!(e, UiEvent::Message { text, .. } if text == "带引用的回复"),
+    ) {
+        UiEvent::Message {
+            quote: received, ..
+        } => assert_eq!(received, Some(quote)),
+        _ => unreachable!(),
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! 与协议 DTO 分开：这里只描述「界面要用到的形状」，不掺网络语义。
 
-use chat_core::{Attachment, RoomId, Seq};
+use chat_core::{Attachment, Quote, RoomId, Seq};
 
 use crate::service::PublicHosting;
 
@@ -11,6 +11,14 @@ use crate::service::PublicHosting;
 pub enum RoomSource {
     Local,
     Remote,
+}
+
+/// 顶栏状态的语气：错误红、重连橙、其余灰。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StatusKind {
+    Info,
+    Warn,
+    Error,
 }
 
 #[derive(Clone)]
@@ -100,6 +108,8 @@ pub struct ChatLine {
     pub(crate) text: String,
     /// 文件消息附带的元数据；文本消息为 `None`。
     pub(crate) attachment: Option<Attachment>,
+    /// 这条消息引用了哪条消息。
+    pub(crate) quote: Option<Quote>,
     /// 是否由自己发出，决定气泡靠哪一边。
     pub(crate) mine: bool,
     pub(crate) system: bool,

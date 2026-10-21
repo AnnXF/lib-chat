@@ -7,7 +7,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use chat_core::{AppendResult, ChatError, MessageStore, NewMessage, Result};
-use chat_core::{Attachment, AttachmentId, Message, MessageKind, RoomId, Seq};
+use chat_core::{Attachment, AttachmentId, Message, MessageKind, Quote, RoomId, Seq};
 use sea_query::{ColumnDef, Expr, Index, Order, Query, SqliteQueryBuilder, Table, Value, Values};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
@@ -30,6 +30,9 @@ mod messages {
     pub const ATTACHMENT_SIZE: &str = "attachment_size";
     pub const ATTACHMENT_MIME: &str = "attachment_mime";
     pub const ATTACHMENT_SHA256: &str = "attachment_sha256";
+    pub const QUOTE_SENDER: &str = "quote_sender";
+    pub const QUOTE_TEXT: &str = "quote_text";
+    pub const QUOTE_SEQ: &str = "quote_seq";
 }
 
 /// `room_meta` 表：单行，记着本库属于哪个房间。
@@ -43,7 +46,7 @@ mod room_meta {
 const ROOM_ROW: i32 = 1;
 
 /// 读消息时统一选出的列，顺序与 [`row_to_message`] 的下标一一对应。
-const MESSAGE_COLUMNS: [&str; 12] = [
+const MESSAGE_COLUMNS: [&str; 15] = [
     messages::SEQ,
     messages::MSG_ID,
     messages::SENDER,
@@ -56,6 +59,9 @@ const MESSAGE_COLUMNS: [&str; 12] = [
     messages::ATTACHMENT_SIZE,
     messages::ATTACHMENT_MIME,
     messages::ATTACHMENT_SHA256,
+    messages::QUOTE_SENDER,
+    messages::QUOTE_TEXT,
+    messages::QUOTE_SEQ,
 ];
 
 pub struct SqliteStore {
@@ -116,6 +122,9 @@ impl SqliteStore {
             .col(ColumnDef::new(messages::ATTACHMENT_SIZE).big_integer())
             .col(ColumnDef::new(messages::ATTACHMENT_MIME).text())
             .col(ColumnDef::new(messages::ATTACHMENT_SHA256).text())
+            .col(ColumnDef::new(messages::QUOTE_SENDER).text())
+            .col(ColumnDef::new(messages::QUOTE_TEXT).text())
+            .col(ColumnDef::new(messages::QUOTE_SEQ).big_integer())
             .primary_key(Index::create().col(messages::ROOM_ID).col(messages::SEQ))
             .to_owned();
 
@@ -211,6 +220,7 @@ impl MessageStore for SqliteStore {
                 let stored = row_to_message(room, &row)?;
                 if stored.text != msg.text
                     || stored.kind != msg.kind
+                    || stored.quote != msg.quote
                     || stored.attachment.as_ref().map(|a| &a.sha256)
                         != msg.attachment.as_ref().map(|a| &a.sha256)
                 {
@@ -242,6 +252,7 @@ impl MessageStore for SqliteStore {
                 kind: msg.kind,
                 text: msg.text,
                 attachment: msg.attachment,
+                quote: msg.quote,
                 server_ts_ms: now_ms(),
             };
 
@@ -261,6 +272,9 @@ impl MessageStore for SqliteStore {
                     messages::ATTACHMENT_SIZE,
                     messages::ATTACHMENT_MIME,
                     messages::ATTACHMENT_SHA256,
+                    messages::QUOTE_SENDER,
+                    messages::QUOTE_TEXT,
+                    messages::QUOTE_SEQ,
                 ])
                 .values_panic([
                     stored.room.to_string().into(),
@@ -276,6 +290,9 @@ impl MessageStore for SqliteStore {
                     stored.attachment.as_ref().map(|a| a.size as i64).into(),
                     stored.attachment.as_ref().map(|a| a.mime.clone()).into(),
                     stored.attachment.as_ref().map(|a| a.sha256.clone()).into(),
+                    stored.quote.as_ref().map(|q| q.sender.clone()).into(),
+                    stored.quote.as_ref().map(|q| q.text.clone()).into(),
+                    stored.quote.as_ref().and_then(|q| q.seq).into(),
                 ])
                 .build(SqliteQueryBuilder);
 
@@ -416,7 +433,18 @@ fn row_to_message(room: RoomId, row: &sqlx::sqlite::SqliteRow) -> Result<Message
         kind: kind_from_str(&row.get::<String, _>(4)),
         text: row.get(5),
         attachment: row_to_attachment(row)?,
+        quote: row_to_quote(row),
         server_ts_ms: row.get(6),
+    })
+}
+
+fn row_to_quote(row: &sqlx::sqlite::SqliteRow) -> Option<Quote> {
+    let sender = row.get::<Option<String>, _>(12)?;
+    let text = row.get::<Option<String>, _>(13)?;
+    Some(Quote {
+        sender,
+        text,
+        seq: row.get::<Option<i64>, _>(14),
     })
 }
 
@@ -477,6 +505,7 @@ mod tests {
             kind: MessageKind::Text,
             text: text.into(),
             attachment: None,
+            quote: None,
         }
     }
 

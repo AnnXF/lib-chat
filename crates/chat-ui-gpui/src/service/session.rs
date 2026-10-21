@@ -3,7 +3,8 @@ use std::collections::VecDeque;
 use uuid::Uuid;
 
 use chat_core::{
-    Attachment, AttachmentId, MAX_ATTACHMENT_BYTES, guess_mime, sha256_hex, validate_attachment,
+    Attachment, AttachmentId, MAX_ATTACHMENT_BYTES, Quote, guess_mime, sha256_hex,
+    validate_attachment,
 };
 use chat_transport_quic::QuicConnection;
 
@@ -14,7 +15,10 @@ use super::*;
 pub(super) enum SessionCmd {
     Join(String),
     Leave,
-    Send(String),
+    Send {
+        text: String,
+        quote: Option<Quote>,
+    },
     /// 发送本地文件。
     SendFile(PathBuf),
     /// 把附件另存到本地。
@@ -225,7 +229,7 @@ struct Session {
     /// 有一页还没回来，避免滚动回调重复触发。
     loading_older: bool,
     /// 保留原消息标识，连接断开后再发送也不会重复落库。
-    pending: VecDeque<(Uuid, String)>,
+    pending: VecDeque<(Uuid, String, Option<Quote>)>,
 }
 
 impl Session {
@@ -254,7 +258,11 @@ impl Session {
         }
     }
 
-    fn enqueue(&mut self, text: String) -> Result<(Uuid, String), &'static str> {
+    fn enqueue(
+        &mut self,
+        text: String,
+        quote: Option<Quote>,
+    ) -> Result<(Uuid, String, Option<Quote>), &'static str> {
         if self.identity.is_none() {
             return Err("尚未加入房间");
         }
@@ -265,7 +273,7 @@ impl Session {
         if self.pending.len() >= PENDING_SEND_CAPACITY {
             return Err("待确认消息已满，请稍后再试");
         }
-        let message = (Uuid::new_v4(), trimmed.to_string());
+        let message = (Uuid::new_v4(), trimmed.to_string(), quote);
         self.pending.push_back(message.clone());
         Ok(message)
     }
@@ -401,9 +409,13 @@ impl Session {
                             let _ = self.events.send_async(UiEvent::Error(format!("退出失败: {e}"))).await;
                         }
                     }
-                    Ok(SessionCmd::Send(text)) => match self.enqueue(text) {
-                        Ok((id, text)) => {
-                            if client.send_text_with_id(self.target.room, id, text).await.is_err() {
+                    Ok(SessionCmd::Send { text, quote }) => match self.enqueue(text, quote) {
+                        Ok((id, text, quote)) => {
+                            if client
+                                .send_text_quoted(self.target.room, id, text, quote)
+                                .await
+                                .is_err()
+                            {
                                 return ServeEnd::Dropped;
                             }
                         }
@@ -424,7 +436,8 @@ impl Session {
     async fn observe(&mut self, client: &Client, event: &ServerEvent) {
         match event {
             ServerEvent::Message { message } => {
-                self.pending.retain(|(id, _)| *id != message.client_msg_id);
+                self.pending
+                    .retain(|(id, _, _)| *id != message.client_msg_id);
                 self.newest = self.newest.max(message.seq);
                 if message.seq == self.cursor + 1 {
                     self.cursor = message.seq;
@@ -449,9 +462,9 @@ impl Session {
                 } else {
                     self.request_sync(client, false).await;
                 }
-                for (id, text) in &self.pending {
+                for (id, text, quote) in &self.pending {
                     if client
-                        .send_text_with_id(self.target.room, *id, text)
+                        .send_text_quoted(self.target.room, *id, text, quote.clone())
                         .await
                         .is_err()
                     {
@@ -619,8 +632,8 @@ impl Session {
                         .send_async(UiEvent::Error("尚未重新连接，文件功能暂不可用".into()))
                         .await;
                 }
-                Ok(Ok(SessionCmd::Send(text))) => {
-                    if let Err(reason) = self.enqueue(text) {
+                Ok(Ok(SessionCmd::Send { text, quote })) => {
+                    if let Err(reason) = self.enqueue(text, quote) {
                         let _ = self
                             .events
                             .send_async(UiEvent::Error(format!("发送失败: {reason}")))
@@ -763,6 +776,7 @@ mod tests {
             kind: chat_core::MessageKind::Text,
             text: format!("m{seq}"),
             attachment: None,
+            quote: None,
             server_ts_ms: 0,
         }
     }
@@ -785,7 +799,7 @@ mod tests {
         let mut session = Session::new(target, conn.clone(), events, cmds);
         session.identity = Some("Alice".into());
         session.needs_history = false;
-        let (id, text) = session.enqueue("同一条消息".into()).unwrap();
+        let (id, text, _) = session.enqueue("同一条消息".into(), None).unwrap();
         client.send_text_with_id(room, id, &text).await.unwrap();
         let joined = ServerEvent::Joined {
             room,
@@ -825,9 +839,9 @@ mod tests {
             .count();
         assert_eq!(sent_again, 2);
         for _ in 0..PENDING_SEND_CAPACITY {
-            session.enqueue("待发".into()).unwrap();
+            session.enqueue("待发".into(), None).unwrap();
         }
-        assert!(session.enqueue("超过容量".into()).is_err());
+        assert!(session.enqueue("超过容量".into(), None).is_err());
         assert_eq!(session.pending.len(), PENDING_SEND_CAPACITY);
     }
 
