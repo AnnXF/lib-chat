@@ -1,14 +1,18 @@
 # lib-chat
 
-基于 QUIC 的单房间聊天，同一套服务端代码支持两种部署：
+基于 QUIC 的账号制聊天，同一套服务端代码支持两种部署：
 
-- **局域网版本**：免配置发现，自签证书 + 指纹固定，界面内一键建房。
-- **公网版本**：独立服务端进程，域名 + 受信 CA 证书，客户端手动连接或从地址簿自动探测。
+- **局域网版本**：免配置发现，自签证书 + 指纹固定，发现房间后登录加入。
+- **公网版本**：独立服务端进程，域名 + 受信 CA 证书，账号登录后进入会话列表。
 
 当前处于开发阶段，协议、存储与界面都还可能做破坏性调整。
 
 ## 功能一览
 
+- 账号：用户名 + 密码（Argon2id），登录发 30 天令牌；所有连接先登录。
+- 好友：按用户名添加，双向生效。
+- 群聊与单聊：群聊只能拉好友，单聊复用房间模型并对同一对用户去重。
+- 会话列表：登录后按群聊/单聊列出，点击切换房间。
 - 文字消息：服务端分配全局递增序号，客户端去重、补齐断线期间的消息。
 - 在线人数：大厅摘要、加入/退出广播、断线重连后恢复身份。
 - 文件消息：≤64 MiB，独立 QUIC 流分块传输，按 SHA-256 内容寻址去重，点击另存。
@@ -37,6 +41,12 @@ cargo build --workspace
 cargo run -p chat-ui-gpui
 ```
 
+启动后先登录：地址填房主服务端地址（本机自签填 `127.0.0.1:端口` 与指纹），用户名/密码用于注册或登录。登录后自动进入默认大厅，界面为微信式三栏：
+
+- 左导航「聊」：搜索框 + 会话列表（群聊、单聊），点会话进入聊天。
+- 左导航「友」：新的朋友（添加好友）、群聊、好友、发起群聊。
+- 左导航「房」：局域网/远程房间、我的房间、手动连接、公网服务。
+
 1. 点侧栏「新建房间」，界面会自动接入并成为房主。
 2. 再开一个实例（同一台机器也可以）：
 
@@ -45,22 +55,28 @@ cargo run -p chat-ui-gpui
 cargo run -p chat-ui-gpui
 ```
 
-3. 新实例左侧「局域网房间」会自动出现刚建的房间和在线人数，点一下连接，再点「加入房间」。
-4. 两个窗口互发消息，观察在线人数与消息实时同步。
+3. 界面是微信式三栏：最左「聊 / 友 / 房」导航，中间列表，右侧聊天。
+4. 点「友」进入通讯录：可以加好友、看群聊、发起群聊；点好友直接开单聊。
+5. 点「房」进入房间与连接：局域网房间、远程服务器、我的房间、手动连接、公网服务都在这里。
+6. 新实例在「房」页的「局域网房间」里自动看到刚建的房间和在线人数，点一下连接，再点「加入房间」。
+7. 两个窗口互发消息，观察在线人数与消息实时同步。
 
-若网络环境阻断发现，点侧栏底部「手动连接」展开面板，填 `127.0.0.1:端口`，指纹填房主界面上展示的 SHA-256。
+若网络环境阻断发现，在「房」页点「手动连接」展开面板，填 `127.0.0.1:端口`，指纹填房主界面上展示的 SHA-256。
 
 ### 命令行验证
+
+服务端启动后先注册账号，再用账号加入；所有连接（含局域网）都要登录：
 
 ```bash
 # 房主
 cargo run -p chat-cli -- host --name 局域网聊天室
 
-# 另一个终端：自动发现
-cargo run -p chat-cli -- join
+# 另一个终端：注册并加入
+cargo run -p chat-cli -- register --server 127.0.0.1:45678 --user alice --password password123
+cargo run -p chat-cli -- join --server 127.0.0.1:45678 --user alice --password password123
 
 # 或不依赖发现，手动指定地址与指纹
-cargo run -p chat-cli -- join --addr 10.0.0.5:45678 --fingerprint <hex>
+cargo run -p chat-cli -- join --addr 10.0.0.5:45678 --fingerprint <hex> --user alice --password password123
 ```
 
 交互命令：`join` 加入、`leave` 退出、`quit` 退出程序，其余输入按文本消息发送。
@@ -92,17 +108,25 @@ cargo run -p chat-cli -- serve \
 ```
 
 ```bash
-# 终端 2：客户端 A
+# 终端 2：注册客户端 A 的账号，再用账号加入
+cargo run -p chat-cli -- register \
+  --server 127.0.0.1:45123 \
+  --fingerprint d74689ab... \
+  --user alice --password password123
 cargo run -p chat-cli -- join \
   --server 127.0.0.1:45123 \
   --fingerprint d74689ab... \
-  --name Alice
+  --user alice --password password123
 
 # 终端 3：客户端 B
+cargo run -p chat-cli -- register \
+  --server 127.0.0.1:45123 \
+  --fingerprint d74689ab... \
+  --user bob --password password123
 cargo run -p chat-cli -- join \
   --server 127.0.0.1:45123 \
   --fingerprint d74689ab... \
-  --name Bob
+  --user bob --password password123
 ```
 
 两端输入 `join` 后互发消息；退出后再启动服务端（同一个 `--data-dir`），房间标识、证书指纹与历史消息都会保留。
@@ -123,13 +147,15 @@ cargo run -p chat-cli -- serve \
 客户端不需要指纹，证书链与主机名由受信根校验：
 
 ```bash
-cargo run -p chat-cli -- join --server chat.example.com:4433 --name Alice
+cargo run -p chat-cli -- register --server chat.example.com:4433 --user alice --password password123
+cargo run -p chat-cli -- join --server chat.example.com:4433 --user alice --password password123
 ```
 
 私有 CA（自建 PKI）用 `--ca` 指定根证书；界面客户端用环境变量：
 
 ```bash
-cargo run -p chat-cli -- join --server chat.internal.example:4433 --ca ./ca.pem
+cargo run -p chat-cli -- register --server chat.internal.example:4433 --ca ./ca.pem --user alice --password password123
+cargo run -p chat-cli -- join --server chat.internal.example:4433 --ca ./ca.pem --user alice --password password123
 LIBCHAT_CA_FILE=./ca.pem cargo run -p chat-ui-gpui
 ```
 
@@ -151,7 +177,7 @@ LIBCHAT_CA_FILE=./ca.pem cargo run -p chat-ui-gpui
 - **受信证书**：其他客户端填 `域名:端口`，指纹留空。
 - **自签**：其他客户端填 `IP:端口`，指纹填界面里的 SHA-256。
 - 填了域名但 DNS 未指向本机时，服务仍会启动，只是本机自动接入会报错；这时用另一台机器或「手动连接」接入。
-- 数据落在 `~/.lib-chat/rooms/room-public.db`、`room-public.files/` 与 `room-public.identity`，重启沿用同一个房间与证书身份。
+- 数据落在 `~/.lib-chat/rooms/hub-public/`（`accounts.db`、`messages.db`、`files/`）与 `room-public.identity`，重启沿用同一个房间与证书身份。界面托管的房主账号是本地自动账号 `owner`，其他客户端登录该服务器后加入。
 
 ### 界面连接公网
 
@@ -177,10 +203,10 @@ LIBCHAT_CA_FILE=./ca.pem cargo run -p chat-ui-gpui
 | `<data-dir>/room.db` | 公网服务端的房间标识与消息 |
 | `<data-dir>/room.files/` | 附件内容，按 SHA-256 命名 |
 | `<data-dir>/room.identity` | 自签证书与私钥，重启沿用 |
-| `~/.lib-chat/rooms/room-52100.db` | 界面托管的局域网房间（按广播端口区分） |
-| `~/.lib-chat/rooms/room-52100.files/` | 局域网房间附件 |
-| `~/.lib-chat/rooms/room-public.db` | 界面托管的公网房间 |
-| `~/.lib-chat/rooms/room-public.files/` | 公网房间附件 |
+| `~/.lib-chat/rooms/hub-52100/accounts.db` | 界面托管局域网房间的账号 |
+| `~/.lib-chat/rooms/hub-52100/messages.db` | 局域网房间消息 |
+| `~/.lib-chat/rooms/hub-52100/files/` | 局域网房间附件 |
+| `~/.lib-chat/rooms/hub-public/` | 界面托管的公网房间（账号、消息、附件） |
 | `~/.lib-chat/rooms/room-public.identity` | 公网自签证书与私钥 |
 | `~/.lib-chat/rooms/known-rooms.json` | 固定过的房间指纹 |
 | `~/.lib-chat/rooms/servers.json` | 公网地址簿 |

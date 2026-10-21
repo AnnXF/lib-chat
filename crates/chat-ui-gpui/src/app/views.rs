@@ -413,6 +413,88 @@ fn menu_item(
         .into_any_element()
 }
 
+impl ChatApp {
+    /// 未登录时的整页登录表单。账号在服务端注册，局域网房间也要登录。
+    pub(crate) fn render_login(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("login-page")
+            .test_id("login-page")
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgb(theme::BG))
+            .child(
+                div()
+                    .w(px(360.))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_6()
+                    .rounded_xl()
+                    .bg(rgb(theme::SURFACE))
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
+                    .child(
+                        div()
+                            .text_size(px(18.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(theme::TEXT))
+                            .child("登录 lib-chat"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(theme::MUTED))
+                            .child("先在服务端注册账号；登录后进入默认大厅"),
+                    )
+                    .child(login_field("服务端地址", self.login_addr.clone()))
+                    .child(login_field("用户名", self.login_user.clone()))
+                    .child(login_field("密码", self.login_password.clone()))
+                    .child(login_field(
+                        "证书指纹（自签时填，受信 CA 留空）",
+                        self.login_fingerprint.clone(),
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .child(div().flex_1().child(button(
+                                "登录",
+                                true,
+                                true,
+                                cx.listener(Self::on_login),
+                            )))
+                            .child(div().flex_1().child(button(
+                                "注册",
+                                false,
+                                true,
+                                cx.listener(Self::on_register),
+                            ))),
+                    )
+                    .child(hint("登录成功后会自动进入默认大厅")),
+            )
+            .into_any_element()
+    }
+}
+
+/// 登录表单的一行：标签 + 输入框。
+fn login_field(label: &str, input: impl IntoElement) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .text_size(px(10.))
+                .text_color(rgb(theme::FAINT))
+                .child(label.to_string()),
+        )
+        .child(input)
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod perf {
     use super::*;

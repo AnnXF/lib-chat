@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chat_core::ConnectionAcceptor;
-use chat_server::{Acceptor, Server};
+use chat_server::{Hub, HubAcceptor};
 use chat_transport_quic::{Liveness, QuicServer};
 use chat_ui_gpui::service::{UiCommand, UiEvent, spawn_with_data};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
@@ -58,7 +58,7 @@ impl Drop for CaEnv {
 /// 一个受信 CA 证书的独立服务端。
 struct PublicRoom {
     runtime: tokio::runtime::Runtime,
-    server: Arc<Server>,
+    hub: Arc<Hub>,
     port: u16,
     ca_path: std::path::PathBuf,
 }
@@ -75,8 +75,8 @@ impl PublicRoom {
             .worker_threads(2)
             .build()
             .unwrap();
-        let (server, port) = runtime.block_on(async {
-            let server = Server::new("公网房间");
+        let (hub, port) = runtime.block_on(async {
+            let hub = Hub::open(&dir.join("hub"), "公网房间").await.unwrap();
             let quic = Arc::new(
                 QuicServer::bind_with_pem(
                     "127.0.0.1:0".parse().unwrap(),
@@ -87,14 +87,14 @@ impl PublicRoom {
                 .unwrap(),
             );
             let port = quic.local_addr().port();
-            let acceptor: Arc<dyn ConnectionAcceptor> = Arc::new(Acceptor(Arc::clone(&server)));
+            let acceptor: Arc<dyn ConnectionAcceptor> = Arc::new(HubAcceptor(Arc::clone(&hub)));
             tokio::spawn(Arc::clone(&quic).serve(acceptor));
-            (server, port)
+            (hub, port)
         });
 
         Self {
             runtime,
-            server,
+            hub,
             port,
             ca_path,
         }
@@ -105,7 +105,7 @@ impl PublicRoom {
     }
 
     fn online(&self) -> u32 {
-        self.runtime.block_on(self.server.online_count())
+        self.runtime.block_on(self.hub.online_count())
     }
 
     /// 让它当作用户目录里的私有 CA。

@@ -69,6 +69,8 @@ struct Target {
     room: RoomId,
     liveness: Liveness,
     rooms: Option<DiscoveredRooms>,
+    /// 登录令牌；重连时用它恢复账号，否则 Hub 会拒绝。
+    token: Option<String>,
 }
 
 impl Target {
@@ -122,15 +124,39 @@ enum ServeEnd {
     Done,
 }
 
+/// 打开会话时的账号凭据：首次登录或复用令牌。
+pub(super) enum Auth {
+    Login {
+        username: String,
+        password: String,
+        register: bool,
+    },
+    Resume(String),
+    /// 本地房主的固定账号：不存在就注册，存在就登录。
+    Ensure {
+        username: String,
+        password: String,
+    },
+}
+
+pub(super) struct AuthInfo {
+    pub(super) user: chat_core::UserSummary,
+    pub(super) token: String,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn open_session(
     addr_text: &str,
     identity: &ServerIdentity,
     events: &Sender<UiEvent>,
     liveness: Liveness,
     expected_room: Option<RoomId>,
+    // 要进入的会话；None 表示握手时服务端给的默认大厅。
+    session_room: Option<RoomId>,
     trust: Option<&TrustStore>,
     rooms: Option<DiscoveredRooms>,
-) -> Result<(Active, UiEvent), String> {
+    auth: Option<Auth>,
+) -> Result<(Active, UiEvent, Option<AuthInfo>), String> {
     let (host, port) = parse_host_port(addr_text).map_err(|e| e.to_string())?;
     let fingerprint = match identity {
         ServerIdentity::Fingerprint(fingerprint) => {
@@ -147,28 +173,79 @@ pub(super) async fn open_session(
     let first = connect_once(&host, port, &identity, liveness)
         .await
         .map_err(|e| format!("连接失败: {e}"))?;
-    let room = first.room_info().room;
-    if expected_room.is_some_and(|expected| expected != room) {
+    let connected_room = first.room_info().room;
+    if expected_room.is_some_and(|expected| expected != connected_room) {
         return Err("连接房间标识与选中的房间不一致".into());
     }
+    let room = session_room.unwrap_or(connected_room);
     if let (Some(trust), Some(fingerprint)) = (trust, &fingerprint)
         && let Some(existing) = trust.get(room).map_err(|e| e.to_string())?
         && &existing != fingerprint
     {
         return Err(format!("房间 {room} 的证书指纹已变更，已拒绝连接"));
     }
-    let target = Target {
+    let mut target = Target {
         host,
         port,
         identity: identity.clone(),
         room,
         liveness,
         rooms,
+        token: None,
     };
     let first: Arc<dyn Connection> = Arc::new(first);
 
-    // 界面要显示「XX 房间」，这条查询只在首次连接时做
+    // Hub 要求先登录；局域网旧的单房间服务端没有这一步，`auth` 为 None
     let client = Client::new(Arc::clone(&first));
+    let auth_info = match auth {
+        Some(Auth::Login {
+            username,
+            password,
+            register,
+        }) => {
+            if register {
+                client
+                    .register(&username, &password, &username)
+                    .await
+                    .map_err(|e| format!("注册失败: {e}"))?;
+            } else {
+                client
+                    .login(&username, &password)
+                    .await
+                    .map_err(|e| format!("登录失败: {e}"))?;
+            }
+            Some(await_auth(&client).await?)
+        }
+        Some(Auth::Resume(token)) => {
+            client
+                .resume(&token)
+                .await
+                .map_err(|e| format!("恢复登录失败: {e}"))?;
+            Some(await_auth(&client).await?)
+        }
+        Some(Auth::Ensure { username, password }) => {
+            client
+                .login(&username, &password)
+                .await
+                .map_err(|e| format!("登录失败: {e}"))?;
+            match await_auth(&client).await {
+                Ok(info) => Some(info),
+                Err(_) => {
+                    client
+                        .register(&username, &password, &username)
+                        .await
+                        .map_err(|e| format!("注册失败: {e}"))?;
+                    Some(await_auth(&client).await?)
+                }
+            }
+        }
+        None => None,
+    };
+    if let Some(info) = &auth_info {
+        target.token = Some(info.token.clone());
+    }
+
+    // 界面要显示「XX 房间」，这条查询只在首次连接时做
     client
         .lobby(target.room)
         .await
@@ -194,7 +271,24 @@ pub(super) async fn open_session(
     let (tx, rx) = flume::bounded(128);
     let task = tokio::spawn(Session::new(target, first, events.clone(), rx).run());
 
-    Ok((Active { room, tx, task }, lobby_event))
+    Ok((Active { room, tx, task }, lobby_event, auth_info))
+}
+
+/// 等待登录应答；服务端可能在 `Authenticated` 之前推房间列表，忽略即可。
+pub(super) async fn await_auth(client: &Client) -> Result<AuthInfo, String> {
+    for _ in 0..16 {
+        let event = tokio::time::timeout(Duration::from_secs(12), client.next_event())
+            .await
+            .map_err(|_| "登录超时".to_string())?
+            .map_err(|e| format!("登录连接中断: {e}"))?;
+        match event {
+            ServerEvent::Authenticated { user, token } => return Ok(AuthInfo { user, token }),
+            ServerEvent::Error { message, .. } => return Err(message),
+            ServerEvent::AuthRequired => return Err("登录失败：需要账号".into()),
+            _ => {}
+        }
+    }
+    Err("登录超时".into())
 }
 
 /// 会话任务：维持一条到房间的连接。
@@ -356,6 +450,13 @@ impl Session {
     ///
     /// 返回 `false` 表示这条连接用不了，应当回到主循环重来。
     async fn handshake(&mut self, client: &Client) -> bool {
+        // 重连后的新连接没有账号，先用令牌恢复登录
+        if let Some(token) = &self.target.token
+            && (client.resume(token).await.is_err() || await_auth(client).await.is_err())
+        {
+            self.attempt += 1;
+            return false;
+        }
         // 每次（重）连都问一次大厅：既确认连接可用，界面也靠它拿房间名
         if client.lobby(self.target.room).await.is_err() {
             self.attempt += 1;
@@ -795,6 +896,7 @@ mod tests {
             identity: ServerIdentity::fingerprint("a".repeat(64)),
             liveness: Liveness::default(),
             rooms: None,
+            token: None,
         };
         let mut session = Session::new(target, conn.clone(), events, cmds);
         session.identity = Some("Alice".into());
@@ -859,6 +961,7 @@ mod tests {
             identity: ServerIdentity::fingerprint("a".repeat(64)),
             liveness: Liveness::default(),
             rooms: None,
+            token: None,
         };
         let mut session = Session::new(target, conn.clone(), events, cmds);
         session.needs_history = false;

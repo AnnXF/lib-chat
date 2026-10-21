@@ -7,9 +7,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chat_core::{ConnectionAcceptor, MessageStore, RoomId};
+use chat_core::{ConnectionAcceptor, RoomId};
 use chat_discovery::RoomAnnouncer;
-use chat_server::{Acceptor, DiskBlobs, Server, SqliteStore};
+use chat_server::{Hub, HubAcceptor};
 use chat_transport_quic::{Liveness, QuicServer, SelfSignedCert};
 
 pub type CliResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -36,36 +36,26 @@ pub struct Serving {
     pub room: RoomId,
     pub addr: SocketAddr,
     pub fingerprint: String,
-    pub server: Arc<Server>,
+    pub hub: Arc<Hub>,
     quic: Arc<QuicServer>,
-    store: Arc<SqliteStore>,
     /// 仅用于保活广播。
     _announcer: Option<RoomAnnouncer>,
 }
 
 impl Serving {
-    /// 停止监听并关闭消息库。重启后同一数据目录仍是同一个房间。
+    /// 停止监听；Hub 内部的消息库随进程退出关闭。
     pub async fn shutdown(self) {
         self.quic.close();
         self.quic.wait_idle().await;
-        self.store.close().await;
     }
 }
 
 /// 启动一个独立服务端：消息落 SQLite，附件落磁盘。
 pub async fn serve(config: ServeConfig) -> CliResult<Serving> {
     std::fs::create_dir_all(&config.data_dir)?;
-    let db_path = config.data_dir.join("room.db");
-    // 库还在时不能悄悄换证书身份，否则客户端固定过的指纹就失效了
-    let allow_new_identity = !db_path.exists();
-    let store = Arc::new(SqliteStore::open(&db_path).await?);
-    let blobs = Arc::new(DiskBlobs::new(config.data_dir.join("room.files"))?);
-    let server = Server::with_blobs(
-        store.room(),
-        &config.name,
-        Arc::clone(&store) as Arc<dyn MessageStore>,
-        blobs,
-    );
+    // 身份文件存在时不能悄悄换证书身份，否则客户端固定过的指纹就失效了
+    let allow_new_identity = !config.data_dir.join("room.identity").exists();
+    let hub = Hub::open(&config.data_dir, &config.name).await?;
 
     let quic = Arc::new(match &config.tls {
         ServerTls::SelfSigned => QuicServer::bind_with_cert(
@@ -86,13 +76,14 @@ pub async fn serve(config: ServeConfig) -> CliResult<Serving> {
     let addr = quic.local_addr();
     let fingerprint = quic.fingerprint().to_string();
 
-    let acceptor: Arc<dyn ConnectionAcceptor> = Arc::new(Acceptor(Arc::clone(&server)));
+    let acceptor: Arc<dyn ConnectionAcceptor> = Arc::new(HubAcceptor(Arc::clone(&hub)));
     tokio::spawn(Arc::clone(&quic).serve(acceptor));
 
+    let room = hub.default_room();
     let announcer = match config.announce_port {
         Some(port) => Some(RoomAnnouncer::start_on(
             port,
-            server.room(),
+            room,
             &config.name,
             addr.port(),
             &fingerprint,
@@ -101,12 +92,11 @@ pub async fn serve(config: ServeConfig) -> CliResult<Serving> {
     };
 
     Ok(Serving {
-        room: server.room(),
+        room,
         addr,
         fingerprint,
-        server,
+        hub,
         quic,
-        store,
         _announcer: announcer,
     })
 }

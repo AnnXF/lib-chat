@@ -26,9 +26,11 @@ use std::time::Duration;
 use chat_core::Client;
 use chat_core::{Attachment, AttachmentId};
 use chat_core::{ChatError, Connection, ConnectionAcceptor};
-use chat_core::{LobbyInfo, Message, Quote, RoomId, Seq, ServerEvent, UserId};
+use chat_core::{
+    LobbyInfo, Message, Quote, RoomId, RoomSummary, Seq, ServerEvent, UserId, UserSummary,
+};
 use chat_discovery::{RoomAnnouncer, RoomBrowser};
-use chat_server::{Acceptor, Server};
+use chat_server::Hub;
 use chat_transport_quic::{
     Liveness, PublicCa, QuicServer, ServerIdentity, TrustStore, connect_to, parse_host_port,
     validate_fingerprint,
@@ -39,7 +41,7 @@ use hosting::{
     Hosting, PublicStart, RoomHostLock, claim_local_room, local_room, start_host, start_public_host,
 };
 use remote::RemoteServers;
-use session::{Active, SessionCmd, open_session};
+use session::{Active, Auth, SessionCmd, await_auth, open_session};
 
 /// 房间列表的人数复查间隔。房间要在未加入时也能看到人数，只能周期性探测。
 const PROBE_INTERVAL: Duration = Duration::from_secs(3);
@@ -59,40 +61,46 @@ async fn start_hosting(
     lock: RoomHostLock,
 ) -> Result<(Hosting, Option<Active>), String> {
     let started = start_host(name, events, beacon_port, liveness, lock).await?;
+    let room = started.hub.default_room();
 
     let alive = Arc::new(AtomicBool::new(true));
     let visible = Arc::new(AtomicBool::new(true));
     spawn_presence_ticker(
-        Arc::clone(&started.server),
-        started.server.room(),
+        Arc::clone(&started.hub),
+        room,
         Arc::clone(&alive),
         Arc::clone(&visible),
         events.clone(),
     );
 
     let hosting = Hosting {
-        room: started.server.room(),
+        room,
         endpoint: Arc::clone(&started.endpoint),
-        store: started.store,
+        _hub: Arc::clone(&started.hub),
         _announcer: started.announcer,
         alive,
         visible,
         lock: started.lock,
     };
 
-    // 房主自己也接入房间，否则同一个窗口里无法参与聊天
+    // 房主自己也接入房间，否则同一个窗口里无法参与聊天；本地 Hub 用自动房主账号
     let session = match open_session(
         &started.addr,
         &ServerIdentity::fingerprint(started.fingerprint.clone()),
         events,
         liveness,
-        Some(started.server.room()),
+        Some(room),
         None,
         None,
+        None,
+        Some(Auth::Ensure {
+            username: "owner".into(),
+            password: "libchat-owner".into(),
+        }),
     )
     .await
     {
-        Ok((session, lobby)) => {
+        Ok((session, lobby, _)) => {
             let _ = events.send_async(lobby).await;
             Some(session)
         }
@@ -235,6 +243,19 @@ pub enum UiEvent {
     Reconnecting(String),
     /// 重连超时，会话到此结束。
     Disconnected,
+    /// 登录/注册成功。
+    Authenticated {
+        user: UserSummary,
+        token: String,
+    },
+    /// 我的会话列表（群聊 + 单聊）。
+    Conversations {
+        rooms: Vec<RoomSummary>,
+    },
+    Friends {
+        users: Vec<UserSummary>,
+    },
+    AuthRequired,
 }
 
 #[derive(Clone, Debug)]
@@ -291,6 +312,30 @@ pub enum UiCommand {
     },
     /// 往前翻一页更早的历史。
     LoadOlder,
+    /// 连接服务端并登录/注册；成功后自动进入默认大厅。
+    Login {
+        addr: String,
+        /// 自签服务端的指纹；受信 CA 留空。
+        fingerprint: Option<String>,
+        username: String,
+        password: String,
+        register: bool,
+    },
+    /// 切换到会话列表里的某个房间。
+    OpenRoom {
+        room: RoomId,
+    },
+    RefreshRooms,
+    AddFriend {
+        username: String,
+    },
+    OpenDirect {
+        user: UserId,
+    },
+    CreateGroup {
+        name: String,
+        members: Vec<UserId>,
+    },
 }
 
 /// 启动后端线程，返回指令通道与事件通道。
@@ -457,9 +502,9 @@ async fn start_public_room(
 
     let alive = Arc::new(AtomicBool::new(true));
     let visible = Arc::new(AtomicBool::new(true));
-    let room = started.server.room();
+    let room = started.hub.default_room();
     spawn_presence_ticker(
-        Arc::clone(&started.server),
+        Arc::clone(&started.hub),
         room,
         Arc::clone(&alive),
         Arc::clone(&visible),
@@ -472,7 +517,7 @@ async fn start_public_room(
     *hosting = Some(Hosting {
         room,
         endpoint: Arc::clone(&started.endpoint),
-        store: started.store,
+        _hub: Arc::clone(&started.hub),
         _announcer: started.announcer,
         alive,
         visible,
@@ -504,8 +549,23 @@ async fn start_public_room(
 
     *active = match target {
         Some((addr, identity)) => {
-            match open_session(&addr, &identity, events, liveness, Some(room), None, None).await {
-                Ok((session, lobby)) => {
+            match open_session(
+                &addr,
+                &identity,
+                events,
+                liveness,
+                Some(room),
+                None,
+                None,
+                None,
+                Some(Auth::Ensure {
+                    username: "owner".into(),
+                    password: "libchat-owner".into(),
+                }),
+            )
+            .await
+            {
+                Ok((session, lobby, _)) => {
                     let _ = events.send_async(lobby).await;
                     Some(session)
                 }
@@ -564,14 +624,19 @@ async fn take_room(
     liveness: Liveness,
     policy: &ConnectPolicy<'_>,
 ) -> Result<RoomId, String> {
-    let (session, lobby) = open_session(
+    let (session, lobby, _) = open_session(
         addr,
         identity,
         events,
         liveness,
         policy.expected_room,
+        None,
         Some(policy.trust),
         Some(policy.rooms.clone()),
+        Some(Auth::Ensure {
+            username: "owner".into(),
+            password: "libchat-owner".into(),
+        }),
     )
     .await?;
     if let Some(previous) = active.take() {
@@ -675,6 +740,29 @@ async fn adopt_local_room(
     }
 }
 
+/// 已登录的账号：切换房间时用它保存的地址、身份与令牌重新连接。
+struct AccountState {
+    addr: String,
+    identity: ServerIdentity,
+    token: String,
+    user: UserSummary,
+}
+
+/// 用保存的令牌建立一条临时连接，执行好友/会话类请求。
+async fn account_client(account: &AccountState, liveness: Liveness) -> Result<Client, String> {
+    let (host, port) = parse_host_port(&account.addr).map_err(|e| e.to_string())?;
+    let conn = connect_to(&host, port, &account.identity, liveness)
+        .await
+        .map_err(|e| format!("连接失败: {e}"))?;
+    let client = Client::new(Arc::new(conn));
+    client
+        .resume(&account.token)
+        .await
+        .map_err(|e| format!("恢复登录失败: {e}"))?;
+    await_auth(&client).await?;
+    Ok(client)
+}
+
 async fn run(
     events: Sender<UiEvent>,
     cmds: Receiver<UiCommand>,
@@ -702,11 +790,194 @@ async fn run(
 
     let mut active: Option<Active> = None;
     let mut hosting: Option<Hosting> = None;
+    let mut account: Option<AccountState> = None;
     let trust = TrustStore::new(&data_dir);
     let mut pending_trust: Option<(RoomId, String, String)> = None;
 
     while let Ok(cmd) = cmds.recv_async().await {
         match cmd {
+            UiCommand::Login {
+                addr,
+                fingerprint,
+                username,
+                password,
+                register,
+            } => {
+                let identity = match manual_identity(&addr, fingerprint) {
+                    Ok(identity) => identity,
+                    Err(e) => {
+                        let _ = events.send_async(UiEvent::Error(e)).await;
+                        continue;
+                    }
+                };
+                let auth = Auth::Login {
+                    username,
+                    password,
+                    register,
+                };
+                match open_session(
+                    &addr,
+                    &identity,
+                    &events,
+                    liveness,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(auth),
+                )
+                .await
+                {
+                    Ok((session, lobby, auth)) => {
+                        let Some(auth) = auth else {
+                            let _ = session.end().await;
+                            let _ = events
+                                .send_async(UiEvent::Error("登录没有返回身份".into()))
+                                .await;
+                            continue;
+                        };
+                        let display = auth.user.display_name.clone();
+                        let state = AccountState {
+                            addr,
+                            identity,
+                            token: auth.token.clone(),
+                            user: auth.user.clone(),
+                        };
+                        account = Some(state);
+                        let _ = events.send_async(lobby).await;
+                        let _ = events
+                            .send_async(UiEvent::Authenticated {
+                                user: auth.user,
+                                token: auth.token,
+                            })
+                            .await;
+                        // open_session 的 lobby 查询会顺手吃掉 Rooms 推送，这里主动拉一次
+                        if let Some(current) = &account
+                            && let Ok(client) = account_client(current, liveness).await
+                        {
+                            let _ = client.list_rooms().await;
+                            let _ = client.list_friends().await;
+                            // 两条应答都读完就回到主循环；不要在这里无限等，否则后续命令全被堵住
+                            for _ in 0..4 {
+                                match tokio::time::timeout(
+                                    Duration::from_millis(300),
+                                    client.next_event(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(ServerEvent::Rooms { rooms })) => {
+                                        let _ = events
+                                            .send_async(UiEvent::Conversations { rooms })
+                                            .await;
+                                    }
+                                    Ok(Ok(ServerEvent::Friends { users })) => {
+                                        let _ = events.send_async(UiEvent::Friends { users }).await;
+                                    }
+                                    Ok(Ok(ServerEvent::Error { .. })) | Ok(Err(_)) | Err(_) => {
+                                        break;
+                                    }
+                                    Ok(Ok(_)) => {}
+                                }
+                            }
+                        }
+                        if let Some(previous) = active.take() {
+                            previous.end().await;
+                        }
+                        active = Some(session);
+                        if let Some(session) = &active {
+                            send_session(session, SessionCmd::Join(display), &events).await;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = events.send_async(UiEvent::Error(e)).await;
+                    }
+                }
+            }
+            UiCommand::OpenRoom { room } => {
+                let Some(current) = &account else {
+                    let _ = events.send_async(UiEvent::Error("请先登录".into())).await;
+                    continue;
+                };
+                let auth = Auth::Resume(current.token.clone());
+                match open_session(
+                    &current.addr,
+                    &current.identity,
+                    &events,
+                    liveness,
+                    None,
+                    Some(room),
+                    None,
+                    None,
+                    Some(auth),
+                )
+                .await
+                {
+                    Ok((session, _, _)) => {
+                        let display = current.user.display_name.clone();
+                        if let Some(previous) = active.take() {
+                            previous.end().await;
+                        }
+                        active = Some(session);
+                        if let Some(session) = &active {
+                            send_session(session, SessionCmd::Join(display), &events).await;
+                        }
+                        let _ = room;
+                    }
+                    Err(e) => {
+                        let _ = events.send_async(UiEvent::Error(e)).await;
+                    }
+                }
+            }
+            UiCommand::RefreshRooms
+            | UiCommand::AddFriend { .. }
+            | UiCommand::OpenDirect { .. }
+            | UiCommand::CreateGroup { .. } => {
+                let Some(current) = &account else {
+                    let _ = events.send_async(UiEvent::Error("请先登录".into())).await;
+                    continue;
+                };
+                let client = match account_client(current, liveness).await {
+                    Ok(client) => client,
+                    Err(e) => {
+                        let _ = events.send_async(UiEvent::Error(e)).await;
+                        continue;
+                    }
+                };
+                let sent = match cmd {
+                    UiCommand::RefreshRooms => client.list_rooms().await,
+                    UiCommand::AddFriend { username } => client.add_friend(username).await,
+                    UiCommand::OpenDirect { user } => client.open_direct(user).await,
+                    UiCommand::CreateGroup { name, members } => {
+                        client.create_group(name, members).await
+                    }
+                    _ => unreachable!(),
+                };
+                if let Err(e) = sent {
+                    let _ = events.send_async(UiEvent::Error(e.to_string())).await;
+                    continue;
+                }
+                for _ in 0..12 {
+                    match client.next_event().await {
+                        Ok(ServerEvent::Rooms { rooms }) => {
+                            let _ = events.send_async(UiEvent::Conversations { rooms }).await;
+                            break;
+                        }
+                        Ok(ServerEvent::Friends { users }) => {
+                            let _ = events.send_async(UiEvent::Friends { users }).await;
+                            break;
+                        }
+                        Ok(ServerEvent::Error { message, .. }) => {
+                            let _ = events.send_async(UiEvent::Error(message)).await;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            let _ = events.send_async(UiEvent::Error(e.to_string())).await;
+                            break;
+                        }
+                    }
+                }
+            }
             UiCommand::Host { name } => {
                 // 「我的房间」：本机已经有实例开着这个房间时接过去，没人开才自己开
                 let adopted = adopt_local_room(
@@ -964,7 +1235,7 @@ async fn send_session(session: &Active, cmd: SessionCmd, events: &Sender<UiEvent
 
 /// 房主房间的人数上报：只在该房间正被展示时推送。
 fn spawn_presence_ticker(
-    server: Arc<Server>,
+    hub: Arc<Hub>,
     room: RoomId,
     alive: Arc<AtomicBool>,
     visible: Arc<AtomicBool>,
@@ -983,7 +1254,7 @@ fn spawn_presence_ticker(
             }
             let event = UiEvent::Presence {
                 room,
-                online: server.online_count().await,
+                online: hub.online_in(room).await,
             };
             if events.send_async(event).await.is_err() {
                 return;

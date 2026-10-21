@@ -6,11 +6,13 @@
 
 use chat_core::{Attachment, AttachmentId, RoomId, UserId};
 use chat_ui_gpui::app::ChatApp;
+use chat_ui_gpui::app::NavTab;
 use chat_ui_gpui::service::{PublicHosting, UiEvent};
 use gpui::{Bounds, Entity, Pixels, TestAppContext, VisualTestContext, px, size};
 
 const WINDOW_WIDTH: f32 = 1024.;
 const WINDOW_HEIGHT: f32 = 700.;
+const NAV_WIDTH: f32 = 56.;
 const SIDEBAR_WIDTH: f32 = 256.;
 
 fn open_window(cx: &mut TestAppContext) -> (Entity<ChatApp>, &mut VisualTestContext) {
@@ -95,8 +97,8 @@ fn default_layout_fills_the_window() {
 
     let main = bounds(cx, "chat-main");
     assert_inside(&main, "chat-main");
-    assert!((f32::from(main.origin.x) - SIDEBAR_WIDTH).abs() <= 1.);
-    assert!((f32::from(main.size.width) - (WINDOW_WIDTH - SIDEBAR_WIDTH)).abs() <= 1.);
+    assert!((f32::from(main.origin.x) - (NAV_WIDTH + SIDEBAR_WIDTH)).abs() <= 1.);
+    assert!((f32::from(main.size.width) - (WINDOW_WIDTH - NAV_WIDTH - SIDEBAR_WIDTH)).abs() <= 1.);
 
     let composer = bounds(cx, "composer");
     assert_inside(&composer, "composer");
@@ -208,7 +210,7 @@ fn long_identity_text_keeps_the_layout_inside_the_window() {
 
     let main = bounds(cx, "chat-main");
     assert_inside(&main, "chat-main");
-    assert!((f32::from(main.size.width) - (WINDOW_WIDTH - SIDEBAR_WIDTH)).abs() <= 1.);
+    assert!((f32::from(main.size.width) - (WINDOW_WIDTH - NAV_WIDTH - SIDEBAR_WIDTH)).abs() <= 1.);
 
     let composer = bounds(cx, "composer");
     assert_inside(&composer, "composer");
@@ -258,7 +260,7 @@ fn long_room_name_keeps_the_composer_visible() {
     assert_inside(&header, "chat-header");
 
     let main = bounds(cx, "chat-main");
-    assert!((f32::from(main.size.width) - (WINDOW_WIDTH - SIDEBAR_WIDTH)).abs() <= 1.);
+    assert!((f32::from(main.size.width) - (WINDOW_WIDTH - NAV_WIDTH - SIDEBAR_WIDTH)).abs() <= 1.);
     assert_inside(&main, "chat-main");
 
     let composer = bounds(cx, "composer");
@@ -345,7 +347,7 @@ fn long_status_text_cannot_widen_the_window() {
     assert!((f32::from(header.size.height) - 48.).abs() <= 1.);
 
     let main = bounds(cx, "chat-main");
-    assert!((f32::from(main.size.width) - (WINDOW_WIDTH - SIDEBAR_WIDTH)).abs() <= 1.);
+    assert!((f32::from(main.size.width) - (WINDOW_WIDTH - NAV_WIDTH - SIDEBAR_WIDTH)).abs() <= 1.);
 }
 
 /// 文件消息卡片不能把聊天气泡区撑出窗口，输入条仍要可见。
@@ -747,4 +749,43 @@ fn quoted_message_renders_a_quote_block() {
         bottom(&block) <= f32::from(composer.origin.y) + 0.5,
         "引用块压到了输入条"
     );
+}
+
+/// 未登录时整页是登录表单，不渲染聊天主界面。
+#[test]
+fn logged_out_shows_the_login_page() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| app.debug_logout(cx));
+    });
+    cx.run_until_parked();
+
+    let page = bounds(cx, "login-page");
+    assert_inside(&page, "login-page");
+    assert!(f32::from(page.size.height) > 200., "登录页应占满主体高度");
+}
+
+/// 微信式三栏：左侧导航 + 列表 + 聊天；通讯录页展示好友与群聊。
+#[test]
+fn wechat_nav_switches_between_chats_and_contacts() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| app.debug_nav(NavTab::Chats, cx));
+    });
+    cx.run_until_parked();
+    assert_inside(&bounds(cx, "nav"), "nav");
+    assert_inside(&bounds(cx, "sidebar"), "sidebar");
+    assert_inside(&bounds(cx, "conversations"), "conversations");
+    assert_inside(&bounds(cx, "chat-main"), "chat-main");
+
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| app.debug_nav(NavTab::Contacts, cx));
+    });
+    cx.run_until_parked();
+    assert_inside(&bounds(cx, "contacts-body"), "contacts-body");
+    assert_inside(&bounds(cx, "groups"), "groups");
+    assert_inside(&bounds(cx, "friends"), "friends");
 }

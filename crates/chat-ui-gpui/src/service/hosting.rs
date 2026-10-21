@@ -1,6 +1,6 @@
 use super::*;
 use chat_core::MessageStore;
-use chat_server::SqliteStore;
+use chat_server::{Accounts, Hub, HubAcceptor, SqliteStore};
 
 /// 房间的数据文件：局域网按广播端口分区，公网用固定分区名 `public`。
 fn room_db_path(data_dir: &Path, key: &str) -> PathBuf {
@@ -23,15 +23,23 @@ fn room_identity_path(data_dir: &Path, key: &str) -> PathBuf {
 /// 同机的实例共用同一个库，于是也共用同一个房间标识：拿它去房间发现里问一句
 /// 「这个房间是不是已经有人在托管了」，就能避免两个实例各起一个服务器。
 pub(super) async fn local_room(data_dir: &Path, beacon_port: u16) -> Option<(RoomId, u64)> {
-    let path = room_db_path(data_dir, &beacon_port.to_string());
-    if !path.exists() {
+    let hub_dir = data_dir.join(format!("hub-{beacon_port}"));
+    let accounts_path = hub_dir.join("accounts.db");
+    if !accounts_path.exists() {
         return None;
     }
-    let store = SqliteStore::open(&path).await.ok()?;
-    let room = store.room();
-    let latest = store.latest_seq(room).await;
-    store.close().await;
-    Some((room, latest.ok()?.max(0) as u64))
+    let accounts = Accounts::open(&accounts_path).await.ok()?;
+    let room = accounts.find_default_room().await.ok()??;
+    let messages_path = hub_dir.join("messages.db");
+    let messages = if messages_path.exists() {
+        let store = SqliteStore::open(&messages_path).await.ok()?;
+        let latest = store.latest_seq(room).await.unwrap_or(0).max(0) as u64;
+        store.close().await;
+        latest
+    } else {
+        0
+    };
+    Some((room, messages))
 }
 
 /// 房间的独占锁：谁拿着它，谁才是本机这个房间的房主。
@@ -44,6 +52,8 @@ pub(super) struct RoomHostLock {
     db_path: PathBuf,
     identity_path: PathBuf,
     files_dir: PathBuf,
+    /// Hub 的账号与消息库目录。
+    hub_dir: PathBuf,
 }
 
 /// 抢占一个房间分区的房主位置；已经被别的实例占着就返回 `Err`。
@@ -64,6 +74,7 @@ pub(super) fn claim_room(data_dir: &Path, key: &str) -> Result<RoomHostLock, Str
             db_path: room_db_path(data_dir, key),
             identity_path: room_identity_path(data_dir, key),
             files_dir: room_files_dir(data_dir, key),
+            hub_dir: data_dir.join(format!("hub-{key}")),
         }),
         Err(std::fs::TryLockError::WouldBlock) => Err("本机已有实例开着这个房间".into()),
         Err(std::fs::TryLockError::Error(e)) => Err(format!("锁定房间失败: {e}")),
@@ -93,7 +104,16 @@ impl RoomHostLock {
             std::fs::remove_dir_all(&self.files_dir)
                 .map_err(|e| format!("清空房间附件失败: {e}"))?;
         }
+        if self.hub_dir.exists() {
+            std::fs::remove_dir_all(&self.hub_dir)
+                .map_err(|e| format!("清空 Hub 数据失败: {e}"))?;
+        }
         Ok(())
+    }
+
+    /// Hub 的账号与消息库目录。
+    fn hub_dir(&self) -> &Path {
+        &self.hub_dir
     }
 }
 
@@ -101,7 +121,7 @@ impl RoomHostLock {
 pub(super) struct Hosting {
     pub(super) room: RoomId,
     pub(super) endpoint: Arc<QuicServer>,
-    pub(super) store: Arc<SqliteStore>,
+    pub(super) _hub: Arc<Hub>,
     /// 局域网广播；公网托管为 `None`。
     pub(super) _announcer: Option<RoomAnnouncer>,
     /// 定时上报是否终止（重建房/关闭时置 false）。
@@ -118,7 +138,6 @@ impl Hosting {
         self.visible.store(false, Ordering::Relaxed);
         self.endpoint.close();
         self.endpoint.wait_idle().await;
-        self.store.close().await;
         let _ = events
             .send_async(UiEvent::RoomGone { room: self.room })
             .await;
@@ -127,8 +146,7 @@ impl Hosting {
 }
 
 pub(super) struct Started {
-    pub(super) server: Arc<Server>,
-    pub(super) store: Arc<SqliteStore>,
+    pub(super) hub: Arc<Hub>,
     pub(super) endpoint: Arc<QuicServer>,
     pub(super) announcer: Option<RoomAnnouncer>,
     pub(super) addr: String,
@@ -145,48 +163,33 @@ pub(super) async fn start_host(
     liveness: Liveness,
     lock: RoomHostLock,
 ) -> Result<Started, String> {
-    let path = lock.db_path.clone();
-    let identity =
-        chat_transport_quic::SelfSignedCert::load_or_create(&lock.identity_path, !path.exists())
-            .map_err(|e| format!("房间身份无效: {e}"))?;
-    let store = Arc::new(
-        SqliteStore::open(&path)
-            .await
-            .map_err(|e| format!("打开消息库失败: {e}"))?,
-    );
-    let blobs = Arc::new(
-        chat_server::DiskBlobs::new(room_files_dir(
-            path.parent().ok_or("缺少房间数据目录")?,
-            &beacon_port.to_string(),
-        ))
-        .map_err(|e| format!("打开附件目录失败: {e}"))?,
-    );
-    let server = Server::with_blobs(
-        store.room(),
-        name,
-        Arc::clone(&store) as Arc<dyn MessageStore>,
-        blobs,
-    );
+    let identity = chat_transport_quic::SelfSignedCert::load_or_create(
+        &lock.identity_path,
+        !lock.identity_path.exists(),
+    )
+    .map_err(|e| format!("房间身份无效: {e}"))?;
+    let hub = Hub::open(lock.hub_dir(), name).await?;
+    let room = hub.default_room();
     let endpoint = Arc::new(
         QuicServer::bind_with_cert(SocketAddr::from(([0, 0, 0, 0], 0)), liveness, identity)
             .map_err(|e| e.to_string())?,
     );
     let port = endpoint.local_addr().port();
     let fingerprint = endpoint.fingerprint().to_string();
-    let data_dir = lock.db_path.parent().ok_or("缺少房间数据目录")?;
+    let data_dir = lock.hub_dir().parent().ok_or("缺少房间数据目录")?;
     chat_transport_quic::TrustStore::new(data_dir)
-        .pin(server.room(), &fingerprint)
+        .pin(room, &fingerprint)
         .map_err(|e| format!("保存本机房间信任失败: {e}"))?;
 
-    let announcer = RoomAnnouncer::start_on(beacon_port, server.room(), name, port, &fingerprint)
+    let announcer = RoomAnnouncer::start_on(beacon_port, room, name, port, &fingerprint)
         .map_err(|e| format!("房间广播失败: {e}"))?;
 
-    let acceptor: Arc<dyn ConnectionAcceptor> = Arc::new(Acceptor(Arc::clone(&server)));
+    let acceptor: Arc<dyn ConnectionAcceptor> = Arc::new(HubAcceptor(Arc::clone(&hub)));
     tokio::spawn(Arc::clone(&endpoint).serve(acceptor));
 
     let _ = events
         .send_async(UiEvent::Hosting {
-            room: server.room(),
+            room,
             name: name.to_string(),
             addrs: local_addrs(port),
             fingerprint: fingerprint.clone(),
@@ -195,8 +198,7 @@ pub(super) async fn start_host(
         .await;
 
     Ok(Started {
-        server,
-        store,
+        hub,
         endpoint,
         announcer: Some(announcer),
         addr: format!("127.0.0.1:{port}"),
@@ -232,9 +234,8 @@ pub(super) async fn start_public_host(
         data_dir,
     } = config;
     let lock = claim_room(data_dir, "public")?;
-    let path = lock.db_path.clone();
-    // 先记下开库前是否已有房间：开库本身会创建文件，之后再判断就永远是「已存在」
-    let fresh_room = !path.exists();
+    // 证书身份是否存在决定是不是新房间；Hub 目录会随第一次打开创建
+    let fresh_room = !lock.identity_path.exists();
 
     // 证书参数有问题时不要先建库，否则会留下「有库无身份」的半成品房间
     let (pem, identity) = match (cert, key) {
@@ -259,21 +260,8 @@ pub(super) async fn start_public_host(
     };
     let trusted_ca = pem.is_some();
 
-    let store = Arc::new(
-        SqliteStore::open(&path)
-            .await
-            .map_err(|e| format!("打开公网消息库失败: {e}"))?,
-    );
-    let blobs = Arc::new(
-        chat_server::DiskBlobs::new(room_files_dir(data_dir, "public"))
-            .map_err(|e| format!("打开公网附件目录失败: {e}"))?,
-    );
-    let server = Server::with_blobs(
-        store.room(),
-        name,
-        Arc::clone(&store) as Arc<dyn MessageStore>,
-        blobs,
-    );
+    let hub = Hub::open(lock.hub_dir(), name).await?;
+    let room = hub.default_room();
 
     let quic = match (pem, identity) {
         (Some((cert_pem, key_pem)), _) => QuicServer::bind_with_pem(
@@ -295,11 +283,11 @@ pub(super) async fn start_public_host(
     let fingerprint = endpoint.fingerprint().to_string();
     if !trusted_ca {
         chat_transport_quic::TrustStore::new(data_dir)
-            .pin(server.room(), &fingerprint)
+            .pin(room, &fingerprint)
             .map_err(|e| format!("保存公网房间信任失败: {e}"))?;
     }
 
-    let acceptor: Arc<dyn ConnectionAcceptor> = Arc::new(Acceptor(Arc::clone(&server)));
+    let acceptor: Arc<dyn ConnectionAcceptor> = Arc::new(HubAcceptor(Arc::clone(&hub)));
     tokio::spawn(Arc::clone(&endpoint).serve(acceptor));
 
     let public = PublicHosting {
@@ -309,7 +297,7 @@ pub(super) async fn start_public_host(
     };
     let _ = events
         .send_async(UiEvent::Hosting {
-            room: server.room(),
+            room,
             name: name.to_string(),
             addrs: local_addrs(port),
             fingerprint: fingerprint.clone(),
@@ -318,8 +306,7 @@ pub(super) async fn start_public_host(
         .await;
 
     Ok(Started {
-        server,
-        store,
+        hub,
         endpoint,
         announcer: None,
         addr: format!("127.0.0.1:{port}"),

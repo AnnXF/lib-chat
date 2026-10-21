@@ -8,6 +8,11 @@ use super::*;
 /// 服务端事件 → 界面事件。
 pub(super) fn map_event(event: ServerEvent) -> UiEvent {
     match event {
+        ServerEvent::Authenticated { user, token } => UiEvent::Authenticated { user, token },
+        ServerEvent::AuthRequired => UiEvent::AuthRequired,
+        ServerEvent::Friends { users } => UiEvent::Friends { users },
+        ServerEvent::Rooms { rooms } => UiEvent::Conversations { rooms },
+        ServerEvent::RoomMembers { .. } => UiEvent::Status("房间成员已更新".into()),
         ServerEvent::Lobby { info } => UiEvent::Presence {
             room: info.room,
             online: info.online_count,

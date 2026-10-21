@@ -254,6 +254,16 @@ impl ChatApp {
                 self.my_id = None;
                 self.status = "连接已断开，可重新加入".into();
             }
+            UiEvent::Authenticated { user, .. } => {
+                self.account = Some(user);
+                self.status = "已登录".into();
+            }
+            UiEvent::Conversations { rooms } => self.conversations = rooms,
+            UiEvent::Friends { users } => self.friends = users,
+            UiEvent::AuthRequired => {
+                self.account = None;
+                self.status = "请先登录".into();
+            }
         }
     }
 

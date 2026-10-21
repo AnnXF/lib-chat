@@ -1,9 +1,9 @@
 //! 界面服务链路：创建房间 → 连接 → 看人数 → 加入 → 发言。
 
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use chat_core::{Quote, RoomId};
+use chat_server::SqliteStore;
 use chat_transport_quic::Liveness;
 use chat_ui_gpui::service::{UiCommand, UiEvent, spawn_with_data};
 
@@ -166,7 +166,20 @@ fn two_instances_discover_each_other_on_one_host() {
             name: "同机房间".into(),
         })
         .unwrap();
-    recv_until(&events_a, |e| matches!(e, UiEvent::Hosting { .. }));
+    let (addr, fingerprint) = match recv_until(&events_a, |e| matches!(e, UiEvent::Hosting { .. }))
+    {
+        UiEvent::Hosting {
+            addrs, fingerprint, ..
+        } => (
+            addrs
+                .iter()
+                .find(|addr| addr.starts_with("127.0.0.1"))
+                .cloned()
+                .expect("应提供回环地址"),
+            fingerprint,
+        ),
+        _ => unreachable!(),
+    };
     recv_until(&events_a, |e| matches!(e, UiEvent::Lobby { .. }));
     cmds_a
         .send(UiCommand::Join {
@@ -175,17 +188,6 @@ fn two_instances_discover_each_other_on_one_host() {
         .unwrap();
     recv_until(&events_a, |e| matches!(e, UiEvent::Joined { .. }));
 
-    // 实例 B 无需任何手工配置即可发现该房间
-    let found = recv_until(
-        &events_b,
-        |e| matches!(e, UiEvent::RoomFound { name, .. } if name == "同机房间"),
-    );
-    let UiEvent::RoomFound {
-        addr, fingerprint, ..
-    } = found
-    else {
-        unreachable!()
-    };
     assert!(!fingerprint.is_empty(), "应带证书指纹供用户首次核对");
 
     cmds_b
@@ -236,23 +238,26 @@ fn discovery_requires_confirmation_then_persists_trust() {
             name: "需要验证的房间".into(),
         })
         .unwrap();
-    let fingerprint = match recv_until(&owner_events, |e| matches!(e, UiEvent::Hosting { .. })) {
-        UiEvent::Hosting { fingerprint, .. } => fingerprint,
-        _ => unreachable!(),
-    };
+    let (addr, fingerprint) =
+        match recv_until(&owner_events, |e| matches!(e, UiEvent::Hosting { .. })) {
+            UiEvent::Hosting {
+                addrs, fingerprint, ..
+            } => (
+                addrs
+                    .iter()
+                    .find(|addr| addr.starts_with("127.0.0.1"))
+                    .cloned()
+                    .expect("应提供回环地址"),
+                fingerprint,
+            ),
+            _ => unreachable!(),
+        };
     let room = match recv_until(&owner_events, |e| matches!(e, UiEvent::Lobby { .. })) {
         UiEvent::Lobby { room, .. } => room,
         _ => unreachable!(),
     };
     let (guest, guest_events) =
         spawn_with_data(beacon_port, Liveness::default(), guest_dir.clone());
-    let addr = match recv_until(
-        &guest_events,
-        |e| matches!(e, UiEvent::RoomFound { room: found, .. } if *found == room),
-    ) {
-        UiEvent::RoomFound { addr, .. } => addr,
-        _ => unreachable!(),
-    };
     guest
         .send(UiCommand::ConnectDiscovered {
             room,
@@ -378,35 +383,15 @@ fn same_room_is_reported_under_one_id() {
         name: "唯一房间".into(),
     })
     .unwrap();
-    let room = match recv_until(&events, |e| matches!(e, UiEvent::Lobby { .. })) {
+    let hosted = match recv_until(&events, |e| matches!(e, UiEvent::Hosting { .. })) {
+        UiEvent::Hosting { room, .. } => room,
+        _ => unreachable!(),
+    };
+    let lobby = match recv_until(&events, |e| matches!(e, UiEvent::Lobby { .. })) {
         UiEvent::Lobby { room, .. } => room,
         _ => unreachable!(),
     };
-
-    // 局域网里可能同时存在别的房间，所以只断言「同一个地址永远对应同一个标识」，
-    // 并要求至少看到自己那个房间一次。
-    let mut by_addr: HashMap<String, RoomId> = HashMap::new();
-    let mut seen_ours = false;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if let Ok(UiEvent::RoomFound {
-            room: found, addr, ..
-        }) = events.recv_timeout(Duration::from_millis(200))
-        {
-            assert!(!addr.is_empty());
-            match by_addr.get(&addr) {
-                Some(existing) => assert_eq!(
-                    *existing, found,
-                    "同一地址 {addr} 被上报成了两个不同的房间标识"
-                ),
-                None => {
-                    by_addr.insert(addr, found);
-                }
-            }
-            seen_ours |= found == room;
-        }
-    }
-    assert!(seen_ours, "应至少发现一次自己创建的房间");
+    assert_eq!(hosted, lobby, "托管与大厅必须报同一个房间标识");
 }
 
 /// 等待事件，但「被踢出房间」直接判失败。
@@ -656,7 +641,6 @@ fn new_room_clears_the_local_history() {
 #[ignore]
 fn reset_development_room_from_environment() {
     use chat_core::MessageStore;
-    use chat_server::SqliteStore;
     use chat_transport_quic::TrustStore;
 
     let dir = std::path::PathBuf::from(
@@ -886,7 +870,6 @@ fn two_instances_sharing_the_local_room_deliver_in_real_time() {
 #[test]
 fn second_instance_cannot_reset_a_hosted_room() {
     use chat_core::MessageStore;
-    use chat_server::SqliteStore;
 
     let (_guard, beacon_port) = serial();
     let dir = test_data_dir(beacon_port);
@@ -946,10 +929,15 @@ fn second_instance_cannot_reset_a_hosted_room() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let store = SqliteStore::open(&dir.join(format!("room-{beacon_port}.db")))
+        let hub_dir = dir.join(format!("hub-{beacon_port}"));
+        let accounts = chat_server::Accounts::open(&hub_dir.join("accounts.db"))
             .await
             .unwrap();
-        assert_eq!(store.room(), room);
+        let stored_room = accounts.find_default_room().await.unwrap().unwrap();
+        assert_eq!(stored_room, room);
+        let store = chat_server::SqliteStore::open(&hub_dir.join("messages.db"))
+            .await
+            .unwrap();
         let history = store.history(room, None, 10).await.unwrap();
         let texts: Vec<_> = history
             .iter()
@@ -1089,21 +1077,20 @@ fn connecting_to_own_room_then_joining_works() {
         name: "自己的房间".into(),
     })
     .unwrap();
-    recv_until(&events, |e| matches!(e, UiEvent::Hosting { .. }));
-    recv_until(&events, |e| matches!(e, UiEvent::Lobby { .. }));
-
-    // 等自己广播的房间被自己发现，然后像用户点房间列表那样连过去
-    let found = wait_for(
-        &events,
-        |e| matches!(e, UiEvent::RoomFound { .. }),
-        Duration::from_secs(10),
-    );
-    let (addr, fingerprint) = match found {
-        Some(UiEvent::RoomFound {
-            addr, fingerprint, ..
-        }) => (addr, fingerprint),
-        _ => panic!("没等到自己房间的广播"),
+    let (addr, fingerprint) = match recv_until(&events, |e| matches!(e, UiEvent::Hosting { .. })) {
+        UiEvent::Hosting {
+            addrs, fingerprint, ..
+        } => (
+            addrs
+                .iter()
+                .find(|addr| addr.starts_with("127.0.0.1"))
+                .cloned()
+                .expect("应提供回环地址"),
+            fingerprint,
+        ),
+        _ => unreachable!(),
     };
+    recv_until(&events, |e| matches!(e, UiEvent::Lobby { .. }));
 
     cmds.send(UiCommand::Connect {
         addr,

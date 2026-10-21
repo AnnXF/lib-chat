@@ -2,7 +2,8 @@
 
 use std::path::PathBuf;
 
-use chat_core::{Attachment, RoomId};
+use crate::app::NavTab;
+use chat_core::{Attachment, RoomId, UserId};
 use chat_transport_quic::validate_fingerprint;
 use gpui::{
     Context, Focusable as _, KeyDownEvent, MouseDownEvent, MouseUpEvent, PathPromptOptions, Pixels,
@@ -517,6 +518,117 @@ impl ChatApp {
             line,
             cx,
         );
+    }
+}
+
+impl ChatApp {
+    fn perform_login(&mut self, register: bool, cx: &mut Context<Self>) {
+        let addr = self.login_addr.read(cx).content().trim().to_string();
+        let username = self.login_user.read(cx).content().trim().to_string();
+        let password = self.login_password.read(cx).content().to_string();
+        let fingerprint = self.login_fingerprint.read(cx).content().trim().to_string();
+        if addr.is_empty() || username.is_empty() || password.is_empty() {
+            self.status = "地址、用户名和密码都不能为空".into();
+            self.status_kind = super::StatusKind::Error;
+            cx.notify();
+            return;
+        }
+        self.status = if register {
+            "正在注册…".into()
+        } else {
+            "正在登录…".into()
+        };
+        self.status_kind = super::StatusKind::Info;
+        self.tell(
+            UiCommand::Login {
+                addr,
+                fingerprint: (!fingerprint.is_empty()).then_some(fingerprint),
+                username,
+                password,
+                register,
+            },
+            cx,
+        );
+    }
+
+    pub(crate) fn on_login(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.perform_login(false, cx);
+    }
+
+    pub(crate) fn on_register(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.perform_login(true, cx);
+    }
+
+    pub(crate) fn open_conversation(&mut self, room: RoomId, cx: &mut Context<Self>) {
+        self.status = "正在进入会话…".into();
+        self.status_kind = super::StatusKind::Info;
+        self.tell(UiCommand::OpenRoom { room }, cx);
+    }
+
+    pub(crate) fn on_add_friend(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let username = self.friend_input.read(cx).content().trim().to_string();
+        if username.is_empty() {
+            return;
+        }
+        self.tell(UiCommand::AddFriend { username }, cx);
+    }
+
+    pub(crate) fn on_open_direct(&mut self, user: UserId, cx: &mut Context<Self>) {
+        self.tell(UiCommand::OpenDirect { user }, cx);
+    }
+
+    pub(crate) fn on_create_group(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = self.group_input.read(cx).content().trim().to_string();
+        if name.is_empty() {
+            self.status = "群名称不能为空".into();
+            self.status_kind = super::StatusKind::Error;
+            cx.notify();
+            return;
+        }
+        let members: Vec<UserId> = self.friends.iter().map(|user| user.id).collect();
+        self.tell(UiCommand::CreateGroup { name, members }, cx);
+    }
+}
+
+impl ChatApp {
+    pub(crate) fn on_nav_chats(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.nav = NavTab::Chats;
+        cx.notify();
+    }
+
+    pub(crate) fn on_nav_contacts(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.nav = NavTab::Contacts;
+        cx.notify();
+    }
+
+    pub(crate) fn on_nav_rooms(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.nav = NavTab::Rooms;
+        cx.notify();
     }
 }
 

@@ -13,6 +13,14 @@ pub enum RoomSource {
     Remote,
 }
 
+/// 左侧导航页：聊天 / 通讯录 / 房间与连接。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NavTab {
+    Chats,
+    Contacts,
+    Rooms,
+}
+
 /// 顶栏状态的语气：错误红、重连橙、其余灰。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {

@@ -17,7 +17,7 @@ use chat_core::Client;
 use chat_core::{Connection, ConnectionAcceptor};
 use chat_core::{RoomId, ServerEvent};
 use chat_discovery::{RoomAnnouncement, RoomAnnouncer, RoomBrowser, PROTOCOL_VERSION};
-use chat_server::{Acceptor, Server};
+
 use chat_transport_quic::{
     connect_to, parse_host_port, validate_fingerprint, Liveness, PublicCa, QuicServer,
     ServerIdentity, TrustStore,
@@ -48,7 +48,9 @@ fn usage() {
         "用法:\n  \
          libchat host [--port 0] [--name 房间名]\n  \
          libchat serve [--listen 0.0.0.0:4433] [--name 房间名] [--cert 证书链.pem --key 私钥.pem] [--data-dir 目录] [--announce 广播端口]\n  \
-         libchat join [--server 主机:端口 | --addr 主机:端口] [--fingerprint SHA-256 | --ca 根证书.pem] [--name 昵称] [--data-dir 目录]"
+         libchat register --server 主机:端口 [--fingerprint SHA-256 | --ca 根证书.pem] --user 账号 --password 密码 [--name 昵称]
+  
+         libchat join [--server 主机:端口 | --addr 主机:端口] [--fingerprint SHA-256 | --ca 根证书.pem] --user 账号 (--password 密码 | --token 令牌 | --register) [--name 昵称] [--data-dir 目录]"
     );
 }
 
@@ -58,6 +60,7 @@ async fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("host") => host(&args[1..]).await,
         Some("serve") => serve_cmd(&args[1..]).await,
+        Some("register") => register_cmd(&args[1..]).await,
         Some("join") => join(&args[1..]).await,
         _ => {
             usage();
@@ -110,12 +113,12 @@ async fn serve_cmd(args: &[String]) -> Result<(), AnyErr> {
     println!("证书 SHA-256: {}", serving.fingerprint);
     if self_signed {
         println!(
-            "加入: libchat join --server {} --fingerprint {}",
+            "加入: libchat join --server {} --fingerprint {} --user <账号> --password <密码>",
             serving.addr, serving.fingerprint
         );
     } else {
         println!(
-            "加入: libchat join --server {}（受信 CA 直接校验，私有 CA 加 --ca）",
+            "加入: libchat join --server {} --user <账号> --password <密码>（受信 CA 直接校验，私有 CA 加 --ca）",
             serving.addr
         );
     }
@@ -126,7 +129,7 @@ async fn serve_cmd(args: &[String]) -> Result<(), AnyErr> {
 
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
-        println!("[状态] 在线 {}", serving.server.online_count().await);
+        println!("[状态] 在线 {}", serving.hub.online_count().await);
     }
 }
 
@@ -136,24 +139,30 @@ async fn host(args: &[String]) -> Result<(), AnyErr> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(0);
 
-    let server = Server::new(name.clone());
+    let data_dir = match opt(args, "--data-dir") {
+        Some(path) => PathBuf::from(path),
+        None => default_data_dir()?,
+    };
+    let hub = chat_server::Hub::open(&data_dir, &name).await?;
     let quic = Arc::new(QuicServer::bind(SocketAddr::from(([0, 0, 0, 0], port)))?);
     let addr = quic.local_addr();
     let fingerprint = quic.fingerprint().to_string();
 
-    let acceptor: Arc<dyn ConnectionAcceptor> = Arc::new(Acceptor(Arc::clone(&server)));
+    let acceptor: Arc<dyn ConnectionAcceptor> =
+        Arc::new(chat_server::HubAcceptor(Arc::clone(&hub)));
     tokio::spawn(Arc::clone(&quic).serve(acceptor));
 
-    let _advertiser = match RoomAnnouncer::start(server.room(), &name, addr.port(), &fingerprint) {
-        Ok(a) => {
-            println!("已广播房间（mDNS + UDP），局域网客户端可直接发现");
-            Some(a)
-        }
-        Err(e) => {
-            eprintln!("广播失败，客户端请用 --addr 手动连接: {e}");
-            None
-        }
-    };
+    let _advertiser =
+        match RoomAnnouncer::start(hub.default_room(), &name, addr.port(), &fingerprint) {
+            Ok(a) => {
+                println!("已广播房间（mDNS + UDP），局域网客户端可直接发现");
+                Some(a)
+            }
+            Err(e) => {
+                eprintln!("广播失败，客户端请用 --addr 手动连接: {e}");
+                None
+            }
+        };
 
     println!("房间: {name}");
     println!("监听: {addr}");
@@ -163,13 +172,13 @@ async fn host(args: &[String]) -> Result<(), AnyErr> {
         eprintln!("未找到局域网 IPv4 地址，客户端请依赖 mDNS 发现");
     }
     for a in &lan {
-        println!("加入: libchat join --addr {a} --fingerprint {fingerprint}");
+        println!("加入: libchat join --addr {a} --fingerprint {fingerprint} --user <账号> --password <密码>");
     }
     println!("按 Ctrl+C 退出");
 
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
-        println!("[状态] 在线 {}", server.online_count().await);
+        println!("[状态] 在线 {}", hub.online_count().await);
     }
 }
 
@@ -285,6 +294,31 @@ async fn join(args: &[String]) -> Result<(), AnyErr> {
     let conn_dyn: Arc<dyn Connection> = conn.clone();
     let client = Client::new(conn_dyn);
 
+    // Hub 要求所有连接先登录；局域网发现到房间后也一样
+    let user = opt(args, "--user").ok_or("需要 --user（账号）与 --password，或用 --token")?;
+    let password = opt(args, "--password").unwrap_or_default();
+    if let Some(token) = opt(args, "--token") {
+        client.resume(token).await?;
+    } else if args.iter().any(|arg| arg == "--register") {
+        client.register(&user, &password, &name).await?;
+    } else {
+        if password.is_empty() {
+            return Err("需要 --password（或用 --token/--register）".into());
+        }
+        client.login(&user, &password).await?;
+    }
+    loop {
+        match client.next_event().await? {
+            ServerEvent::Authenticated { user, .. } => {
+                println!("已登录为 {}（{}）", user.display_name, user.username);
+                break;
+            }
+            ServerEvent::Error { message, .. } => return Err(message.into()),
+            ServerEvent::AuthRequired => return Err("登录失败：未通过认证".into()),
+            _ => {}
+        }
+    }
+
     // 未加入先说清人数：大厅只给摘要，不给消息
     client.lobby(room).await?;
     let Some(ServerEvent::Lobby { info }) = next_lobby(&client).await else {
@@ -359,6 +393,45 @@ async fn next_lobby(client: &Client) -> Option<ServerEvent> {
         }
     }
     None
+}
+
+/// 连接服务端注册账号，打印可复用的登录令牌。
+async fn register_cmd(args: &[String]) -> Result<(), AnyErr> {
+    let server = opt(args, "--server")
+        .or_else(|| opt(args, "--addr"))
+        .ok_or("需要 --server 主机:端口")?;
+    let (host, port) = parse_host_port(&server)?;
+    let identity = identity_for(
+        &host,
+        opt(args, "--fingerprint"),
+        opt(args, "--ca").as_deref(),
+    )?;
+    let username = opt(args, "--user").ok_or("需要 --user")?;
+    let password = opt(args, "--password").ok_or("需要 --password")?;
+    let display = opt(args, "--name").unwrap_or_else(|| username.clone());
+
+    let quic = connect_to(&host, port, &identity, Liveness::default()).await?;
+    println!("已连接 {}", quic.room_info().name);
+    let conn: Arc<dyn Connection> = Arc::new(quic);
+    let client = Client::new(conn);
+    client.register(&username, &password, &display).await?;
+    loop {
+        match client.next_event().await? {
+            ServerEvent::Authenticated { user, token } => {
+                println!("注册成功: {} ({})", user.display_name, user.username);
+                println!("令牌: {token}");
+                println!(
+                    "加入: libchat join --server {server} --user {} --password <密码>",
+                    user.username
+                );
+                break;
+            }
+            ServerEvent::Error { message, .. } => return Err(message.into()),
+            ServerEvent::AuthRequired => return Err("注册失败：服务端未返回登录态".into()),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

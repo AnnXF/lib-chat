@@ -20,7 +20,7 @@ mod update;
 mod views;
 pub mod widgets;
 
-pub use model::{ChatLine, DiscoveredRoom, HostedRoom, RoomSource, RoomView, StatusKind};
+pub use model::{ChatLine, DiscoveredRoom, HostedRoom, NavTab, RoomSource, RoomView, StatusKind};
 
 use std::collections::HashSet;
 
@@ -41,6 +41,14 @@ pub struct ChatApp {
     addr_input: Entity<TextInput>,
     fingerprint_input: Entity<TextInput>,
     message: Entity<TextInput>,
+    /// 登录表单。
+    login_addr: Entity<TextInput>,
+    login_user: Entity<TextInput>,
+    login_password: Entity<TextInput>,
+    login_fingerprint: Entity<TextInput>,
+    /// 好友与建群输入。
+    friend_input: Entity<TextInput>,
+    group_input: Entity<TextInput>,
     /// 手动连接面板是否展开。
     show_connect_form: bool,
     /// 公网托管面板是否展开。
@@ -75,6 +83,15 @@ pub struct ChatApp {
     message_menu: Option<MessageMenu>,
     /// 输入框上方待发送的引用；发送成功或点 × 清除。
     pending_quote: Option<chat_core::Quote>,
+    /// 已登录账号；`None` 时界面显示登录页。
+    account: Option<chat_core::UserSummary>,
+    /// 我的会话列表（群聊 + 单聊）。
+    conversations: Vec<chat_core::RoomSummary>,
+    friends: Vec<chat_core::UserSummary>,
+    /// 微信式左侧导航：聊天 / 通讯录 / 房间。
+    nav: NavTab,
+    /// 会话与好友搜索。
+    search: Entity<TextInput>,
 }
 
 /// 消息右键菜单的目标与位置。
@@ -106,7 +123,23 @@ impl ChatApp {
     pub fn for_test(cx: &mut Context<Self>) -> Self {
         let (cmd_tx, _cmd_rx) = flume::bounded(1);
         let (_event_tx, events) = flume::bounded(1);
-        Self::with_channels(cmd_tx, events, cx)
+        let mut app = Self::with_channels(cmd_tx, events, cx);
+        // 布局测试直接看聊天界面；登录页有单独的用例
+        app.account = Some(chat_core::UserSummary {
+            id: UserId::new(),
+            username: "tester".into(),
+            display_name: "测试用户".into(),
+        });
+        // 旧布局测试跑「房间」页；聊天/通讯录页另有专项用例
+        app.nav = NavTab::Rooms;
+        app
+    }
+
+    /// 切换左侧导航页，供无头测试验证三栏布局。
+    #[cfg(any(test, feature = "ui-test"))]
+    pub fn debug_nav(&mut self, nav: NavTab, cx: &mut Context<Self>) {
+        self.nav = nav;
+        cx.notify();
     }
 
     /// 直接投递一条服务事件，等价于后端事件泵收到它。
@@ -119,6 +152,13 @@ impl ChatApp {
     #[cfg(any(test, feature = "ui-test"))]
     pub fn debug_message_input(&self, cx: &gpui::App) -> String {
         self.message.read(cx).content().to_string()
+    }
+
+    /// 模拟退出登录，供登录页布局测试使用。
+    #[cfg(any(test, feature = "ui-test"))]
+    pub fn debug_logout(&mut self, cx: &mut Context<Self>) {
+        self.account = None;
+        cx.notify();
     }
 
     fn with_channels(
@@ -142,6 +182,17 @@ impl ChatApp {
         let public_cert = cx.new(|cx| TextInput::new("证书链 PEM 路径（留空自签）", cx));
         let public_key = cx.new(|cx| TextInput::new("私钥 PEM 路径（留空自签）", cx));
         let public_domain = cx.new(|cx| TextInput::new("域名，如 chat.example.com（可选）", cx));
+        let login_addr = cx.new(|cx| {
+            let mut input = TextInput::new("服务端地址，如 127.0.0.1:4433", cx);
+            input.set_content("127.0.0.1:4433", cx);
+            input
+        });
+        let login_user = cx.new(|cx| TextInput::new("用户名（3-32 位字母数字）", cx));
+        let login_password = cx.new(|cx| TextInput::new("密码（至少 8 位）", cx));
+        let login_fingerprint = cx.new(|cx| TextInput::new("自签服务端指纹；受信 CA 留空", cx));
+        let friend_input = cx.new(|cx| TextInput::new("好友用户名", cx));
+        let group_input = cx.new(|cx| TextInput::new("群名称（拉入全部好友）", cx));
+        let search = cx.new(|cx| TextInput::new("搜索会话或好友", cx));
         let message = cx.new(|cx| {
             let mut input = TextInput::new("输入消息，Enter 发送", cx);
             // 外观由输入区容器负责，控件本身不再带底色与内边距
@@ -197,6 +248,12 @@ impl ChatApp {
             public_cert,
             public_key,
             public_domain,
+            login_addr,
+            login_user,
+            login_password,
+            login_fingerprint,
+            friend_input,
+            group_input,
             pending_trust: None,
             rooms: Vec::new(),
             room: None,
@@ -214,6 +271,11 @@ impl ChatApp {
             my_id: None,
             message_menu: None,
             pending_quote: None,
+            account: None,
+            conversations: Vec::new(),
+            friends: Vec::new(),
+            nav: NavTab::Chats,
+            search,
         }
     }
 }
@@ -237,7 +299,9 @@ impl Render for ChatApp {
             // 全局快捷键：Esc 收起浮层，Cmd/Ctrl+K 手动连接，Cmd/Ctrl+Shift+P 公网服务
             .on_key_down(cx.listener(Self::on_key_down))
             .child(header)
-            .child(
+            .child(if self.account.is_none() {
+                self.render_login(cx).into_any_element()
+            } else {
                 div()
                     .id("app-body")
                     .test_id("app-body")
@@ -246,9 +310,11 @@ impl Render for ChatApp {
                     .flex_1()
                     .min_h(px(0.))
                     .min_w(px(0.))
+                    .child(self.render_nav(cx))
                     .child(sidebar)
-                    .child(main),
-            )
+                    .child(main)
+                    .into_any_element()
+            })
             .when_some(menu, |this, menu| {
                 this.child(self.render_message_menu(menu, cx))
             })

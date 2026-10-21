@@ -85,6 +85,33 @@ pub struct Quote {
     pub seq: Option<Seq>,
 }
 
+/// 会话类型：群聊或一对一单聊。单聊复用房间与消息模型。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomKind {
+    Group,
+    Direct,
+}
+
+/// 账号的公开信息，绝不包含密码或令牌。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserSummary {
+    pub id: UserId,
+    pub username: String,
+    pub display_name: String,
+}
+
+/// 会话列表里的一行。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RoomSummary {
+    pub room: RoomId,
+    pub kind: RoomKind,
+    pub name: String,
+    pub member_count: u32,
+    /// 房间当前最新序号，客户端据此判断是否有新消息。
+    pub last_seq: Seq,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Message {
     pub room: RoomId,
@@ -121,6 +148,48 @@ pub struct RoomInfo {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientRequest {
+    // ---------------------------------------------------------------- 账号
+    /// 注册并发下登录令牌。用户名唯一，密码至少 8 位。
+    Register {
+        username: String,
+        password: String,
+        display_name: String,
+    },
+    Login {
+        username: String,
+        password: String,
+    },
+    /// 用本地保存的令牌恢复登录，避免每次启动都输密码。
+    Resume {
+        token: String,
+    },
+    Logout,
+
+    // ---------------------------------------------------------------- 好友
+    ListFriends,
+    /// 按用户名添加好友；双方直接建立关系，MVP 不做申请审批。
+    AddFriend {
+        username: String,
+    },
+
+    // ---------------------------------------------------------------- 房间
+    /// 我加入的所有会话（群聊 + 单聊）。
+    ListRooms,
+    /// 创建群聊并把选中的好友直接拉进来。
+    CreateGroup {
+        name: String,
+        members: Vec<UserId>,
+    },
+    /// 打开与某人的单聊；已有就直接复用。
+    OpenDirect {
+        user: UserId,
+    },
+    /// 查询房间成员。
+    RoomMembers {
+        room: RoomId,
+    },
+
+    // ---------------------------------------------------------------- 房间内
     /// 查询大厅摘要，无需加入。
     Lobby {
         room: RoomId,
@@ -164,6 +233,23 @@ pub enum ClientRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEvent {
+    /// 登录/注册/恢复成功；`token` 由客户端保存，下次用 `Resume`。
+    Authenticated {
+        user: UserSummary,
+        token: String,
+    },
+    /// 当前连接还没有登录，除注册/登录外的请求都会被拒绝。
+    AuthRequired,
+    Friends {
+        users: Vec<UserSummary>,
+    },
+    Rooms {
+        rooms: Vec<RoomSummary>,
+    },
+    RoomMembers {
+        room: RoomId,
+        members: Vec<UserSummary>,
+    },
     Lobby {
         info: LobbyInfo,
     },
@@ -207,6 +293,10 @@ pub enum ErrorCode {
     AlreadyJoined,
     RoomMismatch,
     InvalidRequest,
+    /// 未登录或令牌失效。
+    Unauthorized,
+    /// 用户名已存在、重复添加好友等。
+    Conflict,
     /// 附件超过 [`MAX_ATTACHMENT_BYTES`]。
     TooLarge,
     /// 附件不存在或尚未上传完成。

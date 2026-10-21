@@ -1,0 +1,185 @@
+//! Hub：账号、好友、单聊/群聊与按房间隔离的消息。
+
+use std::time::Duration;
+
+use chat_core::{Client, DeviceId, ErrorCode, RoomKind, ServerEvent, UserSummary};
+use chat_server::Hub;
+
+fn temp_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("libchat-hub-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+async fn wait_for<F>(client: &Client, pred: F) -> ServerEvent
+where
+    F: Fn(&ServerEvent) -> bool,
+{
+    for _ in 0..64 {
+        let event = tokio::time::timeout(Duration::from_secs(2), client.next_event())
+            .await
+            .expect("等待事件超时")
+            .expect("连接已关闭");
+        if pred(&event) {
+            return event;
+        }
+    }
+    panic!("未收到期望事件");
+}
+
+async fn register(hub: &std::sync::Arc<Hub>, name: &str) -> (Client, UserSummary) {
+    let client = Client::new(hub.connect(DeviceId::new()).await);
+    client.register(name, "password123", name).await.unwrap();
+    match wait_for(&client, |event| {
+        matches!(event, ServerEvent::Authenticated { .. })
+    })
+    .await
+    {
+        ServerEvent::Authenticated { user, .. } => (client, user),
+        _ => unreachable!(),
+    }
+}
+
+async fn rooms(client: &Client) -> Vec<chat_core::RoomSummary> {
+    client.list_rooms().await.unwrap();
+    match wait_for(client, |event| matches!(event, ServerEvent::Rooms { .. })).await {
+        ServerEvent::Rooms { rooms } => rooms,
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn accounts_friends_direct_chat_and_messages() {
+    let dir = temp_dir("direct");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+
+    let (alice, alice_user) = register(&hub, "alice").await;
+    let (bob, bob_user) = register(&hub, "bob").await;
+
+    alice.add_friend("bob").await.unwrap();
+    match wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await {
+        ServerEvent::Friends { users } => {
+            assert_eq!(
+                users.iter().map(|u| &u.username).collect::<Vec<_>>(),
+                ["bob"]
+            );
+        }
+        _ => unreachable!(),
+    }
+
+    alice.open_direct(bob_user.id).await.unwrap();
+    let direct = rooms(&alice)
+        .await
+        .into_iter()
+        .find(|room| room.kind == RoomKind::Direct)
+        .expect("应出现单聊");
+    assert_eq!(direct.member_count, 2);
+
+    alice.join(direct.room, "alice").await.unwrap();
+    wait_for(&alice, |event| matches!(event, ServerEvent::Joined { .. })).await;
+    bob.join(direct.room, "bob").await.unwrap();
+    wait_for(&bob, |event| matches!(event, ServerEvent::Joined { .. })).await;
+
+    alice.send_text(direct.room, "单聊消息").await.unwrap();
+    match wait_for(
+        &bob,
+        |event| matches!(event, ServerEvent::Message { message } if message.text == "单聊消息"),
+    )
+    .await
+    {
+        ServerEvent::Message { message } => {
+            assert_eq!(message.sender, alice_user.id);
+            assert_eq!(message.sender_name, "alice");
+        }
+        _ => unreachable!(),
+    }
+
+    bob.history(direct.room, None, 10).await.unwrap();
+    match wait_for(&bob, |event| matches!(event, ServerEvent::History { .. })).await {
+        ServerEvent::History { messages, .. } => assert_eq!(messages.len(), 1),
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn groups_only_include_friends_and_reject_outsiders() {
+    let dir = temp_dir("group");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+
+    let (alice, _) = register(&hub, "alice").await;
+    let (bob, bob_user) = register(&hub, "bob").await;
+    let (carol, _) = register(&hub, "carol").await;
+    alice.add_friend("bob").await.unwrap();
+    wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
+
+    alice
+        .create_group("项目群", vec![bob_user.id])
+        .await
+        .unwrap();
+    let group = rooms(&alice)
+        .await
+        .into_iter()
+        .find(|room| room.kind == RoomKind::Group && room.name == "项目群")
+        .expect("应出现群聊");
+    assert_eq!(group.member_count, 2);
+
+    alice.join(group.room, "alice").await.unwrap();
+    wait_for(&alice, |event| matches!(event, ServerEvent::Joined { .. })).await;
+    bob.join(group.room, "bob").await.unwrap();
+    wait_for(&bob, |event| matches!(event, ServerEvent::Joined { .. })).await;
+
+    alice.send_text(group.room, "群消息").await.unwrap();
+    wait_for(
+        &bob,
+        |event| matches!(event, ServerEvent::Message { message } if message.text == "群消息"),
+    )
+    .await;
+
+    // 非成员既不能加入，也收不到消息
+    carol.join(group.room, "carol").await.unwrap();
+    match wait_for(&carol, |event| matches!(event, ServerEvent::Error { .. })).await {
+        ServerEvent::Error { code, .. } => assert_eq!(code, ErrorCode::RoomMismatch),
+        _ => unreachable!(),
+    }
+    match tokio::time::timeout(Duration::from_millis(100), carol.next_event()).await {
+        Err(_) => {}
+        Ok(Ok(ServerEvent::Message { .. })) => panic!("非成员不应收到群消息"),
+        _ => {}
+    }
+}
+
+#[tokio::test]
+async fn unauthenticated_connections_are_asked_to_login() {
+    let dir = temp_dir("auth");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+    let anon = Client::new(hub.connect(DeviceId::new()).await);
+    anon.list_rooms().await.unwrap();
+    match wait_for(&anon, |event| matches!(event, ServerEvent::AuthRequired)).await {
+        ServerEvent::AuthRequired => {}
+        _ => unreachable!(),
+    }
+
+    // 登录后默认房间自动可见
+    let (alice, _) = register(&hub, "alice").await;
+    let rooms = rooms(&alice).await;
+    assert!(rooms.iter().any(|room| room.room == hub.default_room()));
+}
+
+#[tokio::test]
+async fn room_members_are_visible_to_members() {
+    let dir = temp_dir("members");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+    let (alice, _) = register(&hub, "alice").await;
+    let (_bob, bob) = register(&hub, "bob").await;
+
+    alice.room_members(hub.default_room()).await.unwrap();
+    let members = match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::RoomMembers { .. })
+    })
+    .await
+    {
+        ServerEvent::RoomMembers { members, .. } => members,
+        _ => unreachable!(),
+    };
+    assert!(members.iter().any(|user| user.id == bob.id));
+}

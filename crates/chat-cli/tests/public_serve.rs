@@ -71,7 +71,31 @@ where
     panic!("未收到期望事件");
 }
 
+/// 注册一个账号；同名已存在时退化为登录，方便重启后复用。
+async fn authenticate(client: &Client, username: &str) {
+    client
+        .register(username, "password123", username)
+        .await
+        .unwrap();
+    match wait_for(client, |e| {
+        matches!(
+            e,
+            ServerEvent::Authenticated { .. } | ServerEvent::Error { .. }
+        )
+    })
+    .await
+    {
+        ServerEvent::Authenticated { .. } => {}
+        ServerEvent::Error { .. } => {
+            client.login(username, "password123").await.unwrap();
+            wait_for(client, |e| matches!(e, ServerEvent::Authenticated { .. })).await;
+        }
+        _ => unreachable!(),
+    }
+}
+
 async fn join(client: &Client, room: chat_core::RoomId, name: &str) {
+    authenticate(client, name).await;
     client.join(room, name).await.unwrap();
     wait_for(client, |e| matches!(e, ServerEvent::Joined { .. })).await;
 }
@@ -110,16 +134,16 @@ async fn public_server_keeps_room_and_history_across_restarts() {
     .expect("受信 CA 必须能连上公网服务端");
     assert_eq!(conn.room_info().room, room);
     let client = Client::new(Arc::new(conn));
+    join(&client, room, "Alice").await;
     client.lobby(room).await.unwrap();
     match wait_for(&client, |e| matches!(e, ServerEvent::Lobby { .. })).await {
         ServerEvent::Lobby { info } => {
             assert_eq!(info.name, "公网房间");
-            assert_eq!(info.online_count, 0);
+            assert_eq!(info.online_count, 1);
         }
         _ => unreachable!(),
     }
 
-    join(&client, room, "Alice").await;
     client.send_text(room, "公网第一条").await.unwrap();
     wait_for(&client, |e| matches!(e, ServerEvent::Message { .. })).await;
     drop(client);

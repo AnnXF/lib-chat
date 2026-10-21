@@ -1,7 +1,210 @@
 use super::*;
+use crate::app::NavTab;
+use chat_core::RoomId;
 
 impl ChatApp {
+    /// 左侧列表：聊天 / 通讯录 / 房间。
     pub(crate) fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        match self.nav {
+            NavTab::Chats => self.render_chats_sidebar(cx),
+            NavTab::Contacts => self.render_contacts_sidebar(cx),
+            NavTab::Rooms => self.render_rooms_sidebar(cx),
+        }
+    }
+
+    /// 微信式最左侧导航条。
+    pub(crate) fn render_nav(&self, cx: &mut Context<Self>) -> AnyElement {
+        let account_avatar = self
+            .account
+            .as_ref()
+            .map(|user| avatar(user.display_name.chars().next().unwrap_or('?').to_string()));
+        div()
+            .id("nav")
+            .test_id("nav")
+            .w(px(56.))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .py_3()
+            .gap_2()
+            .bg(rgb(theme::BG))
+            .border_r_1()
+            .border_color(rgb(theme::BORDER))
+            .child(nav_button(
+                "聊",
+                "nav-chats",
+                self.nav == NavTab::Chats,
+                cx.listener(Self::on_nav_chats),
+            ))
+            .child(nav_button(
+                "友",
+                "nav-contacts",
+                self.nav == NavTab::Contacts,
+                cx.listener(Self::on_nav_contacts),
+            ))
+            .child(nav_button(
+                "房",
+                "nav-rooms",
+                self.nav == NavTab::Rooms,
+                cx.listener(Self::on_nav_rooms),
+            ))
+            .child(div().flex_1())
+            .when_some(account_avatar, |this, avatar| this.child(avatar))
+            .into_any_element()
+    }
+
+    /// 聊天页：搜索 + 会话列表。
+    pub(crate) fn render_chats_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let query = self.search.read(cx).content().trim().to_lowercase();
+        let rooms: Vec<_> = self
+            .conversations
+            .iter()
+            .filter(|room| query.is_empty() || room.name.to_lowercase().contains(&query))
+            .cloned()
+            .collect();
+        let current = self.room.as_ref().map(|view| view.id);
+        let rows: Vec<_> = rooms
+            .into_iter()
+            .enumerate()
+            .map(|(index, room)| conversation_item(index, room, current, cx))
+            .collect();
+        let empty = rows.is_empty();
+
+        div()
+            .id("sidebar")
+            .test_id("sidebar")
+            .w(px(260.))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(theme::SURFACE))
+            .border_r_1()
+            .border_color(rgb(theme::BORDER))
+            .child(list_title("聊天"))
+            .child(padded(self.search.clone()))
+            .child(
+                div()
+                    .id("conversations")
+                    .test_id("conversations")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .when(empty, |this| {
+                        this.child(hint("还没有会话。去通讯录找好友，或发起群聊。"))
+                    })
+                    .children(rows),
+            )
+            .child(padded(button(
+                "房间与连接",
+                false,
+                true,
+                cx.listener(Self::on_nav_rooms),
+            )))
+            .into_any_element()
+    }
+
+    /// 通讯录页：新的朋友、群聊、好友、发起群聊。
+    pub(crate) fn render_contacts_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let query = self.search.read(cx).content().trim().to_lowercase();
+        let groups: Vec<_> = self
+            .conversations
+            .iter()
+            .filter(|room| room.kind == chat_core::RoomKind::Group)
+            .filter(|room| query.is_empty() || room.name.to_lowercase().contains(&query))
+            .cloned()
+            .collect();
+        let friends: Vec<_> = self
+            .friends
+            .iter()
+            .filter(|user| {
+                query.is_empty()
+                    || user.display_name.to_lowercase().contains(&query)
+                    || user.username.to_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect();
+        let group_rows: Vec<_> = groups
+            .into_iter()
+            .enumerate()
+            .map(|(index, room)| conversation_item(index, room, None, cx))
+            .collect();
+        let friend_rows: Vec<_> = friends
+            .into_iter()
+            .enumerate()
+            .map(|(index, user)| friend_item(index, user, cx))
+            .collect();
+
+        div()
+            .id("sidebar")
+            .test_id("sidebar")
+            .w(px(260.))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(theme::SURFACE))
+            .border_r_1()
+            .border_color(rgb(theme::BORDER))
+            .child(list_title("通讯录"))
+            .child(padded(self.search.clone()))
+            .child(
+                div()
+                    .id("contacts-body")
+                    .test_id("contacts-body")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .pb_3()
+                    .child(section_label("新的朋友"))
+                    .child(padded(self.friend_input.clone()))
+                    .child(padded(button(
+                        "添加好友",
+                        false,
+                        true,
+                        cx.listener(Self::on_add_friend),
+                    )))
+                    .child(section_label("群聊"))
+                    .child(
+                        div()
+                            .id("groups")
+                            .test_id("groups")
+                            .flex()
+                            .flex_col()
+                            .when(group_rows.is_empty(), |this| this.child(hint("还没有群聊")))
+                            .children(group_rows),
+                    )
+                    .child(section_label("好友"))
+                    .child(
+                        div()
+                            .id("friends")
+                            .test_id("friends")
+                            .flex()
+                            .flex_col()
+                            .when(friend_rows.is_empty(), |this| {
+                                this.child(hint("还没有好友"))
+                            })
+                            .children(friend_rows),
+                    )
+                    .child(section_label("发起群聊"))
+                    .child(padded(self.group_input.clone()))
+                    .child(padded(button(
+                        "拉好友建群",
+                        false,
+                        true,
+                        cx.listener(Self::on_create_group),
+                    ))),
+            )
+            .into_any_element()
+    }
+
+    pub(crate) fn render_rooms_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         // 渲染期间要用 cx 注册点击回调，所以先把要用的状态取出来，避免同时借用 self
         let items = self.rooms.clone();
         let local = self.local_room;
@@ -86,6 +289,102 @@ impl ChatApp {
                                 )))
                         },
                     )
+                    // 会话列表（群聊 + 单聊）：登录后由 Hub 推送
+                    .when(!self.conversations.is_empty(), |this| {
+                        this.child(section_label("会话")).child(
+                            div()
+                                .id("conversations")
+                                .test_id("conversations")
+                                .flex()
+                                .flex_col()
+                                .children(self.conversations.iter().enumerate().map(
+                                    |(index, room)| {
+                                        let room_id = room.room;
+                                        let label =
+                                            format!("{} · {} 人", room.name, room.member_count);
+                                        div()
+                                            .id(("conversation", index))
+                                            .h(px(36.))
+                                            .pl_4()
+                                            .pr_4()
+                                            .flex()
+                                            .items_center()
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(rgb(theme::HOVER)))
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.open_conversation(room_id, cx)
+                                                }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.))
+                                                    .truncate()
+                                                    .text_sm()
+                                                    .text_color(rgb(theme::TEXT))
+                                                    .child(label),
+                                            )
+                                            .into_any_element()
+                                    },
+                                )),
+                        )
+                    })
+                    .when(!self.friends.is_empty(), |this| {
+                        this.child(section_label("好友")).child(
+                            div()
+                                .id("friends")
+                                .test_id("friends")
+                                .flex()
+                                .flex_col()
+                                .children(self.friends.iter().enumerate().map(|(index, user)| {
+                                    let user_id = user.id;
+                                    let label = user.display_name.clone();
+                                    div()
+                                        .id(("friend", index))
+                                        .h(px(36.))
+                                        .pl_4()
+                                        .pr_4()
+                                        .flex()
+                                        .items_center()
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(rgb(theme::HOVER)))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.on_open_direct(user_id, cx)
+                                            }),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .text_sm()
+                                                .text_color(rgb(theme::TEXT))
+                                                .child(label),
+                                        )
+                                        .into_any_element()
+                                })),
+                        )
+                    })
+                    .child(section_label("添加好友"))
+                    .child(padded(self.friend_input.clone()))
+                    .child(padded(button(
+                        "添加好友",
+                        false,
+                        true,
+                        cx.listener(Self::on_add_friend),
+                    )))
+                    .child(section_label("新建群聊"))
+                    .child(padded(self.group_input.clone()))
+                    .child(padded(button(
+                        "拉好友建群",
+                        false,
+                        true,
+                        cx.listener(Self::on_create_group),
+                    )))
                     // 「我的房间」：托管中或可恢复，放最上面
                     .child(section_header(
                         "我的房间",
@@ -603,6 +902,171 @@ fn room_row(
             cx.listener(move |this, _: &MouseUpEvent, _window, cx| {
                 this.on_room_click(room_id, addr.clone(), fingerprint.clone(), cx);
             }),
+        )
+        .into_any_element()
+}
+
+fn list_title(text: &str) -> AnyElement {
+    div()
+        .px_4()
+        .pt_4()
+        .pb_2()
+        .text_size(px(18.))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(rgb(theme::TEXT))
+        .child(text.to_string())
+        .into_any_element()
+}
+
+fn nav_button(
+    label: &'static str,
+    test_id: &'static str,
+    active: bool,
+    on_click: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(test_id)
+        .test_id(test_id)
+        .size(px(40.))
+        .rounded_lg()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .text_size(px(13.))
+        .when(active, |this| {
+            this.bg(rgb(theme::ACCENT))
+                .text_color(rgb(theme::ON_ACCENT))
+        })
+        .when(!active, |this| {
+            this.text_color(rgb(theme::MUTED))
+                .hover(|style| style.bg(rgb(theme::HOVER)))
+        })
+        .child(label)
+        .on_mouse_up(MouseButton::Left, on_click)
+        .into_any_element()
+}
+
+fn avatar(text: String) -> AnyElement {
+    div()
+        .size(px(36.))
+        .flex_none()
+        .rounded_full()
+        .bg(rgb(theme::ACCENT))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(14.))
+        .text_color(rgb(theme::ON_ACCENT))
+        .child(text)
+        .into_any_element()
+}
+
+fn conversation_item(
+    index: usize,
+    room: chat_core::RoomSummary,
+    current: Option<RoomId>,
+    cx: &mut Context<ChatApp>,
+) -> AnyElement {
+    let room_id = room.room;
+    let selected = current == Some(room_id);
+    let name = room.name.clone();
+    let first = name.chars().next().unwrap_or('?').to_string();
+    let subtitle = if room.kind == chat_core::RoomKind::Direct {
+        "单聊".to_string()
+    } else {
+        format!("{} 人", room.member_count)
+    };
+    let badge = if room.last_seq > 0 {
+        room.last_seq.to_string()
+    } else {
+        String::new()
+    };
+    div()
+        .id(("conversation-item", index))
+        .h(px(60.))
+        .px_3()
+        .flex()
+        .items_center()
+        .gap_3()
+        .cursor_pointer()
+        .when(selected, |this| this.bg(rgb(theme::HOVER)))
+        .hover(|style| style.bg(rgb(theme::HOVER)))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| this.open_conversation(room_id, cx)),
+        )
+        .child(avatar(first))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .truncate()
+                        .text_sm()
+                        .text_color(rgb(theme::TEXT))
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_xs()
+                        .text_color(rgb(theme::FAINT))
+                        .child(subtitle),
+                ),
+        )
+        .child(div().text_xs().text_color(rgb(theme::FAINT)).child(badge))
+        .into_any_element()
+}
+
+fn friend_item(
+    index: usize,
+    user: chat_core::UserSummary,
+    cx: &mut Context<ChatApp>,
+) -> AnyElement {
+    let user_id = user.id;
+    let name = user.display_name.clone();
+    let first = name.chars().next().unwrap_or('?').to_string();
+    let username = user.username.clone();
+    div()
+        .id(("friend-item", index))
+        .h(px(56.))
+        .px_3()
+        .flex()
+        .items_center()
+        .gap_3()
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(theme::HOVER)))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| this.on_open_direct(user_id, cx)),
+        )
+        .child(avatar(first))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .truncate()
+                        .text_sm()
+                        .text_color(rgb(theme::TEXT))
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_xs()
+                        .text_color(rgb(theme::FAINT))
+                        .child(username),
+                ),
         )
         .into_any_element()
 }

@@ -252,6 +252,25 @@ impl Server {
             return Err(chat_core::ChatError::Closed);
         }
         match req {
+            // 账号与多房间由 Hub 承载；单房间 Server 明确拒绝，避免静默忽略
+            ClientRequest::Register { .. }
+            | ClientRequest::Login { .. }
+            | ClientRequest::Resume { .. }
+            | ClientRequest::Logout
+            | ClientRequest::ListFriends
+            | ClientRequest::AddFriend { .. }
+            | ClientRequest::ListRooms
+            | ClientRequest::CreateGroup { .. }
+            | ClientRequest::OpenDirect { .. }
+            | ClientRequest::RoomMembers { .. } => {
+                self.error_to(
+                    conn,
+                    ErrorCode::InvalidRequest,
+                    "当前服务端只支持单房间模式",
+                )
+                .await;
+            }
+
             ClientRequest::Lobby { room } => {
                 if room != self.room {
                     self.error_to(conn, ErrorCode::RoomMismatch, "房间不存在")

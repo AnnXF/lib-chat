@@ -7,7 +7,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::proto::{
-    Attachment, AttachmentId, ClientRequest, Profile, Quote, RoomId, Seq, ServerEvent,
+    Attachment, AttachmentId, ClientRequest, Profile, Quote, RoomId, Seq, ServerEvent, UserId,
 };
 use crate::{Connection, Result};
 
@@ -19,6 +19,81 @@ pub struct Client {
 impl Client {
     pub fn new(conn: Arc<dyn Connection>) -> Self {
         Self { conn }
+    }
+
+    // ---------------------------------------------------------------- 账号
+    pub async fn register(
+        &self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+        display_name: impl Into<String>,
+    ) -> Result<()> {
+        self.conn
+            .request(ClientRequest::Register {
+                username: username.into(),
+                password: password.into(),
+                display_name: display_name.into(),
+            })
+            .await
+    }
+
+    pub async fn login(
+        &self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Result<()> {
+        self.conn
+            .request(ClientRequest::Login {
+                username: username.into(),
+                password: password.into(),
+            })
+            .await
+    }
+
+    pub async fn resume(&self, token: impl Into<String>) -> Result<()> {
+        self.conn
+            .request(ClientRequest::Resume {
+                token: token.into(),
+            })
+            .await
+    }
+
+    pub async fn logout(&self) -> Result<()> {
+        self.conn.request(ClientRequest::Logout).await
+    }
+
+    // ---------------------------------------------------------------- 好友与会话
+    pub async fn list_friends(&self) -> Result<()> {
+        self.conn.request(ClientRequest::ListFriends).await
+    }
+
+    pub async fn add_friend(&self, username: impl Into<String>) -> Result<()> {
+        self.conn
+            .request(ClientRequest::AddFriend {
+                username: username.into(),
+            })
+            .await
+    }
+
+    pub async fn list_rooms(&self) -> Result<()> {
+        self.conn.request(ClientRequest::ListRooms).await
+    }
+
+    pub async fn create_group(&self, name: impl Into<String>, members: Vec<UserId>) -> Result<()> {
+        self.conn
+            .request(ClientRequest::CreateGroup {
+                name: name.into(),
+                members,
+            })
+            .await
+    }
+
+    pub async fn open_direct(&self, user: UserId) -> Result<()> {
+        self.conn.request(ClientRequest::OpenDirect { user }).await
+    }
+
+    pub async fn room_members(&self, room: RoomId) -> Result<()> {
+        self.conn.request(ClientRequest::RoomMembers { room }).await
     }
 
     /// 查询大厅摘要，无需加入房间。
