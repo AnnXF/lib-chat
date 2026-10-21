@@ -18,6 +18,8 @@ gpui = "0.2.2"
 unicode-segmentation = "1.13.3"
 flume = "0.12.0"
 if-addrs = "0.15.0"
+serde.workspace = true
+serde_json.workspace = true
 uuid.workspace = true
 
 [features]
@@ -26,3 +28,4 @@ ui-test = ["gpui/test-support"]
 
 [dev-dependencies]
 async-trait.workspace = true
+rcgen = "0.14.10"

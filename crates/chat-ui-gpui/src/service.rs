@@ -8,10 +8,12 @@
 //! | [`protocol`] | 网络协议 → 界面事件 |
 //! | [`hosting`] | 本机托管房间：监听、广播、人数上报 |
 //! | [`discovery`] | 局域网房间发现与人数探测 |
+//! | [`remote`] | 公网地址簿：保存地址、周期探测 |
 
 mod discovery;
 mod hosting;
 mod protocol;
+mod remote;
 mod session;
 
 use std::collections::HashMap;
@@ -28,19 +30,24 @@ use chat_core::{LobbyInfo, Message, RoomId, Seq, ServerEvent, UserId};
 use chat_discovery::{RoomAnnouncer, RoomBrowser};
 use chat_server::{Acceptor, Server};
 use chat_transport_quic::{
-    Liveness, QuicConnection, QuicServer, TrustStore, connect, connect_with, validate_fingerprint,
+    Liveness, PublicCa, QuicServer, ServerIdentity, TrustStore, connect_to, parse_host_port,
+    validate_fingerprint,
 };
 use discovery::{DiscoveredRooms, browse_loop};
 use flume::{Receiver, Sender};
-use hosting::{Hosting, RoomHostLock, claim_local_room, local_room, start_host};
+use hosting::{
+    Hosting, PublicStart, RoomHostLock, claim_local_room, local_room, start_host, start_public_host,
+};
+use remote::RemoteServers;
 use session::{Active, SessionCmd, open_session};
 
 /// 房间列表的人数复查间隔。房间要在未加入时也能看到人数，只能周期性探测。
 const PROBE_INTERVAL: Duration = Duration::from_secs(3);
-/// 单次握手与查询的超时。
-/// 单次探测的总期限。必须长于传输层握手期限，否则探测会先取消，
-/// 服务端只能看到一条握手到一半就消失的连接。
-const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+/// 单次探测的总期限。
+///
+/// 必须长于传输层对单个地址的握手期限，并留出域名解析出多个地址时逐个尝试的余量；
+/// 否则探测会先取消，服务端只能看到一条握手到一半就消失的连接。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 /// 建房：起监听与广播、开人数上报，并把房主自己也接进去。
 ///
 /// 自己接不进去不算建房失败——房间已经在广播了，别人照样能连，只是本窗口暂时不进房。
@@ -76,7 +83,7 @@ async fn start_hosting(
     // 房主自己也接入房间，否则同一个窗口里无法参与聊天
     let session = match open_session(
         &started.addr,
-        Some(&started.fingerprint),
+        &ServerIdentity::fingerprint(started.fingerprint.clone()),
         events,
         liveness,
         Some(started.server.room()),
@@ -125,6 +132,16 @@ pub struct HistoryMessage {
     pub attachment: Option<Attachment>,
 }
 
+/// 公网托管的接入信息：客户端据此决定填域名还是填指纹。
+#[derive(Clone, Debug)]
+pub struct PublicHosting {
+    pub port: u16,
+    /// 用户填写的域名；留空时客户端需要自行用可解析的域名连接。
+    pub domain: Option<String>,
+    /// 使用受信 CA 签发的证书；否则是自签 + 指纹固定。
+    pub trusted_ca: bool,
+}
+
 #[derive(Clone, Debug)]
 pub enum UiEvent {
     Status(String),
@@ -142,12 +159,21 @@ pub enum UiEvent {
         fingerprint: String,
         online: u32,
     },
+    /// 公网服务器探测到的房间：没有广播，靠保存的地址周期探测。
+    RemoteRoom {
+        room: RoomId,
+        name: String,
+        addr: String,
+        online: u32,
+    },
     /// 本机已作为房主启动。
     Hosting {
         room: RoomId,
         name: String,
         addrs: Vec<String>,
         fingerprint: String,
+        /// 公网托管时的端口与接入方式；局域网为 `None`。
+        public: Option<PublicHosting>,
     },
     /// 本机已经有一个可恢复的房间（房间标识 + 已存多少条消息）。界面据此给出入口。
     LocalRoom {
@@ -214,18 +240,29 @@ pub enum UiCommand {
     Host {
         name: String,
     },
+    /// 在本机启动公网服务端：PEM 证书或自签，固定端口，不广播。
+    HostPublic {
+        name: String,
+        port: u16,
+        cert: Option<PathBuf>,
+        key: Option<PathBuf>,
+        /// 填了就在本机以客户端身份自动接入，并显示为加入地址。
+        domain: Option<String>,
+    },
     /// 清空本机房间的历史，从空白重新开一个。
     NewRoom {
         name: String,
     },
     Connect {
         addr: String,
+        /// 自签房间的指纹；为空表示公网受信 CA。
         fingerprint: Option<String>,
     },
     ConnectDiscovered {
         room: RoomId,
         addr: String,
-        fingerprint: String,
+        /// 局域网广播一定带指纹；公网地址簿不带。
+        fingerprint: Option<String>,
     },
     ConfirmTrust {
         room: RoomId,
@@ -328,7 +365,11 @@ async fn start_new_room(
         RoomRequest::Reopen(name) => (name, false),
         RoomRequest::New(name) => (name, true),
     };
-    let lock = if hosting.is_none() {
+    // 当前托管的是公网房间（没有局域网分区锁）时，得先拿一把新的
+    let needs_lock = hosting
+        .as_ref()
+        .is_none_or(|current| current.lock.is_none());
+    let fresh_lock = if needs_lock {
         match claim_local_room(data_dir, beacon_port) {
             Ok(lock) => Some(lock),
             Err(e) => {
@@ -343,11 +384,14 @@ async fn start_new_room(
     if let Some(previous) = active.take() {
         previous.end().await;
     }
-    let lock = if let Some(previous) = hosting.take() {
+    let previous_lock = if let Some(previous) = hosting.take() {
         previous.shutdown(events).await
     } else {
-        lock.expect("必须持有房主锁才能建房")
+        None
     };
+    let lock = previous_lock
+        .or(fresh_lock)
+        .expect("必须持有房主锁才能建房");
 
     if reset && let Err(e) = lock.reset() {
         let _ = events.send_async(UiEvent::Error(e)).await;
@@ -365,16 +409,151 @@ async fn start_new_room(
     }
 }
 
+/// 启动公网服务端；填了域名就以客户端身份接进去，否则只起服务、等外部客户端连。
+#[allow(clippy::too_many_arguments)]
+async fn start_public_room(
+    name: String,
+    port: u16,
+    cert: Option<PathBuf>,
+    key: Option<PathBuf>,
+    domain: Option<String>,
+    hosting: &mut Option<Hosting>,
+    active: &mut Option<Active>,
+    events: &Sender<UiEvent>,
+    liveness: Liveness,
+    data_dir: &Path,
+) {
+    if let Some(previous) = active.take() {
+        previous.end().await;
+    }
+    if let Some(previous) = hosting.take() {
+        previous.shutdown(events).await;
+    }
+
+    let started = match start_public_host(
+        PublicStart {
+            name: &name,
+            port,
+            cert: cert.as_deref(),
+            key: key.as_deref(),
+            domain: domain.as_deref(),
+            data_dir,
+        },
+        events,
+        liveness,
+    )
+    .await
+    {
+        Ok(started) => started,
+        Err(e) => {
+            let _ = events.send_async(UiEvent::Error(e)).await;
+            return;
+        }
+    };
+
+    let alive = Arc::new(AtomicBool::new(true));
+    let visible = Arc::new(AtomicBool::new(true));
+    let room = started.server.room();
+    spawn_presence_ticker(
+        Arc::clone(&started.server),
+        room,
+        Arc::clone(&alive),
+        Arc::clone(&visible),
+        events.clone(),
+    );
+
+    let public = started.public.clone().expect("公网托管必须带接入信息");
+    let fallback_addr = started.addr.clone();
+    let fingerprint = started.fingerprint.clone();
+    *hosting = Some(Hosting {
+        room,
+        endpoint: Arc::clone(&started.endpoint),
+        store: started.store,
+        _announcer: started.announcer,
+        alive,
+        visible,
+        lock: started.lock,
+    });
+
+    // 受信证书 + 没填域名：本地拿 127.0.0.1 连会因为主机名不符被拒，干脆不自动接入
+    let target = match (&public.domain, public.trusted_ca) {
+        (Some(domain), true) => {
+            let addr = format!("{domain}:{}", public.port);
+            match manual_identity(&addr, None) {
+                Ok(identity) => Some((addr, identity)),
+                Err(e) => {
+                    let _ = events.send_async(UiEvent::Error(e)).await;
+                    None
+                }
+            }
+        }
+        (Some(domain), false) => Some((
+            format!("{domain}:{}", public.port),
+            ServerIdentity::fingerprint(fingerprint.clone()),
+        )),
+        (None, false) => Some((
+            fallback_addr,
+            ServerIdentity::fingerprint(fingerprint.clone()),
+        )),
+        (None, true) => None,
+    };
+
+    *active = match target {
+        Some((addr, identity)) => {
+            match open_session(&addr, &identity, events, liveness, Some(room), None, None).await {
+                Ok((session, lobby)) => {
+                    let _ = events.send_async(lobby).await;
+                    Some(session)
+                }
+                Err(e) => {
+                    let _ = events.send_async(UiEvent::Error(e)).await;
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+}
+
 struct ConnectPolicy<'a> {
     expected_room: Option<RoomId>,
     trust: &'a TrustStore,
     rooms: &'a DiscoveredRooms,
 }
 
+/// 手动连接的校验方式：给了指纹就按固定指纹，否则按公网受信 CA。
+fn manual_identity(addr: &str, fingerprint: Option<String>) -> Result<ServerIdentity, String> {
+    match fingerprint {
+        Some(fingerprint) => {
+            let fingerprint = fingerprint.trim().to_ascii_lowercase();
+            validate_fingerprint(&fingerprint).map_err(|e| e.to_string())?;
+            Ok(ServerIdentity::fingerprint(fingerprint))
+        }
+        None => {
+            let (host, _) = parse_host_port(addr).map_err(|e| e.to_string())?;
+            Ok(public_identity(host))
+        }
+    }
+}
+
+/// 公网身份：默认信任系统内置公共根；私有 CA 用 `LIBCHAT_CA_FILE` 指定 PEM。
+fn public_identity(server_name: impl Into<String>) -> ServerIdentity {
+    let mut public = PublicCa {
+        server_name: server_name.into(),
+        roots_pem: None,
+    };
+    if let Some(path) = std::env::var_os("LIBCHAT_CA_FILE")
+        && let Ok(pem) = std::fs::read(path)
+    {
+        public.roots_pem = Some(pem);
+    }
+    ServerIdentity::PublicCa(public)
+}
+
 /// 候选房间准备好后再关闭旧会话；失败时仍留在原房间。
 async fn take_room(
     addr: &str,
-    fingerprint: Option<&str>,
+    identity: &ServerIdentity,
     hosting: &Option<Hosting>,
     active: &mut Option<Active>,
     events: &Sender<UiEvent>,
@@ -383,7 +562,7 @@ async fn take_room(
 ) -> Result<RoomId, String> {
     let (session, lobby) = open_session(
         addr,
-        fingerprint,
+        identity,
         events,
         liveness,
         policy.expected_room,
@@ -408,25 +587,19 @@ async fn take_room(
 /// 进入一个房间，进不去就把原因报给界面。
 async fn connect_room(
     addr: String,
-    fingerprint: Option<String>,
+    identity: ServerIdentity,
     hosting: &mut Option<Hosting>,
     active: &mut Option<Active>,
     events: &Sender<UiEvent>,
     liveness: Liveness,
     policy: &ConnectPolicy<'_>,
-) {
-    if let Err(e) = take_room(
-        &addr,
-        fingerprint.as_deref(),
-        hosting,
-        active,
-        events,
-        liveness,
-        policy,
-    )
-    .await
-    {
-        let _ = events.send_async(UiEvent::Error(e)).await;
+) -> bool {
+    match take_room(&addr, &identity, hosting, active, events, liveness, policy).await {
+        Ok(_) => true,
+        Err(e) => {
+            let _ = events.send_async(UiEvent::Error(e)).await;
+            false
+        }
     }
 }
 
@@ -472,7 +645,7 @@ async fn adopt_local_room(
         if let Some((addr, fingerprint)) = rooms.host_of(room).await
             && take_room(
                 &addr,
-                Some(&fingerprint),
+                &ServerIdentity::fingerprint(fingerprint.clone()),
                 hosting,
                 active,
                 events,
@@ -512,6 +685,9 @@ async fn run(
         rooms.clone(),
         data_dir.clone(),
     ));
+    // 公网没有广播，靠地址簿周期探测拿房间名与人数
+    let remote = RemoteServers::new(&data_dir);
+    tokio::spawn(remote::probe_loop(events.clone(), remote.clone(), liveness));
 
     // 本机是不是已经有这个端口的房间了？有就在侧栏给一个「回到我的房间」的入口
     if let Some((room, messages)) = local_room(&data_dir, beacon_port).await {
@@ -553,6 +729,28 @@ async fn run(
                 }
             }
 
+            UiCommand::HostPublic {
+                name,
+                port,
+                cert,
+                key,
+                domain,
+            } => {
+                start_public_room(
+                    name,
+                    port,
+                    cert,
+                    key,
+                    domain,
+                    &mut hosting,
+                    &mut active,
+                    &events,
+                    liveness,
+                    &data_dir,
+                )
+                .await;
+            }
+
             UiCommand::NewRoom { name } => {
                 start_new_room(
                     RoomRequest::New(name),
@@ -568,9 +766,17 @@ async fn run(
 
             UiCommand::Connect { addr, fingerprint } => {
                 pending_trust = None;
-                connect_room(
-                    addr,
-                    fingerprint,
+                let identity = match manual_identity(&addr, fingerprint.clone()) {
+                    Ok(identity) => identity,
+                    Err(e) => {
+                        let _ = events.send_async(UiEvent::Error(e)).await;
+                        continue;
+                    }
+                };
+                let public = fingerprint.is_none();
+                let connected = connect_room(
+                    addr.clone(),
+                    identity,
                     &mut hosting,
                     &mut active,
                     &events,
@@ -582,6 +788,10 @@ async fn run(
                     },
                 )
                 .await;
+                // 连上过的公网地址记进地址簿，下次启动自动探测与展示
+                if connected && public {
+                    remote.remember(&addr).await;
+                }
             }
             UiCommand::ConnectDiscovered {
                 room,
@@ -589,48 +799,73 @@ async fn run(
                 fingerprint,
             } => {
                 pending_trust = None;
-                if let Err(e) = validate_fingerprint(&fingerprint) {
-                    let _ = events.send_async(UiEvent::Error(e.to_string())).await;
-                    continue;
-                }
-                let fingerprint = fingerprint.to_ascii_lowercase();
-                match trust.get(room) {
-                    Ok(Some(pinned)) if pinned != fingerprint => {
-                        let _ = events
-                            .send_async(UiEvent::Error(format!(
-                                "房间 {room} 的证书指纹已变更，已拒绝连接"
-                            )))
-                            .await;
+                match fingerprint {
+                    Some(fingerprint) => {
+                        if let Err(e) = validate_fingerprint(&fingerprint) {
+                            let _ = events.send_async(UiEvent::Error(e.to_string())).await;
+                            continue;
+                        }
+                        let fingerprint = fingerprint.to_ascii_lowercase();
+                        match trust.get(room) {
+                            Ok(Some(pinned)) if pinned != fingerprint => {
+                                let _ = events
+                                    .send_async(UiEvent::Error(format!(
+                                        "房间 {room} 的证书指纹已变更，已拒绝连接"
+                                    )))
+                                    .await;
+                            }
+                            Ok(Some(_)) => {
+                                connect_room(
+                                    addr,
+                                    ServerIdentity::fingerprint(fingerprint),
+                                    &mut hosting,
+                                    &mut active,
+                                    &events,
+                                    liveness,
+                                    &ConnectPolicy {
+                                        expected_room: Some(room),
+                                        trust: &trust,
+                                        rooms: &rooms,
+                                    },
+                                )
+                                .await;
+                            }
+                            Ok(None) => {
+                                pending_trust = Some((room, addr.clone(), fingerprint.clone()));
+                                let _ = events
+                                    .send_async(UiEvent::TrustRequired {
+                                        room,
+                                        addr,
+                                        fingerprint,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = events.send_async(UiEvent::Error(e.to_string())).await;
+                            }
+                        }
                     }
-                    Ok(Some(_)) => {
-                        connect_room(
-                            addr,
-                            Some(fingerprint),
-                            &mut hosting,
-                            &mut active,
-                            &events,
-                            liveness,
-                            &ConnectPolicy {
-                                expected_room: Some(room),
-                                trust: &trust,
-                                rooms: &rooms,
-                            },
-                        )
-                        .await
-                    }
-                    Ok(None) => {
-                        pending_trust = Some((room, addr.clone(), fingerprint.clone()));
-                        let _ = events
-                            .send_async(UiEvent::TrustRequired {
-                                room,
+                    None => match manual_identity(&addr, None) {
+                        Ok(identity) => {
+                            connect_room(
                                 addr,
-                                fingerprint,
-                            })
+                                identity,
+                                &mut hosting,
+                                &mut active,
+                                &events,
+                                liveness,
+                                &ConnectPolicy {
+                                    expected_room: Some(room),
+                                    trust: &trust,
+                                    rooms: &rooms,
+                                },
+                            )
                             .await;
-                    }
-                    Err(e) => {
-                        let _ = events.send_async(UiEvent::Error(e.to_string())).await;
-                    }
+                        }
+                        Err(e) => {
+                            let _ = events.send_async(UiEvent::Error(e)).await;
+                        }
+                    },
                 }
             }
             UiCommand::ConfirmTrust {
@@ -641,7 +876,7 @@ async fn run(
                 if pending_trust.take() == Some((room, addr.clone(), fingerprint.clone())) {
                     connect_room(
                         addr,
-                        Some(fingerprint),
+                        ServerIdentity::fingerprint(fingerprint),
                         &mut hosting,
                         &mut active,
                         &events,

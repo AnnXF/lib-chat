@@ -4,7 +4,6 @@ impl ChatApp {
     pub(crate) fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         // 渲染期间要用 cx 注册点击回调，所以先把要用的状态取出来，避免同时借用 self
         let items = self.rooms.clone();
-        let empty = items.is_empty();
         let local = self.local_room;
         // 「新建房间」连库一起删的是本机房间：本机有房间（不用的在侧栏挂着，在用的正托管着）
         // 就得提示，否则正用着的时候反而是没提示的时候
@@ -15,14 +14,19 @@ impl ChatApp {
         let joined = self.room.as_ref().map(|view| view.joined).unwrap_or(false);
         let identity_open = self.show_identity;
 
-        let rows: Vec<AnyElement> = items
-            .into_iter()
-            .enumerate()
-            .map(|(index, room)| {
-                let selected = current == Some(room.id);
-                room_row(index, room, selected, joined, cx)
-            })
-            .collect();
+        let mut local_rooms = Vec::new();
+        let mut remote_rooms = Vec::new();
+        for (index, room) in items.into_iter().enumerate() {
+            let selected = current == Some(room.id);
+            let source = room.source;
+            let row = room_row(index, room, selected, joined, cx);
+            match source {
+                RoomSource::Local => local_rooms.push(row),
+                RoomSource::Remote => remote_rooms.push(row),
+            }
+        }
+        let local_empty = local_rooms.is_empty();
+        let remote_empty = remote_rooms.is_empty();
 
         // 侧栏固定 240px、不参与伸缩；只有主体滚动，底部连接区始终留在窗口内。
         // 房间身份和信任指纹都是长文本，以前放在可滚动的整列里，窗口不够高时会把
@@ -48,6 +52,28 @@ impl ChatApp {
                     .flex()
                     .flex_col()
                     .pb_3()
+                    .when(self.show_public_form, |this| {
+                        this.child(
+                            div()
+                                .id("public-form")
+                                .test_id("public-form")
+                                .flex()
+                                .flex_col()
+                                .child(section_label("公网服务端"))
+                                .child(padded(self.public_port.clone()))
+                                .child(padded(self.public_cert.clone()))
+                                .child(padded(self.public_key.clone()))
+                                .child(padded(self.public_domain.clone()))
+                                .child(padded(button(
+                                    "启动公网服务",
+                                    true,
+                                    true,
+                                    cx.listener(Self::on_start_public),
+                                )))
+                                .child(hint("证书与私钥留空时使用自签，客户端填指纹"))
+                                .child(hint("填域名后本机自动接入，并作为加入地址展示")),
+                        )
+                    })
                     .when_some(
                         self.pending_trust.clone(),
                         |this, (room, addr, fingerprint)| {
@@ -83,9 +109,22 @@ impl ChatApp {
                             .id("rooms")
                             .flex()
                             .flex_col()
-                            .children(rows)
-                            .when(empty, |this| this.child(hint("未发现房间，可手动连接"))),
+                            .children(local_rooms)
+                            .when(local_empty, |this| {
+                                this.child(hint("未发现房间，可手动连接"))
+                            }),
                     )
+                    // 公网没有广播：这里列的是连过一次、已存进地址簿的服务器
+                    .when(!remote_empty, |this| {
+                        this.child(section_label("远程服务器")).child(
+                            div()
+                                .id("remote-rooms")
+                                .test_id("remote-rooms")
+                                .flex()
+                                .flex_col()
+                                .children(remote_rooms),
+                        )
+                    })
                     // 本机那个房间不在局域网里——它要点了才会被广播出去。
                     // 已经待在这个房间里（可能是本机另一个实例开着、我们接过去）就别再摆入口了
                     .when(local_row, |this| {
@@ -120,12 +159,25 @@ impl ChatApp {
                     )))
                     .child(section_label("昵称"))
                     .child(padded(self.nickname.clone()))
-                    .child(padded(button(
-                        "新建房间",
-                        true,
-                        true,
-                        cx.listener(Self::on_new_room),
-                    )))
+                    // 两个入口并排，矮窗口下也不额外占一行高度
+                    .child(padded(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .child(div().flex_1().child(button(
+                                "新建房间",
+                                true,
+                                true,
+                                cx.listener(Self::on_new_room),
+                            )))
+                            .child(div().flex_1().child(button(
+                                "公网服务",
+                                false,
+                                true,
+                                cx.listener(Self::on_toggle_public_form),
+                            ))),
+                    ))
                     .when(local_exists, |this| {
                         this.child(hint("新建会清空本机房间的历史"))
                     }),
@@ -138,7 +190,11 @@ impl ChatApp {
 ///
 /// 完整标识与 64 位指纹常驻侧栏会把「直接连接 / 新建房间」挤下去，也压过了房间列表的视觉重心。
 fn identity_card(hosted: HostedRoom, expanded: bool, cx: &mut Context<ChatApp>) -> AnyElement {
-    let summary = format!("{} · {}", hosted.short_room(), hosted.summary_addr());
+    let summary = if hosted.is_public() {
+        format!("公网 · {}", hosted.summary_addr())
+    } else {
+        format!("{} · {}", hosted.short_room(), hosted.summary_addr())
+    };
     let toggle = div()
         .id("identity-toggle")
         .test_id("identity-toggle")
@@ -152,6 +208,10 @@ fn identity_card(hosted: HostedRoom, expanded: bool, cx: &mut Context<ChatApp>) 
         .hover(|style| style.bg(rgb(theme::HOVER)))
         .on_mouse_up(MouseButton::Left, cx.listener(ChatApp::on_toggle_identity))
         .child(if expanded { "收起" } else { "详情" });
+
+    let fingerprint = hosted.fingerprint.clone();
+    let join_addr = hosted.join_addr();
+    let public = hosted.public.clone();
 
     let mut card = div()
         .id("hosted-room")
@@ -176,6 +236,12 @@ fn identity_card(hosted: HostedRoom, expanded: bool, cx: &mut Context<ChatApp>) 
                         .text_color(rgb(theme::TEXT))
                         .child(hosted.name.clone()),
                 )
+                .child(copy_text_button(
+                    "copy-fingerprint",
+                    fingerprint.clone(),
+                    "证书指纹",
+                    cx,
+                ))
                 .child(toggle),
         )
         .child(
@@ -193,17 +259,90 @@ fn identity_card(hosted: HostedRoom, expanded: bool, cx: &mut Context<ChatApp>) 
                 .test_id("identity-details")
                 .flex()
                 .flex_col()
-                .child(identity_detail("房间", hosted.room.to_string()))
-                .child(identity_detail("地址", hosted.addrs.join("\n")))
-                .child(identity_detail("证书 SHA-256", hosted.fingerprint_rows())),
+                .child(identity_detail(
+                    "房间（分享用，不是连接指纹）",
+                    hosted.room.to_string(),
+                    Some((hosted.room.to_string(), "房间标识", "copy-room")),
+                    cx,
+                ))
+                .child(identity_detail(
+                    if hosted.is_public() {
+                        "监听"
+                    } else {
+                        "地址"
+                    },
+                    hosted.addrs.join("\n"),
+                    hosted
+                        .addrs
+                        .first()
+                        .cloned()
+                        .map(|addr| (addr, "监听地址", "copy-listen")),
+                    cx,
+                ))
+                .when_some(public, |this, public| {
+                    this.child(identity_detail(
+                        "接入地址（客户端填这个）",
+                        join_addr.clone(),
+                        Some((join_addr.clone(), "接入地址", "copy-join-addr")),
+                        cx,
+                    ))
+                    .child(identity_detail(
+                        "证书",
+                        if public.trusted_ca {
+                            "受信 CA 证书，客户端无需指纹"
+                        } else {
+                            "自签，客户端需填下面的 SHA-256"
+                        }
+                        .to_string(),
+                        None,
+                        cx,
+                    ))
+                })
+                .child(identity_detail(
+                    "证书 SHA-256（客户端指纹）",
+                    hosted.fingerprint_rows(),
+                    Some((fingerprint.clone(), "证书指纹", "copy-fingerprint-detail")),
+                    cx,
+                )),
         );
     }
 
     card.into_any_element()
 }
 
-/// 展开态的一行：小标题在上，值在下。
-fn identity_detail(label: &str, value: String) -> AnyElement {
+/// 详情里的一枚「复制」按钮：把原文放进系统剪贴板，并在状态栏说明复制了什么。
+fn copy_text_button(
+    id: &'static str,
+    text: String,
+    label: &'static str,
+    cx: &mut Context<ChatApp>,
+) -> AnyElement {
+    div()
+        .id(id)
+        .test_id(id)
+        .flex_none()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_size(px(11.))
+        .text_color(rgb(theme::ACCENT))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(theme::HOVER)))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| this.copy_text(text.clone(), label, cx)),
+        )
+        .child("复制")
+        .into_any_element()
+}
+
+/// 展开态的一行：小标题在上，值在下，右侧可选一枚复制按钮。
+fn identity_detail(
+    label: &str,
+    value: String,
+    copy: Option<(String, &'static str, &'static str)>,
+    cx: &mut Context<ChatApp>,
+) -> AnyElement {
     div()
         .mt_1()
         .flex()
@@ -215,7 +354,24 @@ fn identity_detail(label: &str, value: String) -> AnyElement {
                 .text_color(rgb(theme::FAINT))
                 .child(label.to_string()),
         )
-        .child(div().text_xs().text_color(rgb(theme::MUTED)).child(value))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_xs()
+                        .text_color(rgb(theme::MUTED))
+                        .child(value),
+                )
+                .when_some(copy, |this, (text, note, id)| {
+                    this.child(copy_text_button(id, text, note, cx))
+                }),
+        )
         .into_any_element()
 }
 

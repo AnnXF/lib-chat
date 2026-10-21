@@ -255,7 +255,7 @@ fn discovery_requires_confirmation_then_persists_trust() {
         .send(UiCommand::ConnectDiscovered {
             room,
             addr: addr.clone(),
-            fingerprint: fingerprint.clone(),
+            fingerprint: Some(fingerprint.clone()),
         })
         .unwrap();
     let pending = recv_until(&guest_events, |e| {
@@ -283,7 +283,7 @@ fn discovery_requires_confirmation_then_persists_trust() {
         .send(UiCommand::ConnectDiscovered {
             room,
             addr,
-            fingerprint: "f".repeat(64),
+            fingerprint: Some("f".repeat(64)),
         })
         .unwrap();
     recv_until(

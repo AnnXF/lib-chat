@@ -5,6 +5,7 @@ use uuid::Uuid;
 use chat_core::{
     Attachment, AttachmentId, MAX_ATTACHMENT_BYTES, guess_mime, sha256_hex, validate_attachment,
 };
+use chat_transport_quic::QuicConnection;
 
 use super::protocol::{await_lobby, map_event};
 use super::*;
@@ -54,12 +55,13 @@ fn backoff(attempt: u32) -> Duration {
     Duration::from_secs((1u64 << attempt.min(3)).min(5))
 }
 
-/// 会话目标：连到哪里、认哪个房间、用什么保活参数。
+/// 会话目标：连到哪里、认哪个房间、用什么身份校验与保活参数。
 ///
 /// 打包在一起，是因为重连时要用**完全相同**的一组参数再连一次。
 struct Target {
-    addr: SocketAddr,
-    fingerprint: String,
+    host: String,
+    port: u16,
+    identity: ServerIdentity,
     room: RoomId,
     liveness: Liveness,
     rooms: Option<DiscoveredRooms>,
@@ -68,14 +70,17 @@ struct Target {
 impl Target {
     /// 建立一条连接。首次连接与重连走的是同一条路径。
     async fn connect(&mut self) -> Result<Arc<dyn Connection>, ChatError> {
+        // 局域网房间重建后会换端口，发现表里有新地址就跟过去；
+        // 公网走域名，重连时由解析结果决定实际地址。
         if let Some(rooms) = &self.rooms
             && let Some((addr, fingerprint)) = rooms.host_of(self.room).await
-            && self.fingerprint == fingerprint
-            && let Ok(addr) = addr.parse()
+            && matches!(&self.identity, ServerIdentity::Fingerprint(pinned) if pinned == &fingerprint)
+            && let Ok((host, port)) = parse_host_port(&addr)
         {
-            self.addr = addr;
+            self.host = host;
+            self.port = port;
         }
-        let conn = connect_once(self.addr, &self.fingerprint, self.liveness).await?;
+        let conn = connect_once(&self.host, self.port, &self.identity, self.liveness).await?;
         if conn.room_info().room != self.room {
             return Err(ChatError::Protocol("重连目标房间标识已改变".into()));
         }
@@ -87,17 +92,20 @@ impl Target {
 ///
 /// 没有超时的话，一次握手会一直挂到 QUIC 空闲超时（默认 60 秒）；而后端是串行处理指令的，
 /// 这一挂就是「点了没反应」——换房间、建房、加入全排不上队。
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// 公网域名可能解析出多个地址，传输层会逐个尝试，因此这里要给足两轮握手的余量。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 const PENDING_SEND_CAPACITY: usize = 128;
 const MAX_TEXT_BYTES: usize = 8 * 1024;
 
 /// 建一条连接，带超时。首次连接与重连共用同一份超时策略。
 async fn connect_once(
-    addr: SocketAddr,
-    fingerprint: &str,
+    host: &str,
+    port: u16,
+    identity: &ServerIdentity,
     liveness: Liveness,
 ) -> Result<QuicConnection, ChatError> {
-    tokio::time::timeout(CONNECT_TIMEOUT, connect_with(addr, fingerprint, liveness))
+    tokio::time::timeout(CONNECT_TIMEOUT, connect_to(host, port, identity, liveness))
         .await
         .map_err(|_| ChatError::Transport(format!("连接超时（{CONNECT_TIMEOUT:?}）")))?
 }
@@ -112,36 +120,43 @@ enum ServeEnd {
 
 pub(super) async fn open_session(
     addr_text: &str,
-    fingerprint: Option<&str>,
+    identity: &ServerIdentity,
     events: &Sender<UiEvent>,
     liveness: Liveness,
     expected_room: Option<RoomId>,
     trust: Option<&TrustStore>,
     rooms: Option<DiscoveredRooms>,
 ) -> Result<(Active, UiEvent), String> {
-    let fingerprint = fingerprint.ok_or("连接房间须提供完整证书指纹")?;
-    validate_fingerprint(fingerprint).map_err(|e| e.to_string())?;
-    let addr: SocketAddr = addr_text
-        .parse()
-        .map_err(|e| format!("地址「{addr_text}」无效: {e}"))?;
-    let fingerprint = fingerprint.to_ascii_lowercase();
+    let (host, port) = parse_host_port(addr_text).map_err(|e| e.to_string())?;
+    let fingerprint = match identity {
+        ServerIdentity::Fingerprint(fingerprint) => {
+            validate_fingerprint(fingerprint).map_err(|e| e.to_string())?;
+            Some(fingerprint.to_ascii_lowercase())
+        }
+        ServerIdentity::PublicCa(_) => None,
+    };
+    let identity = match fingerprint.clone() {
+        Some(fingerprint) => ServerIdentity::fingerprint(fingerprint),
+        None => identity.clone(),
+    };
 
-    let first = connect_once(addr, &fingerprint, liveness)
+    let first = connect_once(&host, port, &identity, liveness)
         .await
         .map_err(|e| format!("连接失败: {e}"))?;
     let room = first.room_info().room;
     if expected_room.is_some_and(|expected| expected != room) {
         return Err("连接房间标识与选中的房间不一致".into());
     }
-    if let Some(trust) = trust
+    if let (Some(trust), Some(fingerprint)) = (trust, &fingerprint)
         && let Some(existing) = trust.get(room).map_err(|e| e.to_string())?
-        && existing != fingerprint
+        && &existing != fingerprint
     {
         return Err(format!("房间 {room} 的证书指纹已变更，已拒绝连接"));
     }
     let target = Target {
-        addr,
-        fingerprint: fingerprint.clone(),
+        host,
+        port,
+        identity: identity.clone(),
         room,
         liveness,
         rooms,
@@ -158,9 +173,10 @@ pub(super) async fn open_session(
     if lobby.room != target.room {
         return Err("房间标识与大厅信息不一致".into());
     }
-    if let Some(trust) = trust {
+    // 指纹是唯一的持久身份，首次连接后固定下来；公网由证书链保证，不另存。
+    if let (Some(trust), Some(fingerprint)) = (trust, &fingerprint) {
         trust
-            .pin(target.room, &fingerprint)
+            .pin(target.room, fingerprint)
             .map_err(|e| e.to_string())?;
     }
     let lobby_event = UiEvent::Lobby {
@@ -760,8 +776,9 @@ mod tests {
         let (_tx, cmds) = flume::unbounded();
         let target = Target {
             room,
-            addr: "127.0.0.1:54321".parse().unwrap(),
-            fingerprint: "a".repeat(64),
+            host: "127.0.0.1".into(),
+            port: 54321,
+            identity: ServerIdentity::fingerprint("a".repeat(64)),
             liveness: Liveness::default(),
             rooms: None,
         };
@@ -823,8 +840,9 @@ mod tests {
         let (_tx, cmds) = flume::unbounded();
         let target = Target {
             room,
-            addr: "127.0.0.1:54321".parse().unwrap(),
-            fingerprint: "a".repeat(64),
+            host: "127.0.0.1".into(),
+            port: 54321,
+            identity: ServerIdentity::fingerprint("a".repeat(64)),
             liveness: Liveness::default(),
             rooms: None,
         };

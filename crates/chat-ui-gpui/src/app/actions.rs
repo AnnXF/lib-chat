@@ -1,11 +1,51 @@
 //! 用户操作：提交服务指令，必要的即时视图变化交给 `update`。
 
+use std::path::PathBuf;
+
 use chat_core::{Attachment, RoomId};
+use chat_transport_quic::validate_fingerprint;
 use gpui::{Context, Focusable as _, MouseUpEvent, PathPromptOptions, Window};
 
 use crate::service::UiCommand;
 
 use super::ChatApp;
+
+struct PublicOptions {
+    port: u16,
+    cert: Option<PathBuf>,
+    key: Option<PathBuf>,
+    domain: Option<String>,
+}
+
+/// 公网表单的输入校验：端口必须有效，证书与私钥要么都给、要么都空。
+fn public_options(
+    port: &str,
+    cert: &str,
+    key: &str,
+    domain: &str,
+) -> Result<PublicOptions, String> {
+    let port: u16 = port
+        .trim()
+        .parse()
+        .map_err(|_| "监听端口无效，应为 1-65535".to_string())?;
+    if port == 0 {
+        return Err("监听端口无效，应为 1-65535".into());
+    }
+    let cert = cert.trim();
+    let key = key.trim();
+    let cert = (!cert.is_empty()).then(|| PathBuf::from(cert));
+    let key = (!key.is_empty()).then(|| PathBuf::from(key));
+    if cert.is_some() != key.is_some() {
+        return Err("证书与私钥必须同时填写，或都留空使用自签".into());
+    }
+    let domain = domain.trim();
+    Ok(PublicOptions {
+        port,
+        cert,
+        key,
+        domain: (!domain.is_empty()).then(|| domain.to_string()),
+    })
+}
 
 impl ChatApp {
     /// 发一条指令并刷新界面。
@@ -48,10 +88,25 @@ impl ChatApp {
 
     pub(crate) fn connect_from_input(&mut self, cx: &mut Context<Self>) {
         let addr = self.addr_input.read(cx).content().trim().to_string();
-        if !addr.is_empty() {
-            let fingerprint = self.fingerprint_input.read(cx).content().trim().to_string();
-            self.connect(addr, (!fingerprint.is_empty()).then_some(fingerprint), cx);
+        if addr.is_empty() {
+            return;
         }
+        let fingerprint = self.fingerprint_input.read(cx).content().trim().to_string();
+        if !fingerprint.is_empty()
+            && let Err(e) = validate_fingerprint(&fingerprint)
+        {
+            self.status = format!("{e}（请复制「我的房间 → 详情 → 证书 SHA-256」）");
+            cx.notify();
+            return;
+        }
+        self.connect(addr, (!fingerprint.is_empty()).then_some(fingerprint), cx);
+    }
+
+    /// 把一段文字放进系统剪贴板，并在状态栏说明复制了什么。
+    pub(crate) fn copy_text(&mut self, text: String, label: &'static str, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.status = format!("已复制{label}");
+        cx.notify();
     }
 
     /// 展开/收起「我的房间」的完整标识与指纹。
@@ -89,7 +144,7 @@ impl ChatApp {
         &mut self,
         room: RoomId,
         addr: String,
-        fingerprint: String,
+        fingerprint: Option<String>,
         cx: &mut Context<Self>,
     ) {
         // 已经是当前房间，重复点击不该触发一次「退出再重连」，那只会白白抖动人数
@@ -143,6 +198,58 @@ impl ChatApp {
     pub(crate) fn on_new_room(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         let name = self.nickname_or("局域网聊天室", cx);
         self.tell(UiCommand::NewRoom { name }, cx);
+    }
+
+    pub(crate) fn toggle_public_form(&mut self, cx: &mut Context<Self>) {
+        self.show_public_form = !self.show_public_form;
+        cx.notify();
+    }
+
+    /// 供无头测试直接展开/收起公网表单。
+    #[cfg(any(test, feature = "ui-test"))]
+    pub fn debug_toggle_public_form(&mut self, cx: &mut Context<Self>) {
+        self.toggle_public_form(cx);
+    }
+
+    pub(crate) fn on_toggle_public_form(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_public_form(cx);
+    }
+
+    pub(crate) fn on_start_public(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let port = self.public_port.read(cx).content().trim().to_string();
+        let cert = self.public_cert.read(cx).content().trim().to_string();
+        let key = self.public_key.read(cx).content().trim().to_string();
+        let domain = self.public_domain.read(cx).content().trim().to_string();
+        match public_options(&port, &cert, &key, &domain) {
+            Ok(options) => {
+                let name = self.nickname_or("公网聊天室", cx);
+                self.show_public_form = false;
+                self.tell(
+                    UiCommand::HostPublic {
+                        name,
+                        port: options.port,
+                        cert: options.cert,
+                        key: options.key,
+                        domain: options.domain,
+                    },
+                    cx,
+                );
+            }
+            Err(e) => {
+                self.status = e;
+                cx.notify();
+            }
+        }
     }
 
     pub(crate) fn on_join(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -235,5 +342,31 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) {
         self.connect_from_input(cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::public_options;
+
+    #[test]
+    fn public_form_requires_a_valid_port_and_a_matched_cert_pair() {
+        let options = public_options("4433", "", "", "").unwrap();
+        assert_eq!(options.port, 4433);
+        assert!(options.cert.is_none());
+        assert!(options.key.is_none());
+        assert!(options.domain.is_none());
+
+        assert!(public_options("0", "", "", "").is_err());
+        assert!(public_options("abc", "", "", "").is_err());
+        assert!(public_options("4433", "cert.pem", "", "").is_err());
+        assert!(public_options("4433", "", "key.pem", "").is_err());
+
+        let options =
+            public_options("4433", " cert.pem ", " key.pem ", " chat.example.com ").unwrap();
+        assert_eq!(options.port, 4433);
+        assert_eq!(options.cert.unwrap().to_string_lossy(), "cert.pem");
+        assert_eq!(options.key.unwrap().to_string_lossy(), "key.pem");
+        assert_eq!(options.domain.as_deref(), Some("chat.example.com"));
     }
 }

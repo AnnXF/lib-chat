@@ -20,7 +20,7 @@ mod update;
 mod views;
 pub mod widgets;
 
-pub use model::{ChatLine, DiscoveredRoom, HostedRoom, RoomView};
+pub use model::{ChatLine, DiscoveredRoom, HostedRoom, RoomSource, RoomView};
 
 use std::collections::HashSet;
 
@@ -38,6 +38,12 @@ pub struct ChatApp {
     addr_input: Entity<TextInput>,
     fingerprint_input: Entity<TextInput>,
     message: Entity<TextInput>,
+    /// 公网托管表单是否展开。
+    show_public_form: bool,
+    public_port: Entity<TextInput>,
+    public_cert: Entity<TextInput>,
+    public_key: Entity<TextInput>,
+    public_domain: Entity<TextInput>,
     pending_trust: Option<(RoomId, String, String)>,
     rooms: Vec<DiscoveredRoom>,
     room: Option<RoomView>,
@@ -102,8 +108,17 @@ impl ChatApp {
             input.set_content("我", cx);
             input
         });
-        let addr_input = cx.new(|cx| TextInput::new("如 192.168.1.5:52000", cx));
-        let fingerprint_input = cx.new(|cx| TextInput::new("房主提供的完整 SHA-256 指纹", cx));
+        let addr_input = cx.new(|cx| TextInput::new("如 127.0.0.1:4433 或 你的域名:4433", cx));
+        let fingerprint_input =
+            cx.new(|cx| TextInput::new("自签房间的 64 位 SHA-256；公网留空", cx));
+        let public_port = cx.new(|cx| {
+            let mut input = TextInput::new("监听端口，如 4433", cx);
+            input.set_content("4433", cx);
+            input
+        });
+        let public_cert = cx.new(|cx| TextInput::new("证书链 PEM 路径（留空自签）", cx));
+        let public_key = cx.new(|cx| TextInput::new("私钥 PEM 路径（留空自签）", cx));
+        let public_domain = cx.new(|cx| TextInput::new("域名，如 chat.example.com（可选）", cx));
         let message = cx.new(|cx| {
             let mut input = TextInput::new("输入消息，Enter 发送", cx);
             // 外观由输入区容器负责，控件本身不再带底色与内边距
@@ -153,6 +168,11 @@ impl ChatApp {
             addr_input,
             fingerprint_input,
             message,
+            show_public_form: false,
+            public_port,
+            public_cert,
+            public_key,
+            public_domain,
             pending_trust: None,
             rooms: Vec::new(),
             room: None,

@@ -1,8 +1,9 @@
-//! 局域网聊天工具的命令行形态，用于在没有界面时验证整条链路。
+//! 局域网与公网聊天工具的命令行形态，用于在没有界面时验证整条链路。
 //!
 //! ```text
 //! libchat host [--port 0] [--name 房间名]
-//! libchat join [--addr ip:port] [--fingerprint 指纹] [--name 昵称]
+//! libchat serve [--listen 0.0.0.0:4433] [--name 房间名] [--cert 证书 --key 私钥]
+//! libchat join [--server 主机:端口] [--fingerprint 指纹 | --ca 根证书] [--name 昵称]
 //! ```
 
 use std::net::SocketAddr;
@@ -11,12 +12,16 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chat_cli::{default_data_dir, serve, ServeConfig, ServerTls};
 use chat_core::Client;
 use chat_core::{Connection, ConnectionAcceptor};
 use chat_core::{RoomId, ServerEvent};
 use chat_discovery::{RoomAnnouncement, RoomAnnouncer, RoomBrowser, PROTOCOL_VERSION};
 use chat_server::{Acceptor, Server};
-use chat_transport_quic::{connect, validate_fingerprint, QuicServer, TrustStore};
+use chat_transport_quic::{
+    connect_to, parse_host_port, validate_fingerprint, Liveness, PublicCa, QuicServer,
+    ServerIdentity, TrustStore,
+};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 type AnyErr = Box<dyn std::error::Error + Send + Sync>;
@@ -42,7 +47,8 @@ fn usage() {
     eprintln!(
         "用法:\n  \
          libchat host [--port 0] [--name 房间名]\n  \
-         libchat join [--addr ip:port --fingerprint SHA-256] [--name 昵称] [--data-dir 目录]"
+         libchat serve [--listen 0.0.0.0:4433] [--name 房间名] [--cert 证书链.pem --key 私钥.pem] [--data-dir 目录] [--announce 广播端口]\n  \
+         libchat join [--server 主机:端口 | --addr 主机:端口] [--fingerprint SHA-256 | --ca 根证书.pem] [--name 昵称] [--data-dir 目录]"
     );
 }
 
@@ -51,6 +57,7 @@ async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("host") => host(&args[1..]).await,
+        Some("serve") => serve_cmd(&args[1..]).await,
         Some("join") => join(&args[1..]).await,
         _ => {
             usage();
@@ -64,6 +71,62 @@ async fn main() -> ExitCode {
             eprintln!("错误: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+async fn serve_cmd(args: &[String]) -> Result<(), AnyErr> {
+    let listen: SocketAddr = opt(args, "--listen")
+        .unwrap_or_else(|| "0.0.0.0:4433".into())
+        .parse()?;
+    let name = opt(args, "--name").unwrap_or_else(|| "公网聊天室".into());
+    let data_dir = match opt(args, "--data-dir") {
+        Some(path) => PathBuf::from(path),
+        None => default_data_dir()?,
+    };
+    let tls = match (opt(args, "--cert"), opt(args, "--key")) {
+        (Some(cert), Some(key)) => ServerTls::Pem {
+            cert: cert.into(),
+            key: key.into(),
+        },
+        (None, None) => ServerTls::SelfSigned,
+        _ => return Err("--cert 与 --key 必须同时给出".into()),
+    };
+    let self_signed = matches!(tls, ServerTls::SelfSigned);
+    let announce_port = opt(args, "--announce")
+        .map(|p| p.parse::<u16>())
+        .transpose()?;
+
+    let serving = serve(ServeConfig {
+        listen,
+        name: name.clone(),
+        data_dir,
+        tls,
+        announce_port,
+    })
+    .await?;
+
+    println!("房间: {}（{name}）", serving.room);
+    println!("监听: {}", serving.addr);
+    println!("证书 SHA-256: {}", serving.fingerprint);
+    if self_signed {
+        println!(
+            "加入: libchat join --server {} --fingerprint {}",
+            serving.addr, serving.fingerprint
+        );
+    } else {
+        println!(
+            "加入: libchat join --server {}（受信 CA 直接校验，私有 CA 加 --ca）",
+            serving.addr
+        );
+    }
+    if announce_port.is_some() {
+        println!("已在本机广播房间，局域网客户端可直接发现");
+    }
+    println!("按 Ctrl+C 退出");
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        println!("[状态] 在线 {}", serving.server.online_count().await);
     }
 }
 
@@ -113,7 +176,7 @@ async fn host(args: &[String]) -> Result<(), AnyErr> {
 fn discovered_target(
     ann: RoomAnnouncement,
     pinned_fingerprint: Option<String>,
-) -> Result<(SocketAddr, String), AnyErr> {
+) -> Result<(String, u16, String), AnyErr> {
     if ann.version != PROTOCOL_VERSION {
         return Err(format!("协议版本不兼容: {}", ann.version).into());
     }
@@ -121,55 +184,81 @@ fn discovered_target(
     let fingerprint = pinned_fingerprint
         .or_else(|| (!ann.fingerprint.is_empty()).then_some(ann.fingerprint))
         .ok_or("发现的房间缺少证书指纹")?;
-    Ok((addr, fingerprint))
+    Ok((addr.ip().to_string(), addr.port(), fingerprint))
+}
+
+/// 公网连接默认走受信 CA；给了指纹就退回局域网那套固定指纹校验。
+fn identity_for(
+    host: &str,
+    fingerprint: Option<String>,
+    ca: Option<&str>,
+) -> Result<ServerIdentity, AnyErr> {
+    if let Some(fingerprint) = fingerprint {
+        validate_fingerprint(&fingerprint)?;
+        return Ok(ServerIdentity::fingerprint(
+            fingerprint.to_ascii_lowercase(),
+        ));
+    }
+    let mut public = PublicCa {
+        server_name: host.to_string(),
+        roots_pem: None,
+    };
+    if let Some(path) = ca {
+        public.roots_pem = Some(std::fs::read(path)?);
+    }
+    Ok(ServerIdentity::PublicCa(public))
 }
 
 async fn join(args: &[String]) -> Result<(), AnyErr> {
     let name = opt(args, "--name").unwrap_or_else(|| "我".into());
     let data_dir = match opt(args, "--data-dir") {
         Some(path) => PathBuf::from(path),
-        None => PathBuf::from(std::env::var_os("HOME").ok_or("无法确定家目录，请指定 --data-dir")?)
-            .join(".lib-chat")
-            .join("rooms"),
+        None => default_data_dir()?,
     };
     let trust = TrustStore::new(&data_dir);
     let explicitly_pinned = opt(args, "--fingerprint");
+    let ca = opt(args, "--ca");
 
-    let (addr, fingerprint, expected_room) = match opt(args, "--addr") {
-        Some(a) => (
-            a.parse()?,
-            explicitly_pinned
-                .clone()
-                .ok_or("手动连接必须提供 --fingerprint")?,
-            None,
-        ),
-        None => {
-            println!("正在搜索局域网房间...");
-            let mut browser = RoomBrowser::start()?;
-            let ann = tokio::time::timeout(Duration::from_secs(15), browser.next_room())
-                .await
-                .map_err(|_| "搜索房间超时，可用 --addr 手动指定")??;
-            let room = ann.room;
-            let announced = ann.fingerprint.clone();
-            let room_name = ann.name.clone();
-            let (addr, fingerprint) = discovered_target(ann, explicitly_pinned.clone())?;
-            if announced != fingerprint && explicitly_pinned.is_none() {
-                return Err("发现的房间指纹不一致".into());
+    let (host, port, identity, expected_room) =
+        match opt(args, "--server").or_else(|| opt(args, "--addr")) {
+            Some(text) => {
+                let (host, port) = parse_host_port(&text)?;
+                let identity = identity_for(&host, explicitly_pinned.clone(), ca.as_deref())?;
+                (host, port, identity, None)
             }
-            println!("发现房间「{room_name}」于 {addr}");
-            (addr, fingerprint, Some(room))
-        }
-    };
-    validate_fingerprint(&fingerprint)?;
-    let fingerprint = fingerprint.to_ascii_lowercase();
-    if let Some(room) = expected_room {
+            None => {
+                println!("正在搜索局域网房间...");
+                let mut browser = RoomBrowser::start()?;
+                let ann = tokio::time::timeout(Duration::from_secs(15), browser.next_room())
+                    .await
+                    .map_err(|_| "搜索房间超时，可用 --server 手动指定")??;
+                let room = ann.room;
+                let room_name = ann.name.clone();
+                let announced = ann.fingerprint.clone();
+                let (host, port, fingerprint) = discovered_target(ann, explicitly_pinned.clone())?;
+                if announced != fingerprint && explicitly_pinned.is_none() {
+                    return Err("发现的房间指纹不一致".into());
+                }
+                println!("发现房间「{room_name}」于 {host}:{port}");
+                (
+                    host,
+                    port,
+                    ServerIdentity::fingerprint(fingerprint),
+                    Some(room),
+                )
+            }
+        };
+
+    // 固定指纹是带外核对过的身份，首次连接要确认、之后按房间记住；
+    // 公网受信 CA 由证书链保证身份，不需要这一步。
+    if let (ServerIdentity::Fingerprint(fingerprint), Some(room)) = (&identity, expected_room) {
         match trust.get(room)? {
-            Some(pinned) if pinned != fingerprint => {
-                return Err(format!("房间 {room} 的指纹已变更，拒绝连接").into())
+            Some(pinned) if pinned != *fingerprint => {
+                return Err(format!("房间 {room} 的指纹已变更，拒绝连接").into());
             }
             Some(_) => {}
             None if explicitly_pinned.is_none() => {
-                println!("首次连接房间 {room} 于 {addr}\n证书 SHA-256: {fingerprint}\n请向房主通过其他渠道核对房间标识和完整指纹。输入 yes 确认: ");
+                println!("首次连接房间 {room} 于 {host}:{port}\n证书 SHA-256: {fingerprint}\n请向房主通过其他渠道核对房间标识和完整指纹。输入 yes 确认: ");
                 let mut lines = BufReader::new(tokio::io::stdin()).lines();
                 if lines.next_line().await?.as_deref() != Some("yes") {
                     return Err("已取消首次信任".into());
@@ -178,14 +267,17 @@ async fn join(args: &[String]) -> Result<(), AnyErr> {
             None => {}
         }
     }
-    let conn = Arc::new(connect(addr, &fingerprint).await?);
+
+    let conn = Arc::new(connect_to(&host, port, &identity, Liveness::default()).await?);
     let room: RoomId = conn.room_info().room;
     if expected_room.is_some_and(|expected| expected != room) {
         return Err("公告房间标识与实际连接不一致".into());
     }
-    if let Some(existing) = trust.get(room)? {
-        if existing != fingerprint {
-            return Err(format!("房间 {room} 的指纹已变更，拒绝连接").into());
+    if let ServerIdentity::Fingerprint(fingerprint) = &identity {
+        if let Some(existing) = trust.get(room)? {
+            if existing != *fingerprint {
+                return Err(format!("房间 {room} 的指纹已变更，拒绝连接").into());
+            }
         }
     }
     println!("已连接房间「{}」（{}）", conn.room_info().name, room);
@@ -201,7 +293,9 @@ async fn join(args: &[String]) -> Result<(), AnyErr> {
     if info.room != room {
         return Err("大厅房间标识与连接不一致".into());
     }
-    trust.pin(room, &fingerprint)?;
+    if let ServerIdentity::Fingerprint(fingerprint) = &identity {
+        trust.pin(room, fingerprint)?;
+    }
     println!("当前在线 {} 人，输入 join 进入房间", info.online_count);
 
     // 事件打印任务
@@ -283,10 +377,10 @@ mod tests {
 
     #[test]
     fn discovered_room_uses_its_fingerprint_unless_explicitly_pinned() {
-        let (_, fingerprint) = discovered_target(announcement("advertised"), None).unwrap();
+        let (_, _, fingerprint) = discovered_target(announcement("advertised"), None).unwrap();
         assert_eq!(fingerprint, "advertised");
 
-        let (_, fingerprint) =
+        let (_, _, fingerprint) =
             discovered_target(announcement("advertised"), Some("pinned".into())).unwrap();
         assert_eq!(fingerprint, "pinned");
     }
@@ -294,5 +388,42 @@ mod tests {
     #[test]
     fn discovery_without_fingerprint_is_rejected() {
         assert!(discovered_target(announcement(""), None).is_err());
+    }
+
+    #[test]
+    fn server_address_without_fingerprint_targets_a_public_ca() {
+        let identity = identity_for("chat.example.com", None, None).unwrap();
+        assert_eq!(
+            identity,
+            ServerIdentity::PublicCa(PublicCa {
+                server_name: "chat.example.com".into(),
+                roots_pem: None,
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_fingerprint_keeps_the_trust_on_pin_mode() {
+        let fingerprint = "a".repeat(64);
+        let identity = identity_for("chat.example.com", Some(fingerprint.clone()), None).unwrap();
+        assert_eq!(identity, ServerIdentity::Fingerprint(fingerprint));
+        assert!(identity_for("chat.example.com", Some("short".into()), None).is_err());
+    }
+
+    #[test]
+    fn ca_file_is_read_for_private_public_servers() {
+        let dir = std::env::temp_dir().join(format!("libchat-ca-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ca.pem");
+        std::fs::write(&path, b"CA").unwrap();
+
+        match identity_for("chat.example.com", None, path.to_str()).unwrap() {
+            ServerIdentity::PublicCa(ca) => {
+                assert_eq!(ca.roots_pem.as_deref(), Some(&b"CA"[..]));
+                assert_eq!(ca.server_name, "chat.example.com");
+            }
+            other => panic!("期望受信 CA 身份: {other:?}"),
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

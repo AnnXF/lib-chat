@@ -6,7 +6,7 @@
 
 use chat_core::{Attachment, AttachmentId, RoomId, UserId};
 use chat_ui_gpui::app::ChatApp;
-use chat_ui_gpui::service::UiEvent;
+use chat_ui_gpui::service::{PublicHosting, UiEvent};
 use gpui::{Bounds, Entity, Pixels, TestAppContext, VisualTestContext, px, size};
 
 const WINDOW_WIDTH: f32 = 1024.;
@@ -146,6 +146,7 @@ fn long_identity_text_keeps_the_layout_inside_the_window() {
                 "172.16.31.4:52000".into(),
             ],
             fingerprint: "a1b2c3d4".repeat(8),
+            public: None,
         },
     );
     apply(
@@ -281,6 +282,7 @@ fn short_window_keeps_controls_reachable() {
             name: "矮窗口房间".into(),
             addrs: vec!["192.168.100.200:52000".into()],
             fingerprint: "a1b2c3d4".repeat(8),
+            public: None,
         },
     );
     apply(
@@ -404,4 +406,170 @@ fn file_message_renders_inside_the_window() {
         bottom(&card) <= f32::from(composer.origin.y) + 0.5,
         "文件卡片压到了输入条"
     );
+}
+
+/// 公网地址簿：长域名与长房间名不能撑宽侧栏，也不能把底部操作区挤走。
+#[test]
+fn remote_server_rows_stay_inside_the_sidebar() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    let room = RoomId::new();
+
+    apply(
+        &view,
+        cx,
+        UiEvent::RemoteRoom {
+            room,
+            name: "一个名字特别长的公网聊天房间".repeat(3),
+            addr: "a-very-long-subdomain.chat.example.com:4433".into(),
+            online: 12,
+        },
+    );
+
+    let rows = bounds(cx, "remote-rooms");
+    assert_inside(&rows, "remote-rooms");
+    assert!(
+        f32::from(rows.size.width) <= SIDEBAR_WIDTH + 0.5,
+        "远程服务器列表把侧栏撑宽了: {}",
+        f32::from(rows.size.width)
+    );
+
+    let sidebar = bounds(cx, "sidebar");
+    assert!((f32::from(sidebar.size.width) - SIDEBAR_WIDTH).abs() <= 1.);
+
+    let footer = bounds(cx, "sidebar-footer");
+    assert_inside(&footer, "sidebar-footer");
+    assert!((bottom(&footer) - bottom(&sidebar)).abs() <= 1.);
+
+    let composer = bounds(cx, "composer");
+    assert_inside(&composer, "composer");
+}
+
+/// 矮窗口 + 远程服务器列表：主体滚动，底部操作区仍完整可见。
+#[test]
+fn short_window_with_remote_servers_keeps_the_footer_visible() {
+    const HEIGHT: f32 = 420.;
+
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window_sized(&mut app_cx, WINDOW_WIDTH, HEIGHT);
+    for index in 0..6 {
+        apply(
+            &view,
+            cx,
+            UiEvent::RemoteRoom {
+                room: RoomId::new(),
+                name: format!("远程房间 {index}"),
+                addr: format!("server-{index}.example.com:4433"),
+                online: index,
+            },
+        );
+    }
+
+    let footer = bounds(cx, "sidebar-footer");
+    assert!(
+        bottom(&footer) <= HEIGHT + 0.5,
+        "底部操作区被挤出窗口: {} > {HEIGHT}",
+        bottom(&footer)
+    );
+    let body = bounds(cx, "sidebar-body");
+    assert_inside(&body, "sidebar-body");
+    assert!(f32::from(body.size.height) > 0.);
+}
+
+/// 公网托管表单：展开后仍在侧栏内，底部连接区不被挤走。
+#[test]
+fn public_form_fits_inside_the_sidebar() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| app.debug_toggle_public_form(cx));
+    });
+    cx.run_until_parked();
+
+    let form = bounds(cx, "public-form");
+    assert_inside(&form, "public-form");
+    assert!(
+        f32::from(form.size.width) <= SIDEBAR_WIDTH + 0.5,
+        "公网表单把侧栏撑宽了: {}",
+        f32::from(form.size.width)
+    );
+
+    let sidebar = bounds(cx, "sidebar");
+    assert!((f32::from(sidebar.size.width) - SIDEBAR_WIDTH).abs() <= 1.);
+
+    let footer = bounds(cx, "sidebar-footer");
+    assert_inside(&footer, "sidebar-footer");
+    assert!((bottom(&footer) - bottom(&sidebar)).abs() <= 1.);
+
+    let main = bounds(cx, "chat-main");
+    assert_inside(&main, "chat-main");
+}
+
+/// 矮窗口下展开公网表单：主体滚动，底部操作区仍完整可见。
+#[test]
+fn short_window_with_public_form_keeps_the_footer_visible() {
+    const HEIGHT: f32 = 420.;
+
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window_sized(&mut app_cx, WINDOW_WIDTH, HEIGHT);
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| app.debug_toggle_public_form(cx));
+    });
+    cx.run_until_parked();
+
+    let footer = bounds(cx, "sidebar-footer");
+    assert!(
+        bottom(&footer) <= HEIGHT + 0.5,
+        "底部操作区被挤出窗口: {} > {HEIGHT}",
+        bottom(&footer)
+    );
+    let body = bounds(cx, "sidebar-body");
+    assert_inside(&body, "sidebar-body");
+    assert!(f32::from(body.size.height) > 0.);
+}
+
+/// 公网房间详情：接入地址与证书指纹都能一键复制，按钮都在侧栏内。
+#[test]
+fn public_identity_offers_copy_buttons_inside_the_sidebar() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    let room = RoomId::new();
+
+    apply(
+        &view,
+        cx,
+        UiEvent::Hosting {
+            room,
+            name: "公网房间".into(),
+            addrs: vec!["127.0.0.1:4433".into()],
+            fingerprint: "ab".repeat(32),
+            public: Some(PublicHosting {
+                port: 4433,
+                domain: Some("chat.example.com".into()),
+                trusted_ca: true,
+            }),
+        },
+    );
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| app.debug_toggle_identity(cx));
+    });
+    cx.run_until_parked();
+
+    for selector in [
+        "copy-fingerprint",
+        "copy-room",
+        "copy-listen",
+        "copy-join-addr",
+        "copy-fingerprint-detail",
+    ] {
+        let button = bounds(cx, selector);
+        assert_inside(&button, selector);
+        assert!(f32::from(button.size.width) > 0., "{selector} 应当可点击");
+    }
+
+    let sidebar = bounds(cx, "sidebar");
+    assert!((f32::from(sidebar.size.width) - SIDEBAR_WIDTH).abs() <= 1.);
+
+    let footer = bounds(cx, "sidebar-footer");
+    assert_inside(&footer, "sidebar-footer");
 }

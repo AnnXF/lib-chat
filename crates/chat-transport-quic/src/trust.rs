@@ -12,7 +12,7 @@ fn error(err: impl std::fmt::Display) -> ChatError {
 pub fn validate_fingerprint(fingerprint: &str) -> Result<()> {
     if fingerprint.len() != 64 || !fingerprint.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(ChatError::Protocol(
-            "证书指纹须为 64 位十六进制 SHA-256".into(),
+            "证书指纹须为 64 位十六进制 SHA-256（不是房间标识）".into(),
         ));
     }
     Ok(())

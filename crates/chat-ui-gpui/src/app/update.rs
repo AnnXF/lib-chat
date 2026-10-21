@@ -9,7 +9,7 @@ use crate::service::UiEvent;
 
 use chat_core::Attachment;
 
-use super::{ChatApp, ChatLine, DiscoveredRoom, HostedRoom, RoomView};
+use super::{ChatApp, ChatLine, DiscoveredRoom, HostedRoom, RoomSource, RoomView};
 
 impl ChatApp {
     pub(crate) fn begin_loading_older(&mut self) -> bool {
@@ -49,58 +49,49 @@ impl ChatApp {
                 addr,
                 fingerprint,
                 online,
-                ..
-            } => {
-                // 自己就在这个房间里时，人数以房间推送为准：探测是几秒一轮的，
-                // 早于推送发出的那次探测结果回来，只会把数字倒回去
-                let online = match self
-                    .room
-                    .as_ref()
-                    .filter(|view| view.id == room && view.joined)
-                {
-                    Some(view) => view.online,
-                    None => online,
-                };
-                match self.rooms.iter_mut().find(|known| known.id == room) {
-                    Some(known) => {
-                        known.name = name;
-                        known.addr = addr;
-                        known.fingerprint = fingerprint;
-                        known.online = online;
-                    }
-                    None => {
-                        self.rooms.push(DiscoveredRoom {
-                            id: room,
-                            name,
-                            addr,
-                            fingerprint,
-                            online,
-                        });
-                        self.rooms.sort_by(|a, b| a.name.cmp(&b.name));
-                        // 只在确实多了一个房间时说话。复查是在刷新同一个房间，
-                        // 每次都刷状态栏的话，连接失败之类的提示两秒就没了。
-                        self.report_room_count();
-                    }
-                }
-            }
+            } => self.observe_room(
+                room,
+                name,
+                addr,
+                Some(fingerprint),
+                online,
+                RoomSource::Local,
+            ),
+            UiEvent::RemoteRoom {
+                room,
+                name,
+                addr,
+                online,
+            } => self.observe_room(room, name, addr, None, online, RoomSource::Remote),
             UiEvent::Hosting {
                 room,
                 name,
                 addrs,
                 fingerprint,
+                public,
             } => {
+                self.status = match &public {
+                    Some(public) => match &public.domain {
+                        Some(domain) => format!("公网服务已启动：{domain}:{}", public.port),
+                        None => format!(
+                            "公网服务已启动：监听 0.0.0.0:{}，客户端填公网域名:{}",
+                            public.port, public.port
+                        ),
+                    },
+                    None => "房间已启动，等待其他客户端连接".into(),
+                };
                 self.hosted = Some(HostedRoom {
                     name,
                     room,
                     addrs,
                     fingerprint,
+                    public,
                 });
                 // 换了房间就收起到摘要，别把上一间的详情状态带过来
                 self.show_identity = false;
                 // 已经在用这个房间了，侧栏那个「回到我的房间」入口就该收起来
                 self.local_room = None;
                 self.local_room_id = None;
-                self.status = "房间已启动，等待其他客户端连接".into();
             }
             UiEvent::LocalRoom { room, messages } => {
                 self.local_room = Some(messages);
@@ -237,11 +228,60 @@ impl ChatApp {
         }
     }
 
+    /// 发现或刷新一个房间：同一房间只保留一行。
+    ///
+    /// 自己就在这个房间里时，人数以房间推送为准：探测是几秒一轮的，
+    /// 早于推送发出的那次探测结果回来，只会把数字倒回去。
+    fn observe_room(
+        &mut self,
+        room: RoomId,
+        name: String,
+        addr: String,
+        fingerprint: Option<String>,
+        online: u32,
+        source: RoomSource,
+    ) {
+        let online = match self
+            .room
+            .as_ref()
+            .filter(|view| view.id == room && view.joined)
+        {
+            Some(view) => view.online,
+            None => online,
+        };
+        match self.rooms.iter_mut().find(|known| known.id == room) {
+            Some(known) => {
+                known.name = name;
+                known.addr = addr;
+                // 公网条目没有指纹，不要把已有的自签指纹冲掉
+                if fingerprint.is_some() {
+                    known.fingerprint = fingerprint;
+                }
+                known.online = online;
+                known.source = source;
+            }
+            None => {
+                self.rooms.push(DiscoveredRoom {
+                    id: room,
+                    name,
+                    addr,
+                    fingerprint,
+                    online,
+                    source,
+                });
+                self.rooms.sort_by(|a, b| a.name.cmp(&b.name));
+                // 只在确实多了一个房间时说话。复查是在刷新同一个房间，
+                // 每次都刷状态栏的话，连接失败之类的提示两秒就没了。
+                self.report_room_count();
+            }
+        }
+    }
+
     /// 把「发现了几个房间」写进状态栏。
     ///
     /// 只在房间数真的变了时调用：复查是每几秒一轮的，逢轮就写会把错误提示盖掉。
     fn report_room_count(&mut self) {
-        self.status = format!("发现 {} 个局域网房间", self.rooms.len());
+        self.status = format!("发现 {} 个房间", self.rooms.len());
     }
 
     /// 把实时人数同步到侧栏那一行。

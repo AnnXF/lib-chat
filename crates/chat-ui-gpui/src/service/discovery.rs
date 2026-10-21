@@ -202,8 +202,16 @@ async fn probe_room(room: RoomId, known: &KnownRoom, events: &Sender<UiEvent>) -
         return false;
     }
     for addr in &known.addrs {
-        let Ok(Ok(conn)) =
-            tokio::time::timeout(PROBE_TIMEOUT, connect(*addr, &known.fingerprint)).await
+        let Ok(Ok(conn)) = tokio::time::timeout(
+            PROBE_TIMEOUT,
+            connect_to(
+                &addr.ip().to_string(),
+                addr.port(),
+                &ServerIdentity::fingerprint(known.fingerprint.clone()),
+                Liveness::default(),
+            ),
+        )
+        .await
         else {
             continue;
         };

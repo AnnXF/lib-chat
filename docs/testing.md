@@ -30,6 +30,10 @@ cargo test -p chat-server --test load -- --nocapture
 | 协议/端口 | `crates/chat-core` | DTO 编解码、客户端门面、端口契约 | 协议字段或语义变化 |
 | 后端集成 | `crates/chat-server/tests/e2e.rs` | 加入/退出、扇出、历史、同步、慢客户端、幂等 | 任何服务端行为变化 |
 | 传输集成 | `crates/chat-transport-quic/tests/` | 真实 QUIC 握手、证书指纹、保活、断线 | 传输参数、超时、TLS 相关改动 |
+| 公网 TLS | `crates/chat-transport-quic/tests/public_tls.rs` | 受信 CA 链、主机名不匹配、不可信证书、域名解析与多地址回退 | 改证书校验、SNI、监听地址或连接目标 |
+| 独立服务端 | `crates/chat-cli/tests/public_serve.rs` | PEM 部署、自签回退、重启后房间标识与历史/附件延续 | 改 `serve` 的组装、数据目录布局或持久化 |
+| 公网服务链路 | `crates/chat-ui-gpui/tests/public_e2e.rs` | 无指纹连接、地址簿探测、公网重连、退出人数回落、文件收发 | 改 `service/remote.rs`、`session.rs` 或手动连接入口 |
+| 界面公网托管 | `crates/chat-ui-gpui/tests/public_hosting_e2e.rs` | 自签/受信证书托管、自动接入、证书与端口错误、重启后身份延续 | 改 `service/hosting.rs` 的公网分支或侧栏表单 |
 | 后端压测 | `crates/chat-server/tests/load.rs` | 并发顺序、去重、无丢失、时延与吞吐 | 改动锁、队列、存储或广播路径 |
 | 附件传输 | `crates/chat-server/tests/e2e.rs`、`crates/chat-transport-quic/tests/quic_e2e.rs`、`crates/chat-ui-gpui/tests/service_e2e.rs` | 成员校验、摘要/大小校验、内容去重、上传下载往返、另存到本地 | 任何附件、文件消息或存储布局改动 |
 | 服务集成 | `crates/chat-ui-gpui/tests/service_e2e.rs` | 连接、重连、托管、信任、切房、历史补齐 | 改动 `service/` 任一模块 |
@@ -42,7 +46,11 @@ cargo test -p chat-server --test load -- --nocapture
 3. **资源与并发**：若新增队列、锁或后台任务，同时在 `load.rs` 补一条并发用例，断言顺序、去重与不丢失；时延阈值放宽到不会被 CI 抖动误判。
 4. **传输相关**：改握手、超时、证书时补 `chat-transport-quic/tests/`，用真实 QUIC 而不是 mock。
    - 附件/文件消息改动额外覆盖：非成员被拒、摘要或大小不符被拒、同一内容不重复占盘、跨连接下载内容一致。
-5. **服务层**：改 `service/`（连接、重连、托管、信任）必须在 `service_e2e.rs` 覆盖成功与失败两条路径；失败路径要断言「旧会话仍可用」。
+   - 证书或连接目标改动额外覆盖：受信 CA 成功握手、不受信 CA 拒绝、主机名不匹配拒绝、域名解析后多地址回退。
+5. **服务层**：改 `service/`（连接、重连、托管、信任、地址簿）必须在 `service_e2e.rs` 或 `public_e2e.rs` 覆盖成功与失败两条路径；失败路径要断言「旧会话仍可用」。
+   - 公网/地址簿改动额外覆盖：无指纹连接、`servers.json` 保存与重启探测、公网断线重连。
+   - 界面公网托管改动额外覆盖：自签与受信证书两条启动路径、证书/私钥参数错误、端口占用、重启后房间与自签身份延续。
+   - 公网用例通过 `LIBCHAT_CA_FILE` 注入测试 CA；用例结束必须移除该变量，避免污染同进程其它用例。
 6. **界面**：改 `app/` 或 `views/` 时，为关键布局节点保留或新增 `test_id`，并在 `ui_layout.rs` 断言其边界仍在窗口内。
 7. **文档**：能力进入 `plan.md` 的进度表，行为边界（例如「进程重启后待发送不恢复」）一并写明。
 

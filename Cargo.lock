@@ -919,7 +919,9 @@ dependencies = [
  "chat-server",
  "chat-transport-quic",
  "if-addrs",
+ "rcgen",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -969,11 +971,13 @@ dependencies = [
  "quinn",
  "rcgen",
  "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
  "uuid",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -988,6 +992,9 @@ dependencies = [
  "flume 0.12.0",
  "gpui",
  "if-addrs",
+ "rcgen",
+ "serde",
+ "serde_json",
  "tokio",
  "unicode-segmentation",
  "uuid",
@@ -6826,6 +6833,15 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

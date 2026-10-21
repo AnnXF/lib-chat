@@ -1,8 +1,13 @@
-//! QUIC 传输适配器：把服务端逻辑暴露到局域网，并给客户端提供远程连接。
+//! QUIC 传输适配器：把服务端逻辑暴露到局域网与公网，并给客户端提供远程连接。
 //!
-//! 自签证书与可选指纹校验；持久信任由调用方维护。
+//! 两种身份校验方式，由 [`ServerIdentity`] 选择：
+//!
+//! | 方式 | 适用 | 依据 |
+//! |---|---|---|
+//! | [`ServerIdentity::Fingerprint`] | 局域网自签证书 | 房间固定的 SHA-256 指纹 |
+//! | [`ServerIdentity::PublicCa`] | 公网域名 | 受信 CA 证书链 + 主机名 |
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -14,6 +19,7 @@ use chat_core::{
 };
 use chat_core::{ChatError, Connection, ConnectionAcceptor, EventStream, RequestSink, Result};
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use quinn::rustls::RootCertStore;
 use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -332,6 +338,146 @@ fn crypto_provider() -> Arc<quinn::rustls::crypto::CryptoProvider> {
     Arc::new(quinn::rustls::crypto::ring::default_provider())
 }
 
+// ---------------------------------------------------------------- 身份校验
+
+/// 客户端如何确认对端身份。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServerIdentity {
+    /// 局域网自签证书：比对固定指纹，不做 CA 链校验。
+    Fingerprint(String),
+    /// 公网证书：校验受信 CA 链与主机名。
+    PublicCa(PublicCa),
+}
+
+/// 公网证书的校验参数。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicCa {
+    /// 证书上的主机名，域名与 IP 均可。
+    pub server_name: String,
+    /// 额外信任的根证书（PEM）。为空时只信任内置公共根。
+    pub roots_pem: Option<Vec<u8>>,
+}
+
+impl ServerIdentity {
+    pub fn fingerprint(value: impl Into<String>) -> Self {
+        Self::Fingerprint(value.into())
+    }
+
+    pub fn public_ca(server_name: impl Into<String>) -> Self {
+        Self::PublicCa(PublicCa {
+            server_name: server_name.into(),
+            roots_pem: None,
+        })
+    }
+
+    /// SNI 与证书主机名。指纹模式下证书是自签的，名字只用于满足握手要求。
+    fn server_name(&self) -> &str {
+        match self {
+            Self::Fingerprint(_) => "libchat.local",
+            Self::PublicCa(ca) => &ca.server_name,
+        }
+    }
+}
+
+impl PublicCa {
+    /// 信任额外的根证书，用于自建 CA 或私有集群。
+    pub fn with_roots_pem(mut self, pem: Vec<u8>) -> Self {
+        self.roots_pem = Some(pem);
+        self
+    }
+}
+
+fn root_store(extra_pem: Option<&[u8]>) -> Result<RootCertStore> {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let Some(pem) = extra_pem else {
+        return Ok(roots);
+    };
+    let certs = rustls_pemfile::certs(&mut &pem[..])
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|e| ChatError::Transport(format!("解析根证书失败: {e}")))?;
+    if certs.is_empty() {
+        return Err(ChatError::Transport("根证书文件里没有证书".into()));
+    }
+    for cert in certs {
+        roots
+            .add(cert)
+            .map_err(|e| ChatError::Transport(format!("根证书无效: {e}")))?;
+    }
+    Ok(roots)
+}
+
+fn client_config(identity: &ServerIdentity, liveness: Liveness) -> Result<ClientConfig> {
+    let provider = crypto_provider();
+    let builder = quinn::rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&quinn::rustls::version::TLS13])
+        .map_err(transport_err)?;
+    let mut tls = match identity {
+        ServerIdentity::Fingerprint(expected) => {
+            validate_fingerprint(expected)?;
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(FingerprintVerifier {
+                    expected: expected.to_ascii_lowercase(),
+                    provider,
+                }))
+                .with_no_client_auth()
+        }
+        ServerIdentity::PublicCa(ca) => builder
+            .with_root_certificates(root_store(ca.roots_pem.as_deref())?)
+            .with_no_client_auth(),
+    };
+    tls.alpn_protocols = vec![ALPN.to_vec()];
+
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(transport_err)?;
+    let mut config = ClientConfig::new(Arc::new(crypto));
+    config.transport_config(liveness.transport());
+    Ok(config)
+}
+
+/// 拆开 `主机:端口`。IPv6 字面量须写成 `[::1]:4433`。
+pub fn parse_host_port(text: &str) -> Result<(String, u16)> {
+    let text = text.trim();
+    let (host, port) = match text.strip_prefix('[') {
+        Some(rest) => rest
+            .split_once("]:")
+            .ok_or_else(|| ChatError::Transport(format!("地址「{text}」缺少方括号或端口")))?,
+        None => text
+            .rsplit_once(':')
+            .ok_or_else(|| ChatError::Transport(format!("地址「{text}」须为主机:端口")))?,
+    };
+    if host.is_empty() {
+        return Err(ChatError::Transport(format!("地址「{text}」缺少主机名")));
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|e| ChatError::Transport(format!("地址「{text}」的端口无效: {e}")))?;
+    Ok((host.to_string(), port))
+}
+
+/// 把 `host:port` 解析成可尝试的地址列表。域名按系统解析顺序给出全部结果。
+async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Err(ChatError::Transport("连接地址为空".into()));
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| {
+            ChatError::Transport(format!(
+                "解析 {host}:{port} 失败（域名可能不存在或未配置 DNS）: {e}"
+            ))
+        })?
+        .collect();
+    if addrs.is_empty() {
+        return Err(ChatError::Transport(format!("{host} 没有可用地址")));
+    }
+    Ok(addrs)
+}
+
 // ---------------------------------------------------------------- 服务端
 
 /// QUIC 服务端：接受连接并把请求转给 [`ConnectionAcceptor`]。
@@ -356,11 +502,48 @@ impl QuicServer {
         liveness: Liveness,
         cert: SelfSignedCert,
     ) -> Result<Self> {
+        let fingerprint = cert.fingerprint().to_string();
+        Self::bind_with_chain(
+            addr,
+            liveness,
+            vec![cert.cert.clone()],
+            cert.key.clone_key(),
+            fingerprint,
+        )
+    }
+
+    /// 用 PEM 证书链与私钥绑定。公网部署交给受信 CA 签发时使用。
+    pub fn bind_with_pem(
+        addr: SocketAddr,
+        liveness: Liveness,
+        cert_pem: &[u8],
+        key_pem: &[u8],
+    ) -> Result<Self> {
+        let certs = rustls_pemfile::certs(&mut &cert_pem[..])
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|e| ChatError::Transport(format!("解析证书失败: {e}")))?;
+        let Some(leaf) = certs.first() else {
+            return Err(ChatError::Transport("证书文件里没有证书".into()));
+        };
+        let fingerprint = fingerprint_of(leaf);
+        let key = rustls_pemfile::private_key(&mut &key_pem[..])
+            .map_err(|e| ChatError::Transport(format!("解析私钥失败: {e}")))?
+            .ok_or_else(|| ChatError::Transport("私钥文件里没有私钥".into()))?;
+        Self::bind_with_chain(addr, liveness, certs, key, fingerprint)
+    }
+
+    fn bind_with_chain(
+        addr: SocketAddr,
+        liveness: Liveness,
+        certs: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+        fingerprint: String,
+    ) -> Result<Self> {
         let mut tls = quinn::rustls::ServerConfig::builder_with_provider(crypto_provider())
             .with_protocol_versions(&[&quinn::rustls::version::TLS13])
             .map_err(transport_err)?
             .with_no_client_auth()
-            .with_single_cert(vec![cert.cert.clone()], cert.key.clone_key())
+            .with_single_cert(certs, key)
             .map_err(transport_err)?;
         tls.alpn_protocols = vec![ALPN.to_vec()];
 
@@ -374,7 +557,7 @@ impl QuicServer {
         Ok(Self {
             endpoint,
             local_addr,
-            fingerprint: cert.fingerprint().to_string(),
+            fingerprint,
         })
     }
 
@@ -564,32 +747,61 @@ pub async fn connect_with(
     expected_fingerprint: &str,
     liveness: Liveness,
 ) -> Result<QuicConnection> {
-    validate_fingerprint(expected_fingerprint)?;
-    let provider = crypto_provider();
-    let mut tls = quinn::rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_protocol_versions(&[&quinn::rustls::version::TLS13])
-        .map_err(transport_err)?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(FingerprintVerifier {
-            expected: expected_fingerprint.to_ascii_lowercase(),
-            provider,
-        }))
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![ALPN.to_vec()];
+    connect_to(
+        &addr.ip().to_string(),
+        addr.port(),
+        &ServerIdentity::fingerprint(expected_fingerprint),
+        liveness,
+    )
+    .await
+}
 
-    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(transport_err)?;
-    let mut client_config = ClientConfig::new(Arc::new(crypto));
-    client_config.transport_config(liveness.transport());
+/// 按主机名（或 IP）、端口与身份校验方式建立连接。
+///
+/// 域名解析出的每个地址都会尝试一次：本机同时有 IPv6 与 IPv4 记录、
+/// 或服务端只监听其中一族时，靠这一步挑出真正能连上的那个。
+pub async fn connect_to(
+    host: &str,
+    port: u16,
+    identity: &ServerIdentity,
+    liveness: Liveness,
+) -> Result<QuicConnection> {
+    let addrs = resolve(host, port).await?;
+    let config = client_config(identity, liveness)?;
+    let mut last_error = None;
 
-    let mut endpoint =
-        Endpoint::client("0.0.0.0:0".parse().expect("合法地址")).map_err(transport_err)?;
-    endpoint.set_default_client_config(client_config);
+    for addr in addrs {
+        let bind = if addr.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let mut endpoint = match Endpoint::client(bind.parse().expect("合法绑定地址")) {
+            Ok(endpoint) => endpoint,
+            Err(e) => {
+                last_error = Some(transport_err(e));
+                continue;
+            }
+        };
+        endpoint.set_default_client_config(config.clone());
+        match handshake(endpoint, addr, identity.server_name()).await {
+            Ok(conn) => return Ok(conn),
+            Err(e) => last_error = Some(e),
+        }
+    }
 
+    Err(last_error.unwrap_or_else(|| ChatError::Transport("没有可用的连接地址".into())))
+}
+
+/// 在一条连接上完成 hello / welcome 握手，之后把事件读进通道。
+async fn handshake(
+    endpoint: Endpoint,
+    addr: SocketAddr,
+    server_name: &str,
+) -> Result<QuicConnection> {
     let conn = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        endpoint
-            .connect(addr, "libchat.local")
-            .map_err(transport_err)?,
+        endpoint.connect(addr, server_name).map_err(transport_err)?,
     )
     .await
     .map_err(|_| ChatError::Protocol("连接超时".into()))?
@@ -742,5 +954,30 @@ impl Connection for QuicConnection {
         tokio::time::timeout(BLOB_TIMEOUT, transfer)
             .await
             .map_err(|_| ChatError::Protocol("附件下载超时".into()))?
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::parse_host_port;
+
+    #[test]
+    fn parses_host_names_ips_and_ipv6_literals() {
+        assert_eq!(
+            parse_host_port("chat.example.com:4433").unwrap(),
+            ("chat.example.com".into(), 4433)
+        );
+        assert_eq!(
+            parse_host_port("127.0.0.1:52000").unwrap(),
+            ("127.0.0.1".into(), 52000)
+        );
+        assert_eq!(parse_host_port("[::1]:4433").unwrap(), ("::1".into(), 4433));
+    }
+
+    #[test]
+    fn rejects_addresses_without_a_port_or_host() {
+        assert!(parse_host_port("chat.example.com").is_err());
+        assert!(parse_host_port(":4433").is_err());
+        assert!(parse_host_port("chat.example.com:http").is_err());
+        assert!(parse_host_port("[::1]4433").is_err());
     }
 }

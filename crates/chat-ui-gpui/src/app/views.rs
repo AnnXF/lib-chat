@@ -19,7 +19,7 @@ use crate::app::theme;
 
 use chat_core::Attachment;
 
-use super::{ChatApp, ChatLine, DiscoveredRoom, HostedRoom};
+use super::{ChatApp, ChatLine, DiscoveredRoom, HostedRoom, RoomSource};
 
 /// 给关键布局节点挂上固定标识，供无头 UI 测试查询边界。
 ///
