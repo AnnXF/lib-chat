@@ -44,12 +44,6 @@ impl ChatApp {
                 self.nav == NavTab::Contacts,
                 cx.listener(Self::on_nav_contacts),
             ))
-            .child(nav_button(
-                "房",
-                "nav-rooms",
-                self.nav == NavTab::Rooms,
-                cx.listener(Self::on_nav_rooms),
-            ))
             .child(div().flex_1())
             .when_some(account_avatar, |this, avatar| this.child(avatar))
             .into_any_element()
@@ -99,12 +93,6 @@ impl ChatApp {
                     })
                     .children(rows),
             )
-            .child(padded(button(
-                "房间与连接",
-                false,
-                true,
-                cx.listener(Self::on_nav_rooms),
-            )))
             .into_any_element()
     }
 
@@ -341,6 +329,7 @@ impl ChatApp {
                                 .children(self.friends.iter().enumerate().map(|(index, user)| {
                                     let user_id = user.id;
                                     let label = user.display_name.clone();
+                                    let click_name = user.display_name.clone();
                                     div()
                                         .id(("friend", index))
                                         .h(px(36.))
@@ -353,7 +342,7 @@ impl ChatApp {
                                         .on_mouse_up(
                                             MouseButton::Left,
                                             cx.listener(move |this, _, _, cx| {
-                                                this.on_open_direct(user_id, cx)
+                                                this.on_open_direct(user_id, click_name.clone(), cx)
                                             }),
                                         )
                                         .child(
@@ -1032,6 +1021,8 @@ fn friend_item(
     let name = user.display_name.clone();
     let first = name.chars().next().unwrap_or('?').to_string();
     let username = user.username.clone();
+    let click_name = name.clone();
+    let menu_user = user;
     div()
         .id(("friend-item", index))
         .h(px(56.))
@@ -1043,7 +1034,18 @@ fn friend_item(
         .hover(|style| style.bg(rgb(theme::HOVER)))
         .on_mouse_up(
             MouseButton::Left,
-            cx.listener(move |this, _, _, cx| this.on_open_direct(user_id, cx)),
+            cx.listener(move |this, _, _, cx| this.on_open_direct(user_id, click_name.clone(), cx)),
+        )
+        .on_mouse_up(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseUpEvent, window, cx| {
+                this.open_friend_menu(
+                    menu_user.clone(),
+                    event.position,
+                    window.viewport_size(),
+                    cx,
+                );
+            }),
         )
         .child(avatar(first))
         .child(

@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::app::NavTab;
+use crate::app::{FriendMenu, NavTab};
 use chat_core::{Attachment, RoomId, UserId};
 use chat_transport_quic::validate_fingerprint;
 use gpui::{
@@ -420,6 +420,41 @@ impl ChatApp {
         cx.notify();
     }
 
+    pub(crate) fn open_friend_menu(
+        &mut self,
+        user: chat_core::UserSummary,
+        position: Point<Pixels>,
+        viewport: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let menu_height = px(76.);
+        let y = if position.y + menu_height > viewport.height {
+            if position.y > menu_height {
+                position.y - menu_height
+            } else {
+                px(0.)
+            }
+        } else {
+            position.y
+        };
+        self.message_menu = None;
+        self.friend_menu = Some(FriendMenu {
+            user,
+            position: point(position.x, y),
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn on_close_friend_menu(
+        &mut self,
+        _: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.friend_menu = None;
+        cx.notify();
+    }
+
     pub(crate) fn on_close_message_menu(
         &mut self,
         _: &MouseDownEvent,
@@ -477,10 +512,12 @@ impl ChatApp {
         let key = keystroke.key.to_ascii_lowercase();
         if key == "escape" {
             let changed = self.message_menu.is_some()
+                || self.friend_menu.is_some()
                 || self.show_connect_form
                 || self.show_public_form
                 || self.pending_trust.is_some();
             self.message_menu = None;
+            self.friend_menu = None;
             self.show_connect_form = false;
             self.show_public_form = false;
             self.pending_trust = None;
@@ -492,11 +529,8 @@ impl ChatApp {
         if !keystroke.modifiers.platform {
             return;
         }
-        match key.as_str() {
-            "k" => self.toggle_connect_form(cx),
-            "p" if keystroke.modifiers.shift => self.toggle_public_form(cx),
-            "enter" => self.submit_message(cx),
-            _ => {}
+        if key == "enter" {
+            self.submit_message(cx);
         }
     }
 
@@ -571,14 +605,25 @@ impl ChatApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.submit_friend(cx);
+    }
+
+    /// 添加好友：按钮与回车共用；发送后清空输入并给出状态。
+    pub(crate) fn submit_friend(&mut self, cx: &mut Context<Self>) {
         let username = self.friend_input.read(cx).content().trim().to_string();
         if username.is_empty() {
             return;
         }
+        self.status = format!("正在添加好友 {username}…");
+        self.status_kind = super::StatusKind::Info;
         self.tell(UiCommand::AddFriend { username }, cx);
+        self.friend_input
+            .update(cx, |input, cx| input.set_content("", cx));
     }
 
-    pub(crate) fn on_open_direct(&mut self, user: UserId, cx: &mut Context<Self>) {
+    pub(crate) fn on_open_direct(&mut self, user: UserId, name: String, cx: &mut Context<Self>) {
+        self.pending_direct = Some(name);
+        self.friend_menu = None;
         self.tell(UiCommand::OpenDirect { user }, cx);
     }
 
@@ -618,16 +663,6 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) {
         self.nav = NavTab::Contacts;
-        cx.notify();
-    }
-
-    pub(crate) fn on_nav_rooms(
-        &mut self,
-        _: &MouseUpEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.nav = NavTab::Rooms;
         cx.notify();
     }
 }

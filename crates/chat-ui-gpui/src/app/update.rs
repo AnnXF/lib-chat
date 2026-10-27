@@ -258,7 +258,19 @@ impl ChatApp {
                 self.account = Some(user);
                 self.status = "已登录".into();
             }
-            UiEvent::Conversations { rooms } => self.conversations = rooms,
+            UiEvent::Conversations { rooms } => {
+                self.conversations = rooms;
+                // 点好友后服务端会返回新/复用的单聊，直接进去
+                if let Some(name) = self.pending_direct.take()
+                    && let Some(room) = self
+                        .conversations
+                        .iter()
+                        .find(|room| room.kind == chat_core::RoomKind::Direct && room.name == name)
+                        .cloned()
+                {
+                    self.pending_open_room = Some(room.room);
+                }
+            }
             UiEvent::Friends { users } => self.friends = users,
             UiEvent::AuthRequired => {
                 self.account = None;

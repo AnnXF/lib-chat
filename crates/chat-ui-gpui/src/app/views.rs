@@ -15,6 +15,8 @@ use gpui::{
     prelude::*, px, rgb, rgba,
 };
 
+use crate::app::FriendMenu;
+
 use crate::app::theme;
 
 use chat_core::Attachment;
@@ -493,6 +495,62 @@ fn login_field(label: &str, input: impl IntoElement) -> AnyElement {
         )
         .child(input)
         .into_any_element()
+}
+
+impl ChatApp {
+    /// 通讯录好友右键菜单。
+    pub(crate) fn render_friend_menu(
+        &self,
+        menu: FriendMenu,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let user_id = menu.user.id;
+        let display_name = menu.user.display_name.clone();
+        let username = menu.user.username.clone();
+        div()
+            .id("friend-menu-overlay")
+            .absolute()
+            .inset_0()
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_close_friend_menu))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_close_friend_menu))
+            .child(
+                div()
+                    .id("friend-menu")
+                    .test_id("friend-menu")
+                    .absolute()
+                    .left(menu.position.x)
+                    .top(menu.position.y)
+                    .w(px(168.))
+                    .flex()
+                    .flex_col()
+                    .py_1()
+                    .rounded_lg()
+                    .bg(rgb(theme::FIELD))
+                    .border_1()
+                    .border_color(rgb(theme::BORDER_STRONG))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        |_: &MouseDownEvent, _: &mut Window, cx: &mut App| cx.stop_propagation(),
+                    )
+                    .child(menu_item(
+                        "发消息",
+                        cx.listener(move |this, _, _, cx| {
+                            this.on_open_direct(user_id, display_name.clone(), cx);
+                            this.friend_menu = None;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(menu_item(
+                        "复制用户名",
+                        cx.listener(move |this, _, _, cx| {
+                            this.copy_text(username.clone(), "用户名", cx);
+                            this.friend_menu = None;
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .into_any_element()
+    }
 }
 
 #[cfg(test)]

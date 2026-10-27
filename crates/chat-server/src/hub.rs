@@ -139,6 +139,30 @@ impl Hub {
             .and_then(|state| state.display_name.clone())
     }
 
+    /// 把最新好友列表推给某个在线用户的所有连接。
+    async fn push_friends(&self, user: UserId) {
+        let Ok(users) = self.accounts.friends(user).await else {
+            return;
+        };
+        let targets: Vec<ConnId> = self
+            .conns
+            .read()
+            .await
+            .iter()
+            .filter(|(_, conn)| conn.user.as_ref().is_some_and(|known| known.id == user))
+            .map(|(id, _)| *id)
+            .collect();
+        for conn in targets {
+            self.send_to(
+                conn,
+                ServerEvent::Friends {
+                    users: users.clone(),
+                },
+            )
+            .await;
+        }
+    }
+
     async fn joined(&self, conn: ConnId, room: RoomId) -> bool {
         self.conns
             .read()
@@ -376,7 +400,17 @@ impl Hub {
                     return self.send_to(conn, ServerEvent::AuthRequired).await;
                 };
                 match self.accounts.add_friend(user.id, &username).await {
-                    Ok(users) => self.send_to(conn, ServerEvent::Friends { users }).await,
+                    Ok(users) => {
+                        let friend = users
+                            .iter()
+                            .find(|known| known.username == username.trim().to_ascii_lowercase())
+                            .cloned();
+                        self.send_to(conn, ServerEvent::Friends { users }).await;
+                        // 双方都更新，不必等对方重新登录
+                        if let Some(friend) = friend {
+                            self.push_friends(friend.id).await;
+                        }
+                    }
                     Err(e) => self.account_error(conn, e).await,
                 }
             }

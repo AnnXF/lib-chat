@@ -912,8 +912,9 @@ async fn run(
                 )
                 .await
                 {
-                    Ok((session, _, _)) => {
+                    Ok((session, lobby, _)) => {
                         let display = current.user.display_name.clone();
+                        let _ = events.send_async(lobby).await;
                         if let Some(previous) = active.take() {
                             previous.end().await;
                         }
@@ -921,7 +922,6 @@ async fn run(
                         if let Some(session) = &active {
                             send_session(session, SessionCmd::Join(display), &events).await;
                         }
-                        let _ = room;
                     }
                     Err(e) => {
                         let _ = events.send_async(UiEvent::Error(e)).await;

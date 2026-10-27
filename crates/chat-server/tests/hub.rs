@@ -183,3 +183,33 @@ async fn room_members_are_visible_to_members() {
     };
     assert!(members.iter().any(|user| user.id == bob.id));
 }
+
+#[tokio::test]
+async fn adding_a_friend_notifies_both_online_sides() {
+    let dir = temp_dir("friend-notify");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+    let (alice, _) = register(&hub, "alice").await;
+    let (bob, _) = register(&hub, "bob").await;
+
+    alice.add_friend("bob").await.unwrap();
+    match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Friends { users }
+            if users.iter().any(|user| user.username == "bob"))
+    })
+    .await
+    {
+        ServerEvent::Friends { .. } => {}
+        _ => unreachable!(),
+    }
+
+    // 被添加的一方在线时也该立刻刷新，不必重新登录
+    match wait_for(&bob, |event| {
+        matches!(event, ServerEvent::Friends { users }
+            if users.iter().any(|user| user.username == "alice"))
+    })
+    .await
+    {
+        ServerEvent::Friends { .. } => {}
+        _ => unreachable!(),
+    }
+}

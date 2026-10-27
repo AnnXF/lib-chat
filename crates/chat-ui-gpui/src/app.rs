@@ -81,6 +81,10 @@ pub struct ChatApp {
     my_id: Option<UserId>,
     /// 消息右键菜单；`None` 表示没有打开。
     message_menu: Option<MessageMenu>,
+    friend_menu: Option<FriendMenu>,
+    /// 点好友后等待服务端返回单聊房间，再自动打开。
+    pending_direct: Option<String>,
+    pending_open_room: Option<RoomId>,
     /// 输入框上方待发送的引用；发送成功或点 × 清除。
     pending_quote: Option<chat_core::Quote>,
     /// 已登录账号；`None` 时界面显示登录页。
@@ -99,6 +103,13 @@ pub struct ChatApp {
 pub(crate) struct MessageMenu {
     pub(crate) position: Point<Pixels>,
     pub(crate) line: ChatLine,
+}
+
+/// 通讯录好友的右键菜单：发消息、复制用户名。
+#[derive(Clone)]
+pub(crate) struct FriendMenu {
+    pub(crate) user: chat_core::UserSummary,
+    pub(crate) position: Point<Pixels>,
 }
 impl ChatApp {
     /// 事件所属的房间，正是界面此刻展示的那个吗？
@@ -210,12 +221,20 @@ impl ChatApp {
         })
         .detach();
 
+        cx.subscribe(&friend_input, |this, _, _: &TextInputSubmitted, cx| {
+            this.submit_friend(cx);
+        })
+        .detach();
+
         // 后端事件泵：把网络事件搬进界面状态
         cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv_async().await {
                 let alive = this
                     .update(cx, |state, cx| {
                         state.apply(event);
+                        if let Some(room) = state.pending_open_room.take() {
+                            state.open_conversation(room, cx);
+                        }
                         cx.notify();
                     })
                     .is_ok();
@@ -270,6 +289,9 @@ impl ChatApp {
             local_room_id: None,
             my_id: None,
             message_menu: None,
+            friend_menu: None,
+            pending_direct: None,
+            pending_open_room: None,
             pending_quote: None,
             account: None,
             conversations: Vec::new(),
@@ -286,6 +308,7 @@ impl Render for ChatApp {
         let sidebar = self.render_sidebar(cx);
         let main = self.render_main(cx);
         let menu = self.message_menu.clone();
+        let friend_menu = self.friend_menu.clone();
 
         div()
             .id("app-root")
@@ -317,6 +340,9 @@ impl Render for ChatApp {
             })
             .when_some(menu, |this, menu| {
                 this.child(self.render_message_menu(menu, cx))
+            })
+            .when_some(friend_menu, |this, menu| {
+                this.child(self.render_friend_menu(menu, cx))
             })
     }
 }
