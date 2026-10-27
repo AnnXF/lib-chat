@@ -594,6 +594,8 @@ impl ChatApp {
     }
 
     pub(crate) fn open_conversation(&mut self, room: RoomId, cx: &mut Context<Self>) {
+        // 无论从会话列表还是通讯录进来，都回到「聊」页展示聊天
+        self.nav = NavTab::Chats;
         self.status = "正在进入会话…".into();
         self.status_kind = super::StatusKind::Info;
         self.tell(UiCommand::OpenRoom { room }, cx);
@@ -622,6 +624,8 @@ impl ChatApp {
     }
 
     pub(crate) fn on_open_direct(&mut self, user: UserId, name: String, cx: &mut Context<Self>) {
+        // 先在界面上切回「聊」，单聊房间返回后会自动打开
+        self.nav = NavTab::Chats;
         self.pending_direct = Some(name);
         self.friend_menu = None;
         self.tell(UiCommand::OpenDirect { user }, cx);
