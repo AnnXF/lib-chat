@@ -7,7 +7,9 @@ use std::path::Path;
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
-use chat_core::{ChatError, RoomId, RoomKind, RoomSummary, UserId, UserSummary};
+use chat_core::{
+    ChatError, MemberRole, RoomId, RoomKind, RoomMember, RoomSummary, UserId, UserSummary,
+};
 use sea_query::{ColumnDef, Expr, Query, SqliteQueryBuilder, Table};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
@@ -565,6 +567,8 @@ impl Accounts {
                 name,
                 member_count,
                 last_seq: 0,
+                last_text: None,
+                last_at: None,
             });
         }
         Ok(result)
@@ -653,6 +657,104 @@ impl Accounts {
         self.insert_member(room, user, "member", now_secs()).await
     }
 
+    /// 成员与角色，按加入顺序。
+    pub async fn members_with_roles(
+        &self,
+        room: RoomId,
+    ) -> std::result::Result<Vec<RoomMember>, AccountError> {
+        let (sql, values) = Query::select()
+            .columns([
+                (users::TABLE, users::ID),
+                (users::TABLE, users::USERNAME),
+                (users::TABLE, users::DISPLAY_NAME),
+                (room_members::TABLE, room_members::ROLE),
+            ])
+            .from(room_members::TABLE)
+            .inner_join(
+                users::TABLE,
+                Expr::col((users::TABLE, users::ID))
+                    .eq(Expr::col((room_members::TABLE, room_members::USER_ID))),
+            )
+            .and_where(Expr::col((room_members::TABLE, room_members::ROOM_ID)).eq(room.to_string()))
+            .order_by(
+                (room_members::TABLE, room_members::JOINED_AT),
+                sea_query::Order::Asc,
+            )
+            .build(SqliteQueryBuilder);
+        let rows = bind(sqlx::query(&sql), values)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let role = match row.get::<String, _>(3).as_str() {
+                    "owner" => MemberRole::Owner,
+                    _ => MemberRole::Member,
+                };
+                Ok(RoomMember {
+                    user: row_to_user(row)?,
+                    role,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn member_role(
+        &self,
+        room: RoomId,
+        user: UserId,
+    ) -> std::result::Result<Option<MemberRole>, AccountError> {
+        let (sql, values) = Query::select()
+            .column(room_members::ROLE)
+            .from(room_members::TABLE)
+            .and_where(Expr::col(room_members::ROOM_ID).eq(room.to_string()))
+            .and_where(Expr::col(room_members::USER_ID).eq(user.to_string()))
+            .build(SqliteQueryBuilder);
+        let row = bind(sqlx::query(&sql), values)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|row| match row.get::<String, _>(0).as_str() {
+            "owner" => MemberRole::Owner,
+            _ => MemberRole::Member,
+        }))
+    }
+
+    pub async fn is_owner(
+        &self,
+        room: RoomId,
+        user: UserId,
+    ) -> std::result::Result<bool, AccountError> {
+        Ok(self.member_role(room, user).await? == Some(MemberRole::Owner))
+    }
+
+    pub async fn remove_member(
+        &self,
+        room: RoomId,
+        user: UserId,
+    ) -> std::result::Result<(), AccountError> {
+        let (sql, values) = Query::delete()
+            .from_table(room_members::TABLE)
+            .and_where(Expr::col(room_members::ROOM_ID).eq(room.to_string()))
+            .and_where(Expr::col(room_members::USER_ID).eq(user.to_string()))
+            .build(SqliteQueryBuilder);
+        bind(sqlx::query(&sql), values).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// 解散群聊：删除成员与房间记录，消息按房间保留在消息库中。
+    pub async fn dissolve_group(&self, room: RoomId) -> std::result::Result<(), AccountError> {
+        let (sql, values) = Query::delete()
+            .from_table(room_members::TABLE)
+            .and_where(Expr::col(room_members::ROOM_ID).eq(room.to_string()))
+            .build(SqliteQueryBuilder);
+        bind(sqlx::query(&sql), values).execute(&self.pool).await?;
+        let (sql, values) = Query::delete()
+            .from_table(rooms::TABLE)
+            .and_where(Expr::col(rooms::ID).eq(room.to_string()))
+            .build(SqliteQueryBuilder);
+        bind(sqlx::query(&sql), values).execute(&self.pool).await?;
+        Ok(())
+    }
+
     pub async fn is_member(
         &self,
         room: RoomId,
@@ -733,6 +835,8 @@ impl Accounts {
             name: case,
             member_count: self.member_count(room).await?,
             last_seq: 0,
+            last_text: None,
+            last_at: None,
         }))
     }
 

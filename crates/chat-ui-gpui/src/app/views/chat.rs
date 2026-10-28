@@ -1,4 +1,5 @@
 use super::*;
+use chat_core::{MemberRole, RoomKind};
 
 impl ChatApp {
     pub(crate) fn render_main(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -6,6 +7,11 @@ impl ChatApp {
             Some(room) => room.name.clone(),
             None => "未连接".to_string(),
         };
+        let is_group = self.room.as_ref().is_some_and(|room| {
+            self.conversations
+                .iter()
+                .any(|known| known.room == room.id && known.kind == RoomKind::Group)
+        });
         let subtitle = match &self.room {
             Some(room) => format!("{}    在线 {} 人", room.addr, room.online),
             None => self.hosted.as_ref().map_or_else(
@@ -135,8 +141,19 @@ impl ChatApp {
                                     .child(subtitle),
                             ),
                     )
+                    .when(is_group, |this| {
+                        this.child(button(
+                            "成员",
+                            false,
+                            false,
+                            cx.listener(Self::on_show_members),
+                        ))
+                    })
                     .child(action),
             )
+            .when(is_group && self.show_members, |this| {
+                this.child(self.render_members_panel(cx))
+            })
             .child(body)
             .child(
                 div()
@@ -262,4 +279,101 @@ fn quote_bar(quote: chat_core::Quote, cx: &mut Context<ChatApp>) -> AnyElement {
                 .child("×"),
         )
         .into_any_element()
+}
+
+impl ChatApp {
+    /// 群成员面板：成员、角色、移出/退群/解散。
+    pub(crate) fn render_members_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let me = self.account.as_ref().map(|user| user.id);
+        let is_owner = me.is_some_and(|id| {
+            self.members
+                .iter()
+                .any(|member| member.user.id == id && member.role == MemberRole::Owner)
+        });
+        let rows: Vec<_> = self
+            .members
+            .iter()
+            .enumerate()
+            .map(|(index, member)| {
+                let target = member.user.id;
+                let name = member.user.display_name.clone();
+                let first = name.chars().next().unwrap_or('?').to_string();
+                let role = if member.role == MemberRole::Owner {
+                    "群主"
+                } else {
+                    "成员"
+                };
+                let can_remove = is_owner && Some(target) != me;
+                div()
+                    .id(("member", index))
+                    .h(px(36.))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .size(px(24.))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(rgb(theme::ACCENT))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(11.))
+                            .text_color(rgb(theme::ON_ACCENT))
+                            .child(first),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_sm()
+                            .child(name),
+                    )
+                    .child(div().text_xs().text_color(rgb(theme::MUTED)).child(role))
+                    .when(can_remove, |this| {
+                        this.child(button(
+                            "移出",
+                            false,
+                            false,
+                            cx.listener(move |this, _, _, cx| this.on_remove_member(target, cx)),
+                        ))
+                    })
+                    .into_any_element()
+            })
+            .collect();
+
+        div()
+            .id("members-panel")
+            .test_id("members-panel")
+            .flex_none()
+            .max_h(px(190.))
+            .overflow_y_scroll()
+            .bg(rgb(theme::SURFACE))
+            .border_b_1()
+            .border_color(rgb(theme::BORDER))
+            .flex()
+            .flex_col()
+            .py_1()
+            .children(rows)
+            .when(is_owner, |this| {
+                this.child(div().px_4().py_2().child(button(
+                    "解散群聊",
+                    false,
+                    false,
+                    cx.listener(Self::on_dissolve_group),
+                )))
+            })
+            .when(!is_owner, |this| {
+                this.child(div().px_4().py_2().child(button(
+                    "退出群聊",
+                    false,
+                    false,
+                    cx.listener(Self::on_leave_group),
+                )))
+            })
+            .into_any_element()
+    }
 }

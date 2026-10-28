@@ -10,9 +10,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chat_core::{
     sha256_hex, validate_attachment, Attachment, AttachmentId, ChatError, ClientRequest,
-    Connection, ConnectionAcceptor, DeviceId, ErrorCode, EventStream, LobbyInfo, MessageKind,
-    MessageStore, NewMessage, Quote, RequestSink, Result, RoomId, RoomInfo, ServerEvent, UserId,
-    UserSummary, EVENT_QUEUE_CAPACITY,
+    Connection, ConnectionAcceptor, DeviceId, ErrorCode, EventStream, LobbyInfo, MemberRole,
+    MessageKind, MessageStore, NewMessage, Quote, RequestSink, Result, RoomId, RoomInfo, RoomKind,
+    RoomSummary, ServerEvent, UserId, UserSummary, EVENT_QUEUE_CAPACITY,
 };
 use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 
@@ -233,10 +233,78 @@ impl Hub {
                 return;
             }
         };
-        for room in &mut rooms {
-            room.last_seq = self.messages.latest_seq(room.room).await.unwrap_or(0);
-        }
+        self.fill_summaries(&mut rooms).await;
         self.send_to(conn, ServerEvent::Rooms { rooms }).await;
+    }
+
+    /// 会话摘要：最新序号与最后一条消息。
+    async fn fill_summaries(&self, rooms: &mut [RoomSummary]) {
+        for room in rooms {
+            room.last_seq = self.messages.latest_seq(room.room).await.unwrap_or(0);
+            if let Ok(recent) = self.messages.history(room.room, None, 1).await {
+                if let Some(message) = recent.last() {
+                    let text = message.text.replace(['\n', '\r'], " ");
+                    room.last_text = Some(if message.kind == MessageKind::File {
+                        "[文件]".to_string()
+                    } else if room.kind == RoomKind::Group {
+                        format!("{}: {text}", message.sender_name)
+                    } else {
+                        text
+                    });
+                    room.last_at = Some(now_secs());
+                }
+            }
+        }
+    }
+
+    /// 把最新会话列表推给某个在线用户的所有连接。
+    async fn push_rooms_to(&self, user: UserId) {
+        let Ok(mut rooms) = self.accounts.rooms(user).await else {
+            return;
+        };
+        self.fill_summaries(&mut rooms).await;
+        let targets: Vec<ConnId> = self
+            .conns
+            .read()
+            .await
+            .iter()
+            .filter(|(_, conn)| conn.user.as_ref().is_some_and(|known| known.id == user))
+            .map(|(id, _)| *id)
+            .collect();
+        for conn in targets {
+            self.send_to(
+                conn,
+                ServerEvent::Rooms {
+                    rooms: rooms.clone(),
+                },
+            )
+            .await;
+        }
+    }
+
+    /// 把最新成员列表推给房间内所有在线成员。
+    async fn push_members(&self, room: RoomId) {
+        let Ok(members) = self.accounts.members_with_roles(room).await else {
+            return;
+        };
+        let targets: Vec<ConnId> = self
+            .conns
+            .read()
+            .await
+            .iter()
+            .filter(|(_, conn)| conn.joined.contains(&room))
+            .map(|(id, _)| *id)
+            .collect();
+        for conn in targets {
+            self.send_to(
+                conn,
+                ServerEvent::RoomMembers {
+                    room,
+                    members: members.clone(),
+                },
+            )
+            .await;
+        }
     }
 
     async fn send_friends(&self, conn: ConnId, user: UserId) {
@@ -426,7 +494,16 @@ impl Hub {
                     return self.send_to(conn, ServerEvent::AuthRequired).await;
                 };
                 match self.accounts.create_group(user.id, &name, &members).await {
-                    Ok(_) => self.send_rooms(conn, user.id).await,
+                    Ok(_) => {
+                        let mut ids = Vec::with_capacity(members.len() + 1);
+                        ids.push(user.id);
+                        ids.extend(members);
+                        ids.sort_by_key(|id| id.to_string());
+                        ids.dedup();
+                        for id in ids {
+                            self.push_rooms_to(id).await;
+                        }
+                    }
                     Err(e) => self.account_error(conn, e).await,
                 }
             }
@@ -435,7 +512,10 @@ impl Hub {
                     return self.send_to(conn, ServerEvent::AuthRequired).await;
                 };
                 match self.accounts.open_direct(user.id, other).await {
-                    Ok(_) => self.send_rooms(conn, user.id).await,
+                    Ok(_) => {
+                        self.push_rooms_to(user.id).await;
+                        self.push_rooms_to(other).await;
+                    }
                     Err(e) => self.account_error(conn, e).await,
                 }
             }
@@ -453,12 +533,101 @@ impl Hub {
                         .send_error(conn, ErrorCode::RoomMismatch, "房间不存在")
                         .await;
                 }
-                match self.accounts.members(room).await {
+                match self.accounts.members_with_roles(room).await {
                     Ok(members) => {
                         self.send_to(conn, ServerEvent::RoomMembers { room, members })
                             .await
                     }
                     Err(e) => self.account_error(conn, e).await,
+                }
+            }
+
+            ClientRequest::LeaveGroup { room } => {
+                let Some(user) = self.user_of(conn).await else {
+                    return self.send_to(conn, ServerEvent::AuthRequired).await;
+                };
+                match self.accounts.member_role(room, user.id).await {
+                    Ok(Some(MemberRole::Owner)) => {
+                        self.send_error(conn, ErrorCode::Forbidden, "群主需先解散群聊")
+                            .await;
+                    }
+                    Ok(Some(MemberRole::Member)) => {
+                        if let Err(e) = self.accounts.remove_member(room, user.id).await {
+                            return self.account_error(conn, e).await;
+                        }
+                        self.push_rooms_to(user.id).await;
+                        self.send_to(conn, ServerEvent::Left { room }).await;
+                        self.push_members(room).await;
+                    }
+                    Ok(None) | Err(_) => {
+                        self.send_error(conn, ErrorCode::RoomMismatch, "房间不存在")
+                            .await;
+                    }
+                }
+            }
+
+            ClientRequest::RemoveMember { room, user: target } => {
+                let Some(user) = self.user_of(conn).await else {
+                    return self.send_to(conn, ServerEvent::AuthRequired).await;
+                };
+                if !self.accounts.is_owner(room, user.id).await.unwrap_or(false) {
+                    return self
+                        .send_error(conn, ErrorCode::Forbidden, "只有群主能移出成员")
+                        .await;
+                }
+                if target == user.id {
+                    return self
+                        .send_error(conn, ErrorCode::InvalidRequest, "不能移出自己")
+                        .await;
+                }
+                match self.accounts.member_role(room, target).await {
+                    Ok(Some(_)) => {
+                        if let Err(e) = self.accounts.remove_member(room, target).await {
+                            return self.account_error(conn, e).await;
+                        }
+                        self.push_rooms_to(target).await;
+                        self.push_rooms_to(user.id).await;
+                        let members = self
+                            .accounts
+                            .members_with_roles(room)
+                            .await
+                            .unwrap_or_default();
+                        self.send_to(
+                            conn,
+                            ServerEvent::RoomMembers {
+                                room,
+                                members: members.clone(),
+                            },
+                        )
+                        .await;
+                        self.push_members(room).await;
+                    }
+                    Ok(None) | Err(_) => {
+                        self.send_error(conn, ErrorCode::RoomMismatch, "成员不存在")
+                            .await;
+                    }
+                }
+            }
+
+            ClientRequest::DissolveGroup { room } => {
+                let Some(user) = self.user_of(conn).await else {
+                    return self.send_to(conn, ServerEvent::AuthRequired).await;
+                };
+                if !self.accounts.is_owner(room, user.id).await.unwrap_or(false) {
+                    return self
+                        .send_error(conn, ErrorCode::Forbidden, "只有群主能解散群聊")
+                        .await;
+                }
+                let members = self
+                    .accounts
+                    .members_with_roles(room)
+                    .await
+                    .unwrap_or_default();
+                if let Err(e) = self.accounts.dissolve_group(room).await {
+                    return self.account_error(conn, e).await;
+                }
+                for member in members {
+                    self.push_rooms_to(member.user.id).await;
                 }
             }
 
@@ -744,6 +913,13 @@ impl Hub {
         };
         self.send_error(conn, code, &message).await;
     }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn sanitize_quote(quote: Quote) -> Quote {

@@ -96,6 +96,22 @@ impl Client {
         self.conn.request(ClientRequest::RoomMembers { room }).await
     }
 
+    pub async fn leave_group(&self, room: RoomId) -> Result<()> {
+        self.conn.request(ClientRequest::LeaveGroup { room }).await
+    }
+
+    pub async fn remove_member(&self, room: RoomId, user: UserId) -> Result<()> {
+        self.conn
+            .request(ClientRequest::RemoveMember { room, user })
+            .await
+    }
+
+    pub async fn dissolve_group(&self, room: RoomId) -> Result<()> {
+        self.conn
+            .request(ClientRequest::DissolveGroup { room })
+            .await
+    }
+
     /// 查询大厅摘要，无需加入房间。
     pub async fn lobby(&self, room: RoomId) -> Result<()> {
         self.conn.request(ClientRequest::Lobby { room }).await

@@ -27,7 +27,8 @@ use chat_core::Client;
 use chat_core::{Attachment, AttachmentId};
 use chat_core::{ChatError, Connection, ConnectionAcceptor};
 use chat_core::{
-    LobbyInfo, Message, Quote, RoomId, RoomSummary, Seq, ServerEvent, UserId, UserSummary,
+    LobbyInfo, Message, Quote, RoomId, RoomMember, RoomSummary, Seq, ServerEvent, UserId,
+    UserSummary,
 };
 use chat_discovery::{RoomAnnouncer, RoomBrowser};
 use chat_server::Hub;
@@ -255,6 +256,10 @@ pub enum UiEvent {
     Friends {
         users: Vec<UserSummary>,
     },
+    RoomMembers {
+        room: RoomId,
+        members: Vec<RoomMember>,
+    },
     AuthRequired,
 }
 
@@ -335,6 +340,19 @@ pub enum UiCommand {
     CreateGroup {
         name: String,
         members: Vec<UserId>,
+    },
+    RoomMembers {
+        room: RoomId,
+    },
+    LeaveGroup {
+        room: RoomId,
+    },
+    RemoveMember {
+        room: RoomId,
+        user: UserId,
+    },
+    DissolveGroup {
+        room: RoomId,
     },
 }
 
@@ -976,6 +994,157 @@ async fn run(
                             break;
                         }
                     }
+                }
+            }
+            UiCommand::RoomMembers { room } => {
+                let Some(current) = &account else {
+                    let _ = events.send_async(UiEvent::Error("请先登录".into())).await;
+                    continue;
+                };
+                let client = match account_client(current, liveness).await {
+                    Ok(client) => client,
+                    Err(e) => {
+                        let _ = events.send_async(UiEvent::Error(e)).await;
+                        continue;
+                    }
+                };
+                if let Err(e) = client.room_members(room).await {
+                    let _ = events.send_async(UiEvent::Error(e.to_string())).await;
+                    continue;
+                }
+                for _ in 0..8 {
+                    match client.next_event().await {
+                        Ok(ServerEvent::RoomMembers { room, members }) => {
+                            let _ = events
+                                .send_async(UiEvent::RoomMembers { room, members })
+                                .await;
+                            break;
+                        }
+                        Ok(ServerEvent::Error { message, .. }) => {
+                            let _ = events.send_async(UiEvent::Error(message)).await;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            let _ = events.send_async(UiEvent::Error(e.to_string())).await;
+                            break;
+                        }
+                    }
+                }
+            }
+            UiCommand::LeaveGroup { room } => {
+                let Some(current) = &account else {
+                    let _ = events.send_async(UiEvent::Error("请先登录".into())).await;
+                    continue;
+                };
+                let client = match account_client(current, liveness).await {
+                    Ok(client) => client,
+                    Err(e) => {
+                        let _ = events.send_async(UiEvent::Error(e)).await;
+                        continue;
+                    }
+                };
+                if let Err(e) = client.leave_group(room).await {
+                    let _ = events.send_async(UiEvent::Error(e.to_string())).await;
+                    continue;
+                }
+                let mut left = false;
+                for _ in 0..12 {
+                    match client.next_event().await {
+                        Ok(ServerEvent::Rooms { rooms }) => {
+                            let _ = events.send_async(UiEvent::Conversations { rooms }).await;
+                        }
+                        Ok(ServerEvent::Left { .. }) => {
+                            left = true;
+                            break;
+                        }
+                        Ok(ServerEvent::Error { message, .. }) => {
+                            let _ = events.send_async(UiEvent::Error(message)).await;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                if left {
+                    if let Some(previous) = active.take() {
+                        previous.end().await;
+                    }
+                    let _ = events.send_async(UiEvent::Left { room }).await;
+                }
+            }
+            UiCommand::RemoveMember { room, user } => {
+                let Some(current) = &account else {
+                    let _ = events.send_async(UiEvent::Error("请先登录".into())).await;
+                    continue;
+                };
+                let client = match account_client(current, liveness).await {
+                    Ok(client) => client,
+                    Err(e) => {
+                        let _ = events.send_async(UiEvent::Error(e)).await;
+                        continue;
+                    }
+                };
+                if let Err(e) = client.remove_member(room, user).await {
+                    let _ = events.send_async(UiEvent::Error(e.to_string())).await;
+                    continue;
+                }
+                for _ in 0..12 {
+                    match client.next_event().await {
+                        Ok(ServerEvent::Rooms { rooms }) => {
+                            let _ = events.send_async(UiEvent::Conversations { rooms }).await;
+                        }
+                        Ok(ServerEvent::RoomMembers { room, members }) => {
+                            let _ = events
+                                .send_async(UiEvent::RoomMembers { room, members })
+                                .await;
+                            break;
+                        }
+                        Ok(ServerEvent::Error { message, .. }) => {
+                            let _ = events.send_async(UiEvent::Error(message)).await;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+            UiCommand::DissolveGroup { room } => {
+                let Some(current) = &account else {
+                    let _ = events.send_async(UiEvent::Error("请先登录".into())).await;
+                    continue;
+                };
+                let client = match account_client(current, liveness).await {
+                    Ok(client) => client,
+                    Err(e) => {
+                        let _ = events.send_async(UiEvent::Error(e)).await;
+                        continue;
+                    }
+                };
+                if let Err(e) = client.dissolve_group(room).await {
+                    let _ = events.send_async(UiEvent::Error(e.to_string())).await;
+                    continue;
+                }
+                for _ in 0..12 {
+                    match tokio::time::timeout(Duration::from_millis(300), client.next_event())
+                        .await
+                    {
+                        Ok(Ok(ServerEvent::Rooms { rooms })) => {
+                            let _ = events.send_async(UiEvent::Conversations { rooms }).await;
+                        }
+                        Ok(Ok(ServerEvent::Error { message, .. })) => {
+                            let _ = events.send_async(UiEvent::Error(message)).await;
+                            break;
+                        }
+                        Ok(Ok(_)) => {}
+                        Ok(Err(_)) | Err(_) => break,
+                    }
+                }
+                if active.as_ref().is_some_and(|session| session.room == room) {
+                    if let Some(previous) = active.take() {
+                        previous.end().await;
+                    }
+                    let _ = events.send_async(UiEvent::Left { room }).await;
                 }
             }
             UiCommand::Host { name } => {

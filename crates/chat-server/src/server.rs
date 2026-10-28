@@ -262,7 +262,10 @@ impl Server {
             | ClientRequest::ListRooms
             | ClientRequest::CreateGroup { .. }
             | ClientRequest::OpenDirect { .. }
-            | ClientRequest::RoomMembers { .. } => {
+            | ClientRequest::RoomMembers { .. }
+            | ClientRequest::LeaveGroup { .. }
+            | ClientRequest::RemoveMember { .. }
+            | ClientRequest::DissolveGroup { .. } => {
                 self.error_to(
                     conn,
                     ErrorCode::InvalidRequest,

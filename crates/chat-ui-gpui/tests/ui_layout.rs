@@ -789,3 +789,60 @@ fn wechat_nav_switches_between_chats_and_contacts() {
     assert_inside(&bounds(cx, "groups"), "groups");
     assert_inside(&bounds(cx, "friends"), "friends");
 }
+
+/// 群成员面板在窗口内，成员与角色可见。
+#[test]
+fn group_members_panel_fits_inside_the_window() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    let room = chat_core::RoomId::new();
+    let me = chat_core::UserSummary {
+        id: chat_core::UserId::new(),
+        username: "me".into(),
+        display_name: "我".into(),
+    };
+    let other = chat_core::UserSummary {
+        id: chat_core::UserId::new(),
+        username: "bob".into(),
+        display_name: "Bob".into(),
+    };
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| {
+            app.debug_apply(UiEvent::Conversations {
+                rooms: vec![chat_core::RoomSummary {
+                    room,
+                    kind: chat_core::RoomKind::Group,
+                    name: "测试群".into(),
+                    member_count: 2,
+                    last_seq: 0,
+                    last_text: None,
+                    last_at: None,
+                }],
+            });
+            app.debug_apply(UiEvent::Lobby {
+                room,
+                name: "测试群".into(),
+                addr: "127.0.0.1:1".into(),
+                online: 2,
+            });
+            app.debug_apply(UiEvent::RoomMembers {
+                room,
+                members: vec![
+                    chat_core::RoomMember {
+                        user: me,
+                        role: chat_core::MemberRole::Owner,
+                    },
+                    chat_core::RoomMember {
+                        user: other,
+                        role: chat_core::MemberRole::Member,
+                    },
+                ],
+            });
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    let panel = bounds(cx, "members-panel");
+    assert_inside(&panel, "members-panel");
+    assert!(f32::from(panel.size.height) > 20.);
+}

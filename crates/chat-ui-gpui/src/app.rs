@@ -84,6 +84,15 @@ pub struct ChatApp {
     friend_menu: Option<FriendMenu>,
     /// 点好友后等待服务端返回单聊房间，再自动打开。
     pending_direct: Option<String>,
+    /// 建群后等待服务端返回群聊房间，再自动打开。
+    pending_group_name: Option<String>,
+    /// 通讯录里勾选要拉进群的好友。
+    group_selected: Vec<UserId>,
+    /// 当前群聊成员与成员面板。
+    members: Vec<chat_core::RoomMember>,
+    show_members: bool,
+    /// 每个会话已读到的最新序号，用于未读红点。
+    read_seqs: std::collections::HashMap<chat_core::RoomId, i64>,
     pending_open_room: Option<RoomId>,
     /// 输入框上方待发送的引用；发送成功或点 × 清除。
     pending_quote: Option<chat_core::Quote>,
@@ -291,6 +300,11 @@ impl ChatApp {
             message_menu: None,
             friend_menu: None,
             pending_direct: None,
+            pending_group_name: None,
+            group_selected: Vec::new(),
+            members: Vec::new(),
+            show_members: false,
+            read_seqs: std::collections::HashMap::new(),
             pending_open_room: None,
             pending_quote: None,
             account: None,

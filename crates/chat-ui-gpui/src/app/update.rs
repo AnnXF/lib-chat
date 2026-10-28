@@ -160,6 +160,8 @@ impl ChatApp {
                 };
                 view.joined = false;
                 self.my_id = None;
+                self.show_members = false;
+                self.members.clear();
                 self.status = "已退出房间".into();
                 self.push_system("已退出房间".into());
             }
@@ -173,6 +175,7 @@ impl ChatApp {
                 quote,
             } => {
                 if self.showing(room).is_some() {
+                    self.read_seqs.insert(room, seq);
                     let line =
                         chat_line(seq, sender_id, sender, text, attachment, quote, self.my_id);
                     self.push_line(line);
@@ -185,6 +188,9 @@ impl ChatApp {
             } => {
                 if self.showing(room).is_none() {
                     return;
+                }
+                if let Some(last) = messages.last() {
+                    self.read_seqs.insert(room, last.seq);
                 }
                 self.has_older = has_more;
                 self.loading_older = false;
@@ -270,8 +276,34 @@ impl ChatApp {
                 {
                     self.pending_open_room = Some(room.room);
                 }
+                // 建群后服务端返回新群聊，直接进去
+                if let Some(name) = self.pending_group_name.take()
+                    && let Some(room) = self
+                        .conversations
+                        .iter()
+                        .find(|room| room.kind == chat_core::RoomKind::Group && room.name == name)
+                        .cloned()
+                {
+                    self.pending_open_room = Some(room.room);
+                }
+                // 当前正在看的会话保持已读
+                if let Some(current_room) = self.room.as_ref().map(|view| view.id)
+                    && let Some(known) = self
+                        .conversations
+                        .iter()
+                        .find(|room| room.room == current_room)
+                {
+                    let seq = known.last_seq;
+                    self.read_seqs.insert(current_room, seq);
+                }
             }
             UiEvent::Friends { users } => self.friends = users,
+            UiEvent::RoomMembers { room, members } => {
+                if self.showing(room).is_some() {
+                    self.members = members;
+                    self.show_members = true;
+                }
+            }
             UiEvent::AuthRequired => {
                 self.account = None;
                 self.status = "请先登录".into();

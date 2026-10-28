@@ -12,7 +12,7 @@ pub(super) fn map_event(event: ServerEvent) -> UiEvent {
         ServerEvent::AuthRequired => UiEvent::AuthRequired,
         ServerEvent::Friends { users } => UiEvent::Friends { users },
         ServerEvent::Rooms { rooms } => UiEvent::Conversations { rooms },
-        ServerEvent::RoomMembers { .. } => UiEvent::Status("房间成员已更新".into()),
+        ServerEvent::RoomMembers { room, members } => UiEvent::RoomMembers { room, members },
         ServerEvent::Lobby { info } => UiEvent::Presence {
             room: info.room,
             online: info.online_count,

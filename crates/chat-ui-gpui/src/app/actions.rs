@@ -596,6 +596,9 @@ impl ChatApp {
     pub(crate) fn open_conversation(&mut self, room: RoomId, cx: &mut Context<Self>) {
         // 无论从会话列表还是通讯录进来，都回到「聊」页展示聊天
         self.nav = NavTab::Chats;
+        if let Some(known) = self.conversations.iter().find(|known| known.room == room) {
+            self.read_seqs.insert(room, known.last_seq);
+        }
         self.status = "正在进入会话…".into();
         self.status_kind = super::StatusKind::Info;
         self.tell(UiCommand::OpenRoom { room }, cx);
@@ -644,8 +647,27 @@ impl ChatApp {
             cx.notify();
             return;
         }
-        let members: Vec<UserId> = self.friends.iter().map(|user| user.id).collect();
+        if self.group_selected.is_empty() {
+            self.status = "先在通讯录里勾选要拉进群的好友".into();
+            self.status_kind = super::StatusKind::Error;
+            cx.notify();
+            return;
+        }
+        let members = self.group_selected.clone();
+        self.pending_group_name = Some(name.clone());
+        self.group_input
+            .update(cx, |input, cx| input.set_content("", cx));
+        self.group_selected.clear();
         self.tell(UiCommand::CreateGroup { name, members }, cx);
+    }
+
+    pub(crate) fn on_toggle_group_member(&mut self, user: UserId, cx: &mut Context<Self>) {
+        if let Some(index) = self.group_selected.iter().position(|id| *id == user) {
+            self.group_selected.remove(index);
+        } else {
+            self.group_selected.push(user);
+        }
+        cx.notify();
     }
 }
 
@@ -668,6 +690,63 @@ impl ChatApp {
     ) {
         self.nav = NavTab::Contacts;
         cx.notify();
+    }
+}
+
+impl ChatApp {
+    pub(crate) fn on_show_members(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(room) = self.room.as_ref().map(|view| view.id) else {
+            return;
+        };
+        self.show_members = !self.show_members;
+        if self.show_members {
+            self.tell(UiCommand::RoomMembers { room }, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn on_leave_group(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(room) = self.room.as_ref().map(|view| view.id) {
+            self.show_members = false;
+            self.room = None;
+            self.my_id = None;
+            self.lines.clear();
+            self.seen_seqs.clear();
+            self.tell(UiCommand::LeaveGroup { room }, cx);
+        }
+    }
+
+    pub(crate) fn on_remove_member(&mut self, user: UserId, cx: &mut Context<Self>) {
+        if let Some(room) = self.room.as_ref().map(|view| view.id) {
+            self.tell(UiCommand::RemoveMember { room, user }, cx);
+        }
+    }
+
+    pub(crate) fn on_dissolve_group(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(room) = self.room.as_ref().map(|view| view.id) {
+            self.show_members = false;
+            self.room = None;
+            self.my_id = None;
+            self.lines.clear();
+            self.seen_seqs.clear();
+            self.tell(UiCommand::DissolveGroup { room }, cx);
+        }
     }
 }
 

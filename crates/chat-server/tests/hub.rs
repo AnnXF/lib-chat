@@ -181,7 +181,7 @@ async fn room_members_are_visible_to_members() {
         ServerEvent::RoomMembers { members, .. } => members,
         _ => unreachable!(),
     };
-    assert!(members.iter().any(|user| user.id == bob.id));
+    assert!(members.iter().any(|member| member.user.id == bob.id));
 }
 
 #[tokio::test]
@@ -212,4 +212,112 @@ async fn adding_a_friend_notifies_both_online_sides() {
         ServerEvent::Friends { .. } => {}
         _ => unreachable!(),
     }
+}
+
+#[tokio::test]
+async fn group_and_direct_creation_push_rooms_to_members() {
+    let dir = temp_dir("rooms-push");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+    let (alice, _) = register(&hub, "alice").await;
+    let (bob, bob_user) = register(&hub, "bob").await;
+
+    alice.add_friend("bob").await.unwrap();
+    wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
+    wait_for(&bob, |event| matches!(event, ServerEvent::Friends { .. })).await;
+
+    alice
+        .create_group("项目群", vec![bob_user.id])
+        .await
+        .unwrap();
+    wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Rooms { rooms }
+            if rooms.iter().any(|room| room.name == "项目群"))
+    })
+    .await;
+    wait_for(&bob, |event| {
+        matches!(event, ServerEvent::Rooms { rooms }
+            if rooms.iter().any(|room| room.name == "项目群"))
+    })
+    .await;
+
+    alice.open_direct(bob_user.id).await.unwrap();
+    wait_for(&bob, |event| {
+        matches!(event, ServerEvent::Rooms { rooms }
+            if rooms.iter().any(|room| room.kind == RoomKind::Direct))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn owner_can_remove_member_and_dissolve_group() {
+    use chat_core::MemberRole;
+
+    let dir = temp_dir("group-admin");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+    let (alice, alice_user) = register(&hub, "alice").await;
+    let (bob, bob_user) = register(&hub, "bob").await;
+    let (carol, carol_user) = register(&hub, "carol").await;
+
+    alice.add_friend("bob").await.unwrap();
+    wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
+    alice.add_friend("carol").await.unwrap();
+    wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
+
+    alice
+        .create_group("管理群", vec![bob_user.id, carol_user.id])
+        .await
+        .unwrap();
+    let group = match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Rooms { rooms }
+            if rooms.iter().any(|room| room.name == "管理群"))
+    })
+    .await
+    {
+        ServerEvent::Rooms { rooms } => {
+            rooms
+                .into_iter()
+                .find(|room| room.name == "管理群")
+                .unwrap()
+                .room
+        }
+        _ => unreachable!(),
+    };
+    wait_for(&bob, |event| {
+        matches!(event, ServerEvent::Rooms { rooms }
+            if rooms.iter().any(|room| room.room == group))
+    })
+    .await;
+    wait_for(&carol, |event| {
+        matches!(event, ServerEvent::Rooms { rooms }
+            if rooms.iter().any(|room| room.room == group))
+    })
+    .await;
+
+    alice.room_members(group).await.unwrap();
+    match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::RoomMembers { .. })
+    })
+    .await
+    {
+        ServerEvent::RoomMembers { members, .. } => {
+            assert_eq!(members.len(), 3);
+            assert!(members.iter().any(|member| {
+                member.user.id == alice_user.id && member.role == MemberRole::Owner
+            }));
+        }
+        _ => unreachable!(),
+    }
+
+    alice.remove_member(group, bob_user.id).await.unwrap();
+    wait_for(&bob, |event| {
+        matches!(event, ServerEvent::Rooms { rooms }
+            if !rooms.iter().any(|room| room.room == group))
+    })
+    .await;
+    alice.dissolve_group(group).await.unwrap();
+    wait_for(&carol, |event| {
+        matches!(event, ServerEvent::Rooms { rooms }
+            if !rooms.iter().any(|room| room.room == group))
+    })
+    .await;
 }

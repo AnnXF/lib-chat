@@ -62,7 +62,11 @@ impl ChatApp {
         let rows: Vec<_> = rooms
             .into_iter()
             .enumerate()
-            .map(|(index, room)| conversation_item(index, room, current, cx))
+            .map(|(index, room)| {
+                let read = self.read_seqs.get(&room.room).copied().unwrap_or(0);
+                let unread = room.last_seq > read && current != Some(room.room);
+                conversation_item(index, room, current, unread, cx)
+            })
             .collect();
         let empty = rows.is_empty();
 
@@ -119,12 +123,16 @@ impl ChatApp {
         let group_rows: Vec<_> = groups
             .into_iter()
             .enumerate()
-            .map(|(index, room)| conversation_item(index, room, None, cx))
+            .map(|(index, room)| conversation_item(index, room, None, false, cx))
             .collect();
+        let selected = self.group_selected.clone();
         let friend_rows: Vec<_> = friends
             .into_iter()
             .enumerate()
-            .map(|(index, user)| friend_item(index, user, cx))
+            .map(|(index, user)| {
+                let checked = selected.contains(&user.id);
+                friend_item(index, user, checked, cx)
+            })
             .collect();
 
         div()
@@ -955,22 +963,26 @@ fn conversation_item(
     index: usize,
     room: chat_core::RoomSummary,
     current: Option<RoomId>,
+    unread: bool,
     cx: &mut Context<ChatApp>,
 ) -> AnyElement {
     let room_id = room.room;
     let selected = current == Some(room_id);
     let name = room.name.clone();
     let first = name.chars().next().unwrap_or('?').to_string();
-    let subtitle = if room.kind == chat_core::RoomKind::Direct {
-        "单聊".to_string()
-    } else {
-        format!("{} 人", room.member_count)
-    };
+    let subtitle = room.last_text.clone().unwrap_or_else(|| {
+        if room.kind == chat_core::RoomKind::Direct {
+            "单聊".to_string()
+        } else {
+            format!("{} 人", room.member_count)
+        }
+    });
     let badge = if room.last_seq > 0 {
         room.last_seq.to_string()
     } else {
         String::new()
     };
+    let time = room.last_at.map(short_time);
     div()
         .id(("conversation-item", index))
         .h(px(60.))
@@ -1008,13 +1020,39 @@ fn conversation_item(
                         .child(subtitle),
                 ),
         )
-        .child(div().text_xs().text_color(rgb(theme::FAINT)).child(badge))
+        .child(if unread {
+            div()
+                .size(px(8.))
+                .flex_none()
+                .rounded_full()
+                .bg(rgb(theme::DANGER))
+                .into_any_element()
+        } else if let Some(time) = time {
+            div()
+                .text_xs()
+                .text_color(rgb(theme::FAINT))
+                .child(time)
+                .into_any_element()
+        } else {
+            div()
+                .text_xs()
+                .text_color(rgb(theme::FAINT))
+                .child(badge)
+                .into_any_element()
+        })
         .into_any_element()
+}
+
+/// Unix 秒 → `HH:MM`，会话列表右上角的时间。
+fn short_time(seconds: i64) -> String {
+    let day = seconds.rem_euclid(86_400);
+    format!("{:02}:{:02}", day / 3_600, (day % 3_600) / 60)
 }
 
 fn friend_item(
     index: usize,
     user: chat_core::UserSummary,
+    selected: bool,
     cx: &mut Context<ChatApp>,
 ) -> AnyElement {
     let user_id = user.id;
@@ -1069,6 +1107,32 @@ fn friend_item(
                         .text_color(rgb(theme::FAINT))
                         .child(username),
                 ),
+        )
+        .child(
+            div()
+                .size(px(20.))
+                .flex_none()
+                .rounded_full()
+                .border_1()
+                .border_color(rgb(if selected {
+                    theme::ACCENT
+                } else {
+                    theme::BORDER_STRONG
+                }))
+                .when(selected, |this| this.bg(rgb(theme::ACCENT)))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.on_toggle_group_member(user_id, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .when(selected, |this| {
+                    this.child(div().size(px(8.)).rounded_full().bg(rgb(theme::ON_ACCENT)))
+                }),
         )
         .into_any_element()
 }

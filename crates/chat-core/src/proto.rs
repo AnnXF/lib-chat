@@ -110,6 +110,23 @@ pub struct RoomSummary {
     pub member_count: u32,
     /// 房间当前最新序号，客户端据此判断是否有新消息。
     pub last_seq: Seq,
+    /// 最后一条消息摘要；空会话为 `None`。群聊带发送者名。
+    pub last_text: Option<String>,
+    /// 最后活动时间（Unix 秒），空会话为 `None`。
+    pub last_at: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberRole {
+    Owner,
+    Member,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RoomMember {
+    pub user: UserSummary,
+    pub role: MemberRole,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -188,6 +205,19 @@ pub enum ClientRequest {
     RoomMembers {
         room: RoomId,
     },
+    /// 主动退出群聊；群主需先解散。
+    LeaveGroup {
+        room: RoomId,
+    },
+    /// 群主把成员移出群聊。
+    RemoveMember {
+        room: RoomId,
+        user: UserId,
+    },
+    /// 群主解散群聊。
+    DissolveGroup {
+        room: RoomId,
+    },
 
     // ---------------------------------------------------------------- 房间内
     /// 查询大厅摘要，无需加入。
@@ -248,7 +278,7 @@ pub enum ServerEvent {
     },
     RoomMembers {
         room: RoomId,
-        members: Vec<UserSummary>,
+        members: Vec<RoomMember>,
     },
     Lobby {
         info: LobbyInfo,
@@ -297,6 +327,8 @@ pub enum ErrorCode {
     Unauthorized,
     /// 用户名已存在、重复添加好友等。
     Conflict,
+    /// 当前账号没有权限执行该操作。
+    Forbidden,
     /// 附件超过 [`MAX_ATTACHMENT_BYTES`]。
     TooLarge,
     /// 附件不存在或尚未上传完成。
