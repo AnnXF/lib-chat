@@ -11,6 +11,18 @@ pub(super) fn map_event(event: ServerEvent) -> UiEvent {
         ServerEvent::Authenticated { user, token } => UiEvent::Authenticated { user, token },
         ServerEvent::AuthRequired => UiEvent::AuthRequired,
         ServerEvent::Friends { users } => UiEvent::Friends { users },
+        ServerEvent::UserSearch { users } => UiEvent::UserSearch { users },
+        ServerEvent::SearchResults { room, messages } => UiEvent::SearchResults {
+            room,
+            messages: messages.into_iter().map(to_history_message).collect(),
+        },
+        ServerEvent::MessageRecalled { room, seq } => UiEvent::MessageRecalled { room, seq },
+        ServerEvent::MessageEdited { message } => UiEvent::MessageEdited {
+            room: message.room,
+            message: to_history_message(message),
+        },
+        ServerEvent::Mention { room, from, text } => UiEvent::Mention { room, from, text },
+        ServerEvent::FriendPresence { user, online } => UiEvent::FriendPresence { user, online },
         ServerEvent::Rooms { rooms } => UiEvent::Conversations { rooms },
         ServerEvent::RoomMembers { room, members } => UiEvent::RoomMembers { room, members },
         ServerEvent::Lobby { info } => UiEvent::Presence {
@@ -33,6 +45,7 @@ pub(super) fn map_event(event: ServerEvent) -> UiEvent {
             seq: message.seq,
             sender_id: message.sender,
             sender: message.sender_name,
+            at: message.server_ts_ms,
             text: message.text,
             attachment: message.attachment,
             quote: message.quote,
@@ -58,11 +71,12 @@ pub(super) fn map_event(event: ServerEvent) -> UiEvent {
     }
 }
 
-fn to_history_message(message: Message) -> HistoryMessage {
+pub(super) fn to_history_message(message: Message) -> HistoryMessage {
     HistoryMessage {
         seq: message.seq,
         sender_id: message.sender,
         sender: message.sender_name,
+        at: message.server_ts_ms,
         text: message.text,
         attachment: message.attachment,
         quote: message.quote,

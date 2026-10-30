@@ -3,15 +3,23 @@
 //! 消息列表的改动同时维护虚拟列表的项数。
 
 use chat_core::{RoomId, Seq, UserId};
-use gpui::ListOffset;
 
-use crate::service::UiEvent;
+use crate::service::{UiCommand, UiEvent};
+use gpui::ListOffset;
 
 use chat_core::Attachment;
 
 use super::{ChatApp, ChatLine, DiscoveredRoom, HostedRoom, RoomSource, RoomView, StatusKind};
 
 impl ChatApp {
+    pub(crate) fn mark_read(&mut self, room: RoomId, seq: Seq) {
+        if seq > self.read_seqs.get(&room).copied().unwrap_or(0) {
+            self.read_seqs.insert(room, seq);
+            // 已读位置由服务端落库；本地只做即时更新
+            let _ = self.cmd_tx.try_send(UiCommand::MarkRead { room, seq });
+        }
+    }
+
     pub(crate) fn begin_loading_older(&mut self) -> bool {
         if !self.has_older
             || self.loading_older
@@ -162,6 +170,14 @@ impl ChatApp {
                 self.my_id = None;
                 self.show_members = false;
                 self.members.clear();
+                self.unread_after = None;
+                self.unread_count = 0;
+                self.unread_room = None;
+                self.unread_marker_ix = None;
+                self.unread_prompt_done = true;
+                self.jump_requested = false;
+                self.auto_unread = false;
+                self.auto_unread_pages = 0;
                 self.status = "已退出房间".into();
                 self.push_system("已退出房间".into());
             }
@@ -170,14 +186,20 @@ impl ChatApp {
                 seq,
                 sender_id,
                 sender,
+                at,
                 text,
                 attachment,
                 quote,
             } => {
                 if self.showing(room).is_some() {
-                    self.read_seqs.insert(room, seq);
-                    let line =
-                        chat_line(seq, sender_id, sender, text, attachment, quote, self.my_id);
+                    if self.window_active {
+                        self.mark_read(room, seq);
+                    }
+                    let mentioned = self.mentions_me(&text);
+                    let mut line = chat_line(
+                        seq, at, sender_id, sender, text, attachment, quote, self.my_id,
+                    );
+                    line.mentioned = mentioned;
                     self.push_line(line);
                 }
             }
@@ -190,27 +212,68 @@ impl ChatApp {
                     return;
                 }
                 if let Some(last) = messages.last() {
-                    self.read_seqs.insert(room, last.seq);
+                    self.mark_read(room, last.seq);
                 }
                 self.has_older = has_more;
                 self.loading_older = false;
                 let my_id = self.my_id;
-                let lines = messages
+                let lines: Vec<ChatLine> = messages
                     .into_iter()
                     .map(|m| {
-                        chat_line(
+                        let mentioned = self.mentions_me(&m.text);
+                        let mut line = chat_line(
                             m.seq,
+                            m.at,
                             m.sender_id,
                             m.sender,
                             m.text,
                             m.attachment,
                             m.quote,
                             my_id,
-                        )
+                        );
+                        line.mentioned = mentioned;
+                        line
                     })
                     .collect();
+                let mut marker_index = None;
+                if let Some(cutoff) = self.unread_after
+                    && self.unread_marker_ix.is_none()
+                {
+                    let boundary = lines
+                        .iter()
+                        .position(|line| line.seq.is_some_and(|seq| seq > cutoff));
+                    if let Some(position) = boundary {
+                        marker_index = Some(position);
+                        self.auto_unread = false;
+                    } else if self.auto_unread && self.has_older && self.auto_unread_pages < 20 {
+                        // 当前页全在未读区间内：继续向前翻，直到找到已读边界
+                        self.auto_unread_pages += 1;
+                        self.loading_older = true;
+                        if self.cmd_tx.try_send(UiCommand::LoadOlder).is_err() {
+                            self.loading_older = false;
+                        }
+                    } else {
+                        // 已经到最老的一页，第一条就是最早未读
+                        marker_index = Some(0);
+                        self.auto_unread = false;
+                    }
+                }
                 // 比当前会话更早，插到最前才是正确的时间顺序
                 self.prepend_lines(lines);
+                // 分隔条不能走 insert_line：seq 为 None 会被追加到末尾，导致跳错位置
+                if let Some(index) = marker_index {
+                    self.lines.insert(index, self.unread_marker_line());
+                    self.list.splice(index..index, 1);
+                    self.unread_marker_ix = Some(index);
+                    if self.jump_requested {
+                        self.jump_requested = false;
+                        self.unread_prompt_done = true;
+                        self.list.scroll_to(ListOffset {
+                            item_ix: index,
+                            offset_in_item: gpui::px(0.),
+                        });
+                    }
+                }
             }
             UiEvent::Missed { room, messages } => {
                 if self.showing(room).is_none() {
@@ -220,15 +283,19 @@ impl ChatApp {
                 let lines = messages
                     .into_iter()
                     .map(|m| {
-                        chat_line(
+                        let mentioned = self.mentions_me(&m.text);
+                        let mut line = chat_line(
                             m.seq,
+                            m.at,
                             m.sender_id,
                             m.sender,
                             m.text,
                             m.attachment,
                             m.quote,
                             my_id,
-                        )
+                        );
+                        line.mentioned = mentioned;
+                        line
                     })
                     .collect();
                 self.push_lines(lines);
@@ -262,10 +329,18 @@ impl ChatApp {
             }
             UiEvent::Authenticated { user, .. } => {
                 self.account = Some(user);
+                self.read_seqs.clear();
                 self.status = "已登录".into();
             }
             UiEvent::Conversations { rooms } => {
                 self.conversations = rooms;
+                // 已读位置来自服务端；本地只保留即时状态
+                for room in &self.conversations {
+                    let current = self.read_seqs.get(&room.room).copied().unwrap_or(0);
+                    if room.read_seq > current {
+                        self.read_seqs.insert(room.room, room.read_seq);
+                    }
+                }
                 // 点好友后服务端会返回新/复用的单聊，直接进去
                 if let Some(name) = self.pending_direct.take()
                     && let Some(room) = self
@@ -287,17 +362,85 @@ impl ChatApp {
                     self.pending_open_room = Some(room.room);
                 }
                 // 当前正在看的会话保持已读
-                if let Some(current_room) = self.room.as_ref().map(|view| view.id)
+                if self.window_active
+                    && let Some(current_room) = self.room.as_ref().map(|view| view.id)
                     && let Some(known) = self
                         .conversations
                         .iter()
                         .find(|room| room.room == current_room)
                 {
                     let seq = known.last_seq;
-                    self.read_seqs.insert(current_room, seq);
+                    self.mark_read(current_room, seq);
                 }
             }
             UiEvent::Friends { users } => self.friends = users,
+            UiEvent::UserSearch { users } => self.search_results = users,
+            UiEvent::MessageEdited { room, message } => {
+                if self.showing(room).is_some() {
+                    if let Some(line) = self
+                        .lines
+                        .iter_mut()
+                        .find(|line| line.seq == Some(message.seq))
+                    {
+                        line.text = message.text.clone();
+                    }
+                    if self
+                        .editing
+                        .is_some_and(|(room_id, seq)| room_id == room && seq == message.seq)
+                    {
+                        self.editing = None;
+                    }
+                    self.status = "消息已更新".into();
+                }
+            }
+            UiEvent::MessageRecalled { room, seq } => {
+                if self.showing(room).is_some() {
+                    self.lines.retain(|line| line.seq != Some(seq));
+                    self.seen_seqs.remove(&seq);
+                    self.list.reset(self.lines.len());
+                    self.status = "消息已撤回".into();
+                }
+            }
+            UiEvent::Mention { room, from, text } => {
+                let where_ = self
+                    .conversations
+                    .iter()
+                    .find(|known| known.room == room)
+                    .map(|known| known.name.clone())
+                    .unwrap_or_else(|| room.to_string());
+                self.status = format!("{} 在「{where_}」提到你：{text}", from.display_name);
+                self.status_kind = super::StatusKind::Warn;
+                notify_desktop(
+                    "lib-chat",
+                    &format!("{} 在「{where_}」提到你：{text}", from.display_name),
+                );
+            }
+            UiEvent::SearchResults { room, messages } => {
+                if self.showing(room).is_some() {
+                    self.message_results = messages;
+                    self.show_search = true;
+                }
+            }
+            UiEvent::FriendPresence { user, online } => {
+                if online {
+                    self.online_friends.insert(user);
+                } else {
+                    self.online_friends.remove(&user);
+                }
+            }
+            UiEvent::LoggedOut => {
+                self.account = None;
+                self.conversations.clear();
+                self.friends.clear();
+                self.search_results.clear();
+                self.online_friends.clear();
+                self.read_seqs.clear();
+                self.room = None;
+                self.my_id = None;
+                self.show_members = false;
+                self.members.clear();
+                self.status = "已退出登录".into();
+            }
             UiEvent::RoomMembers { room, members } => {
                 if self.showing(room).is_some() {
                     self.members = members;
@@ -410,6 +553,28 @@ impl ChatApp {
         Some(at)
     }
 
+    fn unread_marker_line(&self) -> ChatLine {
+        ChatLine {
+            seq: None,
+            sender: String::new(),
+            at: 0,
+            text: format!("{} 条未读，以下是新消息", self.unread_count),
+            attachment: None,
+            quote: None,
+            mine: false,
+            mentioned: false,
+            unread_marker: true,
+            system: false,
+        }
+    }
+
+    fn mentions_me(&self, text: &str) -> bool {
+        self.account.as_ref().is_some_and(|user| {
+            text.to_lowercase()
+                .contains(&format!("@{}", user.username.to_lowercase()))
+        })
+    }
+
     pub(crate) fn push_line(&mut self, line: ChatLine) {
         self.insert_line(line, false);
     }
@@ -450,18 +615,23 @@ impl ChatApp {
     pub(crate) fn push_system(&mut self, text: String) {
         self.push_line(ChatLine {
             seq: None,
+            at: 0,
             sender: "系统".into(),
             text,
             attachment: None,
             quote: None,
             mine: false,
+            mentioned: false,
+            unread_marker: false,
             system: true,
         });
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn chat_line(
     seq: Seq,
+    at: i64,
     sender_id: UserId,
     sender: String,
     text: String,
@@ -472,10 +642,26 @@ fn chat_line(
     ChatLine {
         seq: Some(seq),
         sender,
+        at,
         text,
         attachment,
         quote,
         mine: mine == Some(sender_id),
+        mentioned: false,
+        unread_marker: false,
         system: false,
     }
+}
+
+/// macOS 桌面通知；没有 osascript 的平台静默失败。
+fn notify_desktop(title: &str, body: &str) {
+    let escape = |text: &str| text.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(
+        "display notification \"{}\" with title \"{}\"",
+        escape(body),
+        escape(title)
+    );
+    let _ = std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .spawn();
 }

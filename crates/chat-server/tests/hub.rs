@@ -321,3 +321,203 @@ async fn owner_can_remove_member_and_dissolve_group() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn search_remove_friend_and_presence() {
+    let dir = temp_dir("friend-search-remove");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+    let (alice, _) = register(&hub, "alice").await;
+    let (bob, bob_user) = register(&hub, "bob").await;
+
+    alice.search_users("bo").await.unwrap();
+    match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::UserSearch { .. })
+    })
+    .await
+    {
+        ServerEvent::UserSearch { users } => {
+            assert!(users.iter().any(|user| user.id == bob_user.id));
+        }
+        _ => unreachable!(),
+    }
+
+    alice.add_friend("bob").await.unwrap();
+    wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
+    wait_for(&bob, |event| matches!(event, ServerEvent::Friends { .. })).await;
+    // 双方都能看到对方在线
+    wait_for(&alice, |event| {
+        matches!(event, ServerEvent::FriendPresence { user, online: true } if *user == bob_user.id)
+    })
+    .await;
+
+    alice.remove_friend(bob_user.id).await.unwrap();
+    match wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await {
+        ServerEvent::Friends { users } => {
+            assert!(!users.iter().any(|user| user.id == bob_user.id));
+        }
+        _ => unreachable!(),
+    }
+
+    // 重新加好友，bob 退出后 alice 应收到离线
+    alice.add_friend("bob").await.unwrap();
+    wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
+    wait_for(&bob, |event| matches!(event, ServerEvent::Friends { .. })).await;
+    bob.logout().await.unwrap();
+    wait_for(&alice, |event| {
+        matches!(event, ServerEvent::FriendPresence { user, online: false } if *user == bob_user.id)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn searches_messages_in_room() {
+    let dir = temp_dir("message-search");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+    let (alice, _) = register(&hub, "alice").await;
+    let (bob, bob_user) = register(&hub, "bob").await;
+
+    alice.add_friend("bob").await.unwrap();
+    wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
+    wait_for(&bob, |event| matches!(event, ServerEvent::Friends { .. })).await;
+    alice.open_direct(bob_user.id).await.unwrap();
+    let room = match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Rooms { rooms }
+            if rooms.iter().any(|room| room.kind == RoomKind::Direct))
+    })
+    .await
+    {
+        ServerEvent::Rooms { rooms } => {
+            rooms
+                .into_iter()
+                .find(|room| room.kind == RoomKind::Direct)
+                .unwrap()
+                .room
+        }
+        _ => unreachable!(),
+    };
+
+    alice.join(room, "Alice").await.unwrap();
+    wait_for(&alice, |event| matches!(event, ServerEvent::Joined { .. })).await;
+    bob.join(room, "Bob").await.unwrap();
+    wait_for(&bob, |event| matches!(event, ServerEvent::Joined { .. })).await;
+
+    alice
+        .send_text(room, "hello searchable world")
+        .await
+        .unwrap();
+    let seq = match wait_for(&bob, |event| matches!(event, ServerEvent::Message { .. })).await {
+        ServerEvent::Message { message } => message.seq,
+        _ => unreachable!(),
+    };
+
+    alice.search_messages(room, "searchable").await.unwrap();
+    match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::SearchResults { .. })
+    })
+    .await
+    {
+        ServerEvent::SearchResults { messages, .. } => {
+            assert!(messages
+                .iter()
+                .any(|message| message.text.contains("searchable")));
+        }
+        _ => unreachable!(),
+    }
+
+    alice.edit_message(room, seq, "edited text").await.unwrap();
+    wait_for(&bob, |event| {
+        matches!(event, ServerEvent::MessageEdited { message }
+            if message.text == "edited text")
+    })
+    .await;
+    alice.recall_message(room, seq).await.unwrap();
+    wait_for(&bob, |event| {
+        matches!(event, ServerEvent::MessageRecalled { .. })
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn messages_push_room_summaries_to_members_not_in_the_room() {
+    let dir = temp_dir("rooms-unread");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+    let (alice, _) = register(&hub, "alice").await;
+    let (bob, bob_user) = register(&hub, "bob").await;
+
+    alice.add_friend("bob").await.unwrap();
+    wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
+    wait_for(&bob, |event| matches!(event, ServerEvent::Friends { .. })).await;
+    alice.open_direct(bob_user.id).await.unwrap();
+    let room = match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Rooms { rooms }
+            if rooms.iter().any(|room| room.kind == RoomKind::Direct))
+    })
+    .await
+    {
+        ServerEvent::Rooms { rooms } => {
+            rooms
+                .into_iter()
+                .find(|room| room.kind == RoomKind::Direct)
+                .unwrap()
+                .room
+        }
+        _ => unreachable!(),
+    };
+
+    // 只有 alice 进入房间；bob 不在房间里，也应该收到会话摘要更新
+    alice.join(room, "Alice").await.unwrap();
+    wait_for(&alice, |event| matches!(event, ServerEvent::Joined { .. })).await;
+    alice.send_text(room, "不在房间也要看到未读").await.unwrap();
+
+    wait_for(&bob, |event| {
+        matches!(event, ServerEvent::Rooms { rooms }
+        if rooms.iter().any(|known| {
+            known.room == room
+                && known.last_text.as_deref() == Some("不在房间也要看到未读")
+        }))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn mark_read_persists_in_room_summary() {
+    let dir = temp_dir("mark-read");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+    let (alice, _) = register(&hub, "alice").await;
+    let (bob, bob_user) = register(&hub, "bob").await;
+
+    alice.add_friend("bob").await.unwrap();
+    wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
+    wait_for(&bob, |event| matches!(event, ServerEvent::Friends { .. })).await;
+    alice.open_direct(bob_user.id).await.unwrap();
+    let room = match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Rooms { rooms }
+            if rooms.iter().any(|room| room.kind == RoomKind::Direct))
+    })
+    .await
+    {
+        ServerEvent::Rooms { rooms } => {
+            rooms
+                .into_iter()
+                .find(|room| room.kind == RoomKind::Direct)
+                .unwrap()
+                .room
+        }
+        _ => unreachable!(),
+    };
+    alice.join(room, "Alice").await.unwrap();
+    wait_for(&alice, |event| matches!(event, ServerEvent::Joined { .. })).await;
+    alice.send_text(room, "已读位置").await.unwrap();
+    let seq = match wait_for(&alice, |event| matches!(event, ServerEvent::Message { .. })).await {
+        ServerEvent::Message { message } => message.seq,
+        _ => unreachable!(),
+    };
+
+    alice.mark_read(room, seq).await.unwrap();
+    alice.list_rooms().await.unwrap();
+    wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Rooms { rooms }
+            if rooms.iter().any(|known| known.room == room && known.read_seq == seq))
+    })
+    .await;
+}

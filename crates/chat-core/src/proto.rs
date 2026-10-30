@@ -114,6 +114,8 @@ pub struct RoomSummary {
     pub last_text: Option<String>,
     /// 最后活动时间（Unix 秒），空会话为 `None`。
     pub last_at: Option<i64>,
+    /// 当前账号在这个房间已读到的最新序号，由服务端持久化。
+    pub read_seq: Seq,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +189,35 @@ pub enum ClientRequest {
     /// 按用户名添加好友；双方直接建立关系，MVP 不做申请审批。
     AddFriend {
         username: String,
+    },
+    /// 解除好友关系，双方列表同时移除。
+    RemoveFriend {
+        user: UserId,
+    },
+    /// 按用户名或昵称搜索用户，最多 20 条。
+    SearchUsers {
+        query: String,
+    },
+    /// 在当前房间内按正文搜索消息，最多 50 条。
+    SearchMessages {
+        room: RoomId,
+        query: String,
+    },
+    /// 撤回自己发送的一条消息。
+    RecallMessage {
+        room: RoomId,
+        seq: Seq,
+    },
+    /// 编辑自己发送的文本消息。
+    EditMessage {
+        room: RoomId,
+        seq: Seq,
+        text: String,
+    },
+    /// 更新当前账号在房间里的已读位置。
+    MarkRead {
+        room: RoomId,
+        seq: Seq,
     },
 
     // ---------------------------------------------------------------- 房间
@@ -272,6 +303,35 @@ pub enum ServerEvent {
     AuthRequired,
     Friends {
         users: Vec<UserSummary>,
+    },
+    /// 用户搜索结果。
+    UserSearch {
+        users: Vec<UserSummary>,
+    },
+    /// 房间消息搜索结果。
+    SearchResults {
+        room: RoomId,
+        messages: Vec<Message>,
+    },
+    /// 某条消息被撤回，客户端应从列表移除。
+    MessageRecalled {
+        room: RoomId,
+        seq: Seq,
+    },
+    /// 某条消息被编辑。
+    MessageEdited {
+        message: Message,
+    },
+    /// 有人在消息里 @ 了当前用户。
+    Mention {
+        room: RoomId,
+        from: UserSummary,
+        text: String,
+    },
+    /// 好友在线状态变化。
+    FriendPresence {
+        user: UserId,
+        online: bool,
     },
     Rooms {
         rooms: Vec<RoomSummary>,

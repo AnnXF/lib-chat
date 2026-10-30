@@ -141,6 +141,12 @@ impl ChatApp {
                                     .child(subtitle),
                             ),
                     )
+                    .child(button(
+                        "搜索",
+                        false,
+                        false,
+                        cx.listener(Self::on_toggle_search),
+                    ))
                     .when(is_group, |this| {
                         this.child(button(
                             "成员",
@@ -151,9 +157,27 @@ impl ChatApp {
                     })
                     .child(action),
             )
+            .when(self.show_search, |this| {
+                this.child(self.render_search_panel(cx))
+            })
             .when(is_group && self.show_members, |this| {
                 this.child(self.render_members_panel(cx))
             })
+            .when(
+                {
+                    let same_room = self
+                        .unread_room
+                        .is_some_and(|room| self.room.as_ref().is_some_and(|view| view.id == room));
+                    let marker_visible = self
+                        .unread_marker_ix
+                        .is_some_and(|index| self.visible_range.contains(&index));
+                    self.unread_count > 0
+                        && same_room
+                        && !self.unread_prompt_done
+                        && !marker_visible
+                },
+                |this| this.child(self.render_unread_banner(cx)),
+            )
             .child(body)
             .child(
                 div()
@@ -169,6 +193,14 @@ impl ChatApp {
                     .bg(rgb(theme::SURFACE))
                     .border_t_1()
                     .border_color(rgb(theme::BORDER))
+                    .when(self.editing.is_some(), |this| {
+                        this.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(theme::WARN))
+                                .child("编辑消息：Enter 保存，Esc 取消"),
+                        )
+                    })
                     // 工具条在上：左侧功能入口，右侧快捷键与发送；
                     // 新增表情/图片只是在左侧再加一个入口，不挤占输入区
                     .child(
@@ -198,9 +230,16 @@ impl ChatApp {
                                     .gap_3()
                                     .child(
                                         div()
+                                            .id("drop-zone")
+                                            .test_id("drop-zone")
                                             .text_size(px(11.))
                                             .text_color(rgb(theme::FAINT))
-                                            .child("Enter 发送"),
+                                            .child("拖文件到此 / Enter 发送")
+                                            .on_drop::<gpui::ExternalPaths>(cx.listener(
+                                                |this, paths: &gpui::ExternalPaths, _, cx| {
+                                                    this.on_drop_files(paths.paths(), cx);
+                                                },
+                                            )),
                                     )
                                     .child(button("发送", true, false, cx.listener(Self::on_send))),
                             ),
@@ -374,6 +413,111 @@ impl ChatApp {
                     cx.listener(Self::on_leave_group),
                 )))
             })
+            .into_any_element()
+    }
+}
+
+impl ChatApp {
+    /// 当前会话的聊天记录搜索面板。
+    pub(crate) fn render_search_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let rows: Vec<_> = self
+            .message_results
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                div()
+                    .id(("search-result", index))
+                    .px_4()
+                    .py_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(rgb(theme::BORDER))
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(rgb(theme::FAINT))
+                            .child(format!("{}  {}", message.sender, format_time(message.at))),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(rgb(theme::TEXT))
+                            .child(message.text.clone()),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        div()
+            .id("search-panel")
+            .test_id("search-panel")
+            .flex_none()
+            .max_h(px(220.))
+            .overflow_y_scroll()
+            .bg(rgb(theme::SURFACE))
+            .border_b_1()
+            .border_color(rgb(theme::BORDER))
+            .flex()
+            .flex_col()
+            .py_2()
+            .child(
+                div()
+                    .px_4()
+                    .pb_2()
+                    .flex()
+                    .gap_2()
+                    .child(div().flex_1().child(self.message_search_input.clone()))
+                    .child(button(
+                        "搜索",
+                        true,
+                        false,
+                        cx.listener(Self::on_search_messages),
+                    )),
+            )
+            .when(rows.is_empty(), |this| {
+                this.child(
+                    div()
+                        .px_4()
+                        .py_2()
+                        .text_size(px(12.))
+                        .text_color(rgb(theme::FAINT))
+                        .child("输入关键词搜索当前聊天记录"),
+                )
+            })
+            .children(rows)
+            .into_any_element()
+    }
+}
+
+impl ChatApp {
+    /// 未读提示只负责跳转；进入房间仍停在最新消息。
+    pub(crate) fn render_unread_banner(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("unread-banner")
+            .test_id("unread-banner")
+            .flex_none()
+            .px_4()
+            .py_2()
+            .bg(rgb(theme::FIELD))
+            .border_b_1()
+            .border_color(rgb(theme::BORDER))
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(theme::MUTED))
+                    .child(format!("{} 条未读", self.unread_count)),
+            )
+            .child(button(
+                "跳至最早未读",
+                false,
+                false,
+                cx.listener(Self::on_jump_unread),
+            ))
             .into_any_element()
     }
 }

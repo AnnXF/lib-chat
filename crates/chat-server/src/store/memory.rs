@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use chat_core::{
     AppendResult, Attachment, AttachmentId, ChatError, Message, MessageStore, NewMessage, Result,
-    RoomId, Seq,
+    RoomId, Seq, UserId,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -100,6 +100,70 @@ impl MessageStore for InMemoryStore {
     async fn latest_seq(&self, room: RoomId) -> Result<Seq> {
         let guard = self.inner.lock().await;
         Ok(guard.get(&room).map(|l| l.next_seq).unwrap_or(0))
+    }
+
+    async fn search(&self, room: RoomId, query: &str, limit: usize) -> Result<Vec<Message>> {
+        let guard = self.inner.lock().await;
+        let Some(log) = guard.get(&room) else {
+            return Ok(Vec::new());
+        };
+        let query = query.to_lowercase();
+        let mut messages: Vec<Message> = log
+            .messages
+            .iter()
+            .rev()
+            .filter(|message| message.text.to_lowercase().contains(&query))
+            .take(limit)
+            .cloned()
+            .collect();
+        messages.reverse();
+        Ok(messages)
+    }
+
+    async fn recall(&self, room: RoomId, seq: Seq, sender: UserId) -> Result<bool> {
+        let mut guard = self.inner.lock().await;
+        let Some(log) = guard.get_mut(&room) else {
+            return Ok(false);
+        };
+        let Some(index) = log
+            .messages
+            .iter()
+            .position(|message| message.seq == seq && message.sender == sender)
+        else {
+            return Ok(false);
+        };
+        log.messages.remove(index);
+        Ok(true)
+    }
+
+    async fn edit(
+        &self,
+        room: RoomId,
+        seq: Seq,
+        sender: UserId,
+        text: String,
+    ) -> Result<Option<Message>> {
+        let mut guard = self.inner.lock().await;
+        let Some(log) = guard.get_mut(&room) else {
+            return Ok(None);
+        };
+        let Some(message) = log
+            .messages
+            .iter_mut()
+            .find(|message| message.seq == seq && message.sender == sender)
+        else {
+            return Ok(None);
+        };
+        message.text = text;
+        Ok(Some(message.clone()))
+    }
+
+    async fn clear(&self, room: RoomId) -> Result<u64> {
+        let mut guard = self.inner.lock().await;
+        let Some(log) = guard.remove(&room) else {
+            return Ok(0);
+        };
+        Ok(log.messages.len() as u64)
     }
 
     async fn attachment(&self, room: RoomId, id: AttachmentId) -> Result<Option<Attachment>> {

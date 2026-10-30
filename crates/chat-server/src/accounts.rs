@@ -8,7 +8,7 @@ use std::path::Path;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 use chat_core::{
-    ChatError, MemberRole, RoomId, RoomKind, RoomMember, RoomSummary, UserId, UserSummary,
+    ChatError, MemberRole, RoomId, RoomKind, RoomMember, RoomSummary, Seq, UserId, UserSummary,
 };
 use sea_query::{ColumnDef, Expr, Query, SqliteQueryBuilder, Table};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
@@ -25,6 +25,7 @@ mod users {
     pub const DISPLAY_NAME: &str = "display_name";
     pub const PASSWORD_HASH: &str = "password_hash";
     pub const CREATED_AT: &str = "created_at";
+    pub const BANNED: &str = "banned";
 }
 
 mod sessions {
@@ -59,6 +60,14 @@ mod room_members {
     pub const USER_ID: &str = "user_id";
     pub const ROLE: &str = "role";
     pub const JOINED_AT: &str = "joined_at";
+}
+
+mod read_markers {
+    pub const TABLE: &str = "read_markers";
+    pub const USER_ID: &str = "user_id";
+    pub const ROOM_ID: &str = "room_id";
+    pub const SEQ: &str = "seq";
+    pub const UPDATED_AT: &str = "updated_at";
 }
 
 /// 账号层的错误，交给 Hub 映射成协议错误码。
@@ -133,6 +142,12 @@ impl Accounts {
             .col(ColumnDef::new(users::DISPLAY_NAME).text().not_null())
             .col(ColumnDef::new(users::PASSWORD_HASH).text().not_null())
             .col(ColumnDef::new(users::CREATED_AT).big_integer().not_null())
+            .col(
+                ColumnDef::new(users::BANNED)
+                    .integer()
+                    .not_null()
+                    .default(0),
+            )
             .to_owned();
         let sessions = Table::create()
             .table(sessions::TABLE)
@@ -194,11 +209,32 @@ impl Accounts {
                     .col(room_members::USER_ID),
             )
             .to_owned();
+        let read_markers = Table::create()
+            .table(read_markers::TABLE)
+            .if_not_exists()
+            .col(ColumnDef::new(read_markers::USER_ID).text().not_null())
+            .col(ColumnDef::new(read_markers::ROOM_ID).text().not_null())
+            .col(ColumnDef::new(read_markers::SEQ).big_integer().not_null())
+            .col(
+                ColumnDef::new(read_markers::UPDATED_AT)
+                    .big_integer()
+                    .not_null(),
+            )
+            .primary_key(
+                sea_query::Index::create()
+                    .col(read_markers::USER_ID)
+                    .col(read_markers::ROOM_ID),
+            )
+            .to_owned();
 
-        for table in [users, sessions, friends, rooms, members] {
+        for table in [users, sessions, friends, rooms, members, read_markers] {
             let sql = table.build(SqliteQueryBuilder);
             sqlx::query(&sql).execute(&self.pool).await?;
         }
+        // 旧库没有 banned 列，补一次；已存在时 SQLite 会报错，忽略即可
+        let _ = sqlx::query("ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0")
+            .execute(&self.pool)
+            .await;
         Ok(())
     }
 
@@ -270,6 +306,7 @@ impl Accounts {
                 users::USERNAME,
                 users::DISPLAY_NAME,
                 users::PASSWORD_HASH,
+                users::BANNED,
             ])
             .from(users::TABLE)
             .and_where(Expr::col(users::USERNAME).eq(username))
@@ -281,6 +318,9 @@ impl Accounts {
 
         let hash: String = row.get(3);
         verify_password(password, &hash)?;
+        if row.get::<i64, _>(4) != 0 {
+            return Err(AccountError::BadCredentials);
+        }
         let user = UserSummary {
             id: row
                 .get::<String, _>(0)
@@ -312,6 +352,7 @@ impl Accounts {
             )
             .and_where(Expr::col((sessions::TABLE, sessions::TOKEN)).eq(token))
             .and_where(Expr::col((sessions::TABLE, sessions::EXPIRES_AT)).gt(now))
+            .and_where(Expr::col((users::TABLE, users::BANNED)).eq(0))
             .build(SqliteQueryBuilder);
         let row = bind(sqlx::query(&sql), values)
             .fetch_optional(&self.pool)
@@ -409,6 +450,73 @@ impl Accounts {
             )
             .and_where(Expr::col((friends::TABLE, friends::USER_ID)).eq(user.to_string()))
             .order_by((users::TABLE, users::DISPLAY_NAME), sea_query::Order::Asc)
+            .build(SqliteQueryBuilder);
+        let rows = bind(sqlx::query(&sql), values)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(row_to_user).collect()
+    }
+
+    pub async fn remove_friend(
+        &self,
+        user: UserId,
+        friend: UserId,
+    ) -> std::result::Result<(), AccountError> {
+        for (a, b) in [(user, friend), (friend, user)] {
+            let (sql, values) = Query::delete()
+                .from_table(friends::TABLE)
+                .and_where(Expr::col(friends::USER_ID).eq(a.to_string()))
+                .and_where(Expr::col(friends::FRIEND_ID).eq(b.to_string()))
+                .build(SqliteQueryBuilder);
+            bind(sqlx::query(&sql), values).execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn find_user(
+        &self,
+        username: &str,
+    ) -> std::result::Result<Option<UserSummary>, AccountError> {
+        let (sql, values) = Query::select()
+            .columns([
+                (users::TABLE, users::ID),
+                (users::TABLE, users::USERNAME),
+                (users::TABLE, users::DISPLAY_NAME),
+            ])
+            .from(users::TABLE)
+            .and_where(Expr::col(users::USERNAME).eq(username.trim().to_ascii_lowercase()))
+            .build(SqliteQueryBuilder);
+        let row = bind(sqlx::query(&sql), values)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(row_to_user).transpose()
+    }
+
+    /// 按用户名或昵称搜索用户，排除自己，最多 20 条。
+    pub async fn search_users(
+        &self,
+        user: UserId,
+        query: &str,
+    ) -> std::result::Result<Vec<UserSummary>, AccountError> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("%{query}%");
+        let (sql, values) = Query::select()
+            .columns([
+                (users::TABLE, users::ID),
+                (users::TABLE, users::USERNAME),
+                (users::TABLE, users::DISPLAY_NAME),
+            ])
+            .from(users::TABLE)
+            .and_where(Expr::col((users::TABLE, users::ID)).ne(user.to_string()))
+            .and_where(
+                Expr::col((users::TABLE, users::USERNAME))
+                    .like(&pattern)
+                    .or(Expr::col((users::TABLE, users::DISPLAY_NAME)).like(&pattern)),
+            )
+            .limit(20)
             .build(SqliteQueryBuilder);
         let rows = bind(sqlx::query(&sql), values)
             .fetch_all(&self.pool)
@@ -569,6 +677,7 @@ impl Accounts {
                 last_seq: 0,
                 last_text: None,
                 last_at: None,
+                read_seq: 0,
             });
         }
         Ok(result)
@@ -755,6 +864,53 @@ impl Accounts {
         Ok(())
     }
 
+    pub async fn read_seq(
+        &self,
+        user: UserId,
+        room: RoomId,
+    ) -> std::result::Result<Option<Seq>, AccountError> {
+        let (sql, values) = Query::select()
+            .column(read_markers::SEQ)
+            .from(read_markers::TABLE)
+            .and_where(Expr::col(read_markers::USER_ID).eq(user.to_string()))
+            .and_where(Expr::col(read_markers::ROOM_ID).eq(room.to_string()))
+            .build(SqliteQueryBuilder);
+        let row = bind(sqlx::query(&sql), values)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|row| row.get(0)))
+    }
+
+    pub async fn set_read_seq(
+        &self,
+        user: UserId,
+        room: RoomId,
+        seq: Seq,
+    ) -> std::result::Result<(), AccountError> {
+        let (sql, values) = Query::insert()
+            .into_table(read_markers::TABLE)
+            .columns([
+                read_markers::USER_ID,
+                read_markers::ROOM_ID,
+                read_markers::SEQ,
+                read_markers::UPDATED_AT,
+            ])
+            .values_panic([
+                user.to_string().into(),
+                room.to_string().into(),
+                seq.into(),
+                now_secs().into(),
+            ])
+            .on_conflict(
+                sea_query::OnConflict::columns([read_markers::USER_ID, read_markers::ROOM_ID])
+                    .update_columns([read_markers::SEQ, read_markers::UPDATED_AT])
+                    .to_owned(),
+            )
+            .build(SqliteQueryBuilder);
+        bind(sqlx::query(&sql), values).execute(&self.pool).await?;
+        Ok(())
+    }
+
     pub async fn is_member(
         &self,
         room: RoomId,
@@ -837,6 +993,7 @@ impl Accounts {
             last_seq: 0,
             last_text: None,
             last_at: None,
+            read_seq: 0,
         }))
     }
 
@@ -1020,6 +1177,78 @@ fn bind<'q>(
         };
     }
     query
+}
+
+impl Accounts {
+    /// 管理命令：封禁/解封账号。
+    pub async fn set_banned(
+        &self,
+        username: &str,
+        banned: bool,
+    ) -> std::result::Result<bool, AccountError> {
+        let (sql, values) = Query::update()
+            .table(users::TABLE)
+            .value(users::BANNED, if banned { 1 } else { 0 })
+            .and_where(Expr::col(users::USERNAME).eq(username.trim().to_ascii_lowercase()))
+            .build(SqliteQueryBuilder);
+        let result = bind(sqlx::query(&sql), values).execute(&self.pool).await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// 管理命令：所有用户。
+    pub async fn admin_users(&self) -> std::result::Result<Vec<UserSummary>, AccountError> {
+        let (sql, values) = Query::select()
+            .columns([
+                (users::TABLE, users::ID),
+                (users::TABLE, users::USERNAME),
+                (users::TABLE, users::DISPLAY_NAME),
+            ])
+            .from(users::TABLE)
+            .order_by((users::TABLE, users::USERNAME), sea_query::Order::Asc)
+            .build(SqliteQueryBuilder);
+        let rows = bind(sqlx::query(&sql), values)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(row_to_user).collect()
+    }
+
+    /// 管理命令：所有房间。
+    pub async fn admin_rooms(&self) -> std::result::Result<Vec<RoomSummary>, AccountError> {
+        let (sql, values) = Query::select()
+            .columns([
+                (rooms::TABLE, rooms::ID),
+                (rooms::TABLE, rooms::KIND),
+                (rooms::TABLE, rooms::NAME),
+            ])
+            .from(rooms::TABLE)
+            .order_by((rooms::TABLE, rooms::CREATED_AT), sea_query::Order::Asc)
+            .build(SqliteQueryBuilder);
+        let rows = bind(sqlx::query(&sql), values)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut result = Vec::with_capacity(rows.len());
+        for row in rows {
+            let room: RoomId = row
+                .get::<String, _>(0)
+                .parse()
+                .map_err(|e| AccountError::Storage(format!("房间标识无效: {e}")))?;
+            let kind = match row.get::<String, _>(1).as_str() {
+                "direct" => RoomKind::Direct,
+                _ => RoomKind::Group,
+            };
+            result.push(RoomSummary {
+                room,
+                kind,
+                name: row.get(2),
+                member_count: self.member_count(room).await?,
+                last_seq: 0,
+                last_text: None,
+                last_at: None,
+                read_seq: 0,
+            });
+        }
+        Ok(result)
+    }
 }
 
 #[cfg(test)]

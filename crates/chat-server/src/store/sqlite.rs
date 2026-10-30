@@ -7,7 +7,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use chat_core::{AppendResult, ChatError, MessageStore, NewMessage, Result};
-use chat_core::{Attachment, AttachmentId, Message, MessageKind, Quote, RoomId, Seq};
+use chat_core::{Attachment, AttachmentId, Message, MessageKind, Quote, RoomId, Seq, UserId};
 use sea_query::{ColumnDef, Expr, Index, Order, Query, SqliteQueryBuilder, Table, Value, Values};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
@@ -350,6 +350,88 @@ impl MessageStore for SqliteStore {
             .collect::<Result<Vec<_>>>()?;
         messages.reverse();
         Ok(messages)
+    }
+
+    async fn search(&self, room: RoomId, query: &str, limit: usize) -> Result<Vec<Message>> {
+        let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
+        let (sql, values) = Query::select()
+            .columns(MESSAGE_COLUMNS)
+            .from(messages::TABLE)
+            .and_where(Expr::col(messages::ROOM_ID).eq(room.to_string()))
+            .and_where(Expr::col(messages::BODY).like(&pattern))
+            .order_by(messages::SEQ, Order::Desc)
+            .limit(limit as u64)
+            .build(SqliteQueryBuilder);
+        let rows = bind(sqlx::query(&sql), values)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+        let mut messages = rows
+            .iter()
+            .map(|row| row_to_message(room, row))
+            .collect::<Result<Vec<_>>>()?;
+        messages.reverse();
+        Ok(messages)
+    }
+
+    async fn recall(&self, room: RoomId, seq: Seq, sender: UserId) -> Result<bool> {
+        let (sql, values) = Query::delete()
+            .from_table(messages::TABLE)
+            .and_where(Expr::col(messages::ROOM_ID).eq(room.to_string()))
+            .and_where(Expr::col(messages::SEQ).eq(seq))
+            .and_where(Expr::col(messages::SENDER).eq(sender.to_string()))
+            .build(SqliteQueryBuilder);
+        let result = bind(sqlx::query(&sql), values)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn edit(
+        &self,
+        room: RoomId,
+        seq: Seq,
+        sender: UserId,
+        text: String,
+    ) -> Result<Option<Message>> {
+        let (sql, values) = Query::update()
+            .table(messages::TABLE)
+            .value(messages::BODY, text)
+            .and_where(Expr::col(messages::ROOM_ID).eq(room.to_string()))
+            .and_where(Expr::col(messages::SEQ).eq(seq))
+            .and_where(Expr::col(messages::SENDER).eq(sender.to_string()))
+            .build(SqliteQueryBuilder);
+        let result = bind(sqlx::query(&sql), values)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        let (sql, values) = Query::select()
+            .columns(MESSAGE_COLUMNS)
+            .from(messages::TABLE)
+            .and_where(Expr::col(messages::ROOM_ID).eq(room.to_string()))
+            .and_where(Expr::col(messages::SEQ).eq(seq))
+            .build(SqliteQueryBuilder);
+        let row = bind(sqlx::query(&sql), values)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        row.map(|row| row_to_message(room, &row)).transpose()
+    }
+
+    async fn clear(&self, room: RoomId) -> Result<u64> {
+        let (sql, values) = Query::delete()
+            .from_table(messages::TABLE)
+            .and_where(Expr::col(messages::ROOM_ID).eq(room.to_string()))
+            .build(SqliteQueryBuilder);
+        let result = bind(sqlx::query(&sql), values)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(result.rows_affected())
     }
 
     async fn since(&self, room: RoomId, after: Seq, limit: usize) -> Result<Vec<Message>> {

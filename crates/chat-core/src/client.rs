@@ -75,6 +75,56 @@ impl Client {
             .await
     }
 
+    pub async fn remove_friend(&self, user: UserId) -> Result<()> {
+        self.conn
+            .request(ClientRequest::RemoveFriend { user })
+            .await
+    }
+
+    pub async fn search_users(&self, query: impl Into<String>) -> Result<()> {
+        self.conn
+            .request(ClientRequest::SearchUsers {
+                query: query.into(),
+            })
+            .await
+    }
+
+    pub async fn edit_message(
+        &self,
+        room: RoomId,
+        seq: Seq,
+        text: impl Into<String>,
+    ) -> Result<()> {
+        self.conn
+            .request(ClientRequest::EditMessage {
+                room,
+                seq,
+                text: text.into(),
+            })
+            .await
+    }
+
+    pub async fn mark_read(&self, room: RoomId, seq: Seq) -> Result<()> {
+        self.conn
+            .request(ClientRequest::MarkRead { room, seq })
+            .await
+    }
+
+    pub async fn recall_message(&self, room: RoomId, seq: Seq) -> Result<()> {
+        self.conn
+            .request(ClientRequest::RecallMessage { room, seq })
+            .await
+    }
+
+    pub async fn search_messages(&self, room: RoomId, query: impl Into<String>) -> Result<()> {
+        self.conn
+            .request(ClientRequest::SearchMessages {
+                room,
+                query: query.into(),
+            })
+            .await
+    }
+
     pub async fn list_rooms(&self) -> Result<()> {
         self.conn.request(ClientRequest::ListRooms).await
     }

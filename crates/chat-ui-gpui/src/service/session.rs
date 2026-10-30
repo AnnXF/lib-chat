@@ -26,6 +26,15 @@ pub(super) enum SessionCmd {
         id: AttachmentId,
         path: PathBuf,
     },
+    /// 撤回自己的一条消息。
+    Recall(Seq),
+    /// 编辑自己的一条文本消息。
+    Edit {
+        seq: Seq,
+        text: String,
+    },
+    /// 把当前房间已读位置落库。
+    MarkRead(Seq),
     /// 往前翻一页更早的历史。
     LoadOlder,
     /// 结束会话：先退出房间再关闭连接。
@@ -524,6 +533,28 @@ impl Session {
                             let _ = self.events.send_async(UiEvent::Error(format!("发送失败: {reason}"))).await;
                         }
                     },
+                    Ok(SessionCmd::Recall(seq)) => {
+                        if client
+                            .recall_message(self.target.room, seq)
+                            .await
+                            .is_err()
+                        {
+                            return ServeEnd::Dropped;
+                        }
+                    }
+                    Ok(SessionCmd::Edit { seq, text }) => {
+                        if client
+                            .edit_message(self.target.room, seq, text)
+                            .await
+                            .is_err()
+                        {
+                            return ServeEnd::Dropped;
+                        }
+                    }
+                    Ok(SessionCmd::MarkRead(seq)) => {
+                        // 已读位置落库失败不阻塞会话，下次标记还会再试
+                        let _ = client.mark_read(self.target.room, seq).await;
+                    }
                     Ok(SessionCmd::LoadOlder) => self.load_older(client).await,
                     Ok(SessionCmd::SendFile(path)) => self.upload_file(client, path),
                     Ok(SessionCmd::SaveFile { id, path }) => {
@@ -743,6 +774,10 @@ impl Session {
                 }
                 // 断线期间翻不了历史，重连后界面再滑到顶会重新发
                 Ok(Ok(SessionCmd::LoadOlder)) => {}
+                // 断线期间撤回/编辑没有意义，等重连后用户再操作
+                Ok(Ok(SessionCmd::Recall(_)))
+                | Ok(Ok(SessionCmd::Edit { .. }))
+                | Ok(Ok(SessionCmd::MarkRead(_))) => {}
                 Err(_) => return true,
             }
         }

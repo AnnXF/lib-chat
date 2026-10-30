@@ -238,6 +238,26 @@ fn tool_button(
 ///
 /// 自己发的靠右并带强调底色，别人的靠左只留文字，视觉噪声更低。
 fn render_line(line: &ChatLine, save: Option<SaveHandler>) -> AnyElement {
+    if line.unread_marker {
+        return div()
+            .test_id("unread-divider")
+            .w_full()
+            .px_6()
+            .py_2()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .rounded_full()
+                    .bg(rgb(theme::FIELD))
+                    .text_size(px(11.))
+                    .text_color(rgb(theme::MUTED))
+                    .child(line.text.clone()),
+            )
+            .into_any_element();
+    }
     if line.system {
         return div()
             .w_full()
@@ -322,9 +342,34 @@ fn render_line(line: &ChatLine, save: Option<SaveHandler>) -> AnyElement {
             div()
                 .px_1()
                 .mb_1()
-                .text_size(px(11.))
-                .text_color(rgb(label_color))
-                .child(label.to_string()),
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(label_color))
+                        .child(label.to_string()),
+                )
+                .when(line.at > 0, |this| {
+                    this.child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(rgb(theme::FAINT))
+                            .child(format_time(line.at)),
+                    )
+                })
+                .when(line.mentioned, |this| {
+                    this.child(
+                        div()
+                            .px_1()
+                            .rounded_sm()
+                            .bg(rgb(theme::DANGER))
+                            .text_size(px(9.))
+                            .text_color(rgb(theme::ON_ACCENT))
+                            .child("@我"),
+                    )
+                }),
         )
         .child(body)
         .into_any_element()
@@ -381,6 +426,26 @@ impl ChatApp {
                             this.quote_message(line_for_quote.clone(), window, cx);
                         }),
                     ))
+                    .when(line.mine, |this| {
+                        let seq = line.seq;
+                        let edit_text = line.text.clone();
+                        this.child(menu_item(
+                            "编辑",
+                            cx.listener(move |this, _, _, cx| {
+                                if let Some(seq) = seq {
+                                    this.on_edit_message(seq, edit_text.clone(), cx);
+                                }
+                            }),
+                        ))
+                        .child(menu_item(
+                            "撤回",
+                            cx.listener(move |this, _, _, cx| {
+                                if let Some(seq) = seq {
+                                    this.on_recall_message(seq, cx);
+                                }
+                            }),
+                        ))
+                    })
                     .when_some(attachment, |this, attachment| {
                         this.child(menu_item(
                             "保存附件",
@@ -394,6 +459,12 @@ impl ChatApp {
             )
             .into_any_element()
     }
+}
+
+/// 服务端毫秒时间 → `HH:MM`。
+fn format_time(ms: i64) -> String {
+    let day = (ms / 1000).rem_euclid(86_400);
+    format!("{:02}:{:02}", day / 3_600, (day % 3_600) / 60)
 }
 
 /// 右键菜单里的一行。
@@ -547,6 +618,12 @@ impl ChatApp {
                             this.friend_menu = None;
                             cx.notify();
                         }),
+                    ))
+                    .child(menu_item(
+                        "删除好友",
+                        cx.listener(move |this, _, _, cx| {
+                            this.on_remove_friend(user_id, cx);
+                        }),
                     )),
             )
             .into_any_element()
@@ -571,11 +648,14 @@ mod perf {
             let lines: Vec<ChatLine> = (0..count)
                 .map(|i| ChatLine {
                     seq: Some(i as i64 + 1),
+                    at: 0,
                     sender: "某人".into(),
                     text: format!("这是第 {i} 条消息，长度大约二十来个字"),
                     attachment: None,
                     quote: None,
                     mine: i % 2 == 0,
+                    mentioned: false,
+                    unread_marker: false,
                     system: false,
                 })
                 .collect();

@@ -6,8 +6,8 @@ use crate::app::{FriendMenu, NavTab};
 use chat_core::{Attachment, RoomId, UserId};
 use chat_transport_quic::validate_fingerprint;
 use gpui::{
-    Context, Focusable as _, KeyDownEvent, MouseDownEvent, MouseUpEvent, PathPromptOptions, Pixels,
-    Point, Size, Window, point, px,
+    Context, Focusable as _, KeyDownEvent, ListOffset, MouseDownEvent, MouseUpEvent,
+    PathPromptOptions, Pixels, Point, Size, Window, point, px,
 };
 
 use crate::service::UiCommand;
@@ -77,6 +77,16 @@ impl ChatApp {
     pub(crate) fn submit_message(&mut self, cx: &mut Context<Self>) {
         let text = self.message.read(cx).content().trim().to_string();
         if text.is_empty() {
+            return;
+        }
+        if let Some((room, seq)) = self.editing.take() {
+            if self.tell(UiCommand::EditMessage { room, seq, text }, cx) {
+                self.message
+                    .update(cx, |input, cx| input.set_content("", cx));
+                self.status = "正在保存编辑…".into();
+            } else {
+                self.editing = Some((room, seq));
+            }
             return;
         }
         let quote = self.pending_quote.take();
@@ -515,12 +525,16 @@ impl ChatApp {
                 || self.friend_menu.is_some()
                 || self.show_connect_form
                 || self.show_public_form
-                || self.pending_trust.is_some();
+                || self.pending_trust.is_some()
+                || self.show_search;
             self.message_menu = None;
             self.friend_menu = None;
             self.show_connect_form = false;
             self.show_public_form = false;
             self.pending_trust = None;
+            self.show_search = false;
+            self.message_results.clear();
+            self.editing = None;
             if changed {
                 cx.notify();
             }
@@ -529,8 +543,15 @@ impl ChatApp {
         if !keystroke.modifiers.platform {
             return;
         }
-        if key == "enter" {
-            self.submit_message(cx);
+        match key.as_str() {
+            "enter" => self.submit_message(cx),
+            "v" => self.paste_clipboard_image(cx),
+            "f" => self.toggle_search(cx),
+            "l" if keystroke.modifiers.shift => {
+                self.show_members = false;
+                self.tell(UiCommand::Logout, cx);
+            }
+            _ => {}
         }
     }
 
@@ -539,11 +560,14 @@ impl ChatApp {
     pub fn debug_open_message_menu(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
         let line = ChatLine {
             seq: Some(1),
+            at: 0,
             sender: "某人".into(),
             text: "一条消息".into(),
             attachment: None,
             quote: None,
             mine: false,
+            mentioned: false,
+            unread_marker: false,
             system: false,
         };
         self.open_message_menu(
@@ -596,8 +620,24 @@ impl ChatApp {
     pub(crate) fn open_conversation(&mut self, room: RoomId, cx: &mut Context<Self>) {
         // 无论从会话列表还是通讯录进来，都回到「聊」页展示聊天
         self.nav = NavTab::Chats;
+        self.unread_after = None;
+        self.unread_count = 0;
+        self.unread_room = None;
+        self.unread_marker_ix = None;
+        self.jump_requested = false;
+        self.unread_prompt_done = false;
+        self.auto_unread = false;
+        self.auto_unread_pages = 0;
         if let Some(known) = self.conversations.iter().find(|known| known.room == room) {
-            self.read_seqs.insert(room, known.last_seq);
+            let previous = self.read_seqs.get(&room).copied().unwrap_or(0);
+            if known.last_seq > previous {
+                self.unread_count = (known.last_seq - previous) as usize;
+                self.unread_room = Some(room);
+                self.unread_after = Some(previous);
+                self.auto_unread = true;
+            }
+            // 进入会话即视为已读，红点消失；未读分隔留给本次查看
+            self.mark_read(room, known.last_seq);
         }
         self.status = "正在进入会话…".into();
         self.status_kind = super::StatusKind::Info;
@@ -624,6 +664,133 @@ impl ChatApp {
         self.tell(UiCommand::AddFriend { username }, cx);
         self.friend_input
             .update(cx, |input, cx| input.set_content("", cx));
+    }
+
+    pub(crate) fn on_search_users(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let query = self.user_search.read(cx).content().trim().to_string();
+        if query.is_empty() {
+            self.status = "请输入要搜索的用户名".into();
+            self.status_kind = super::StatusKind::Error;
+            cx.notify();
+            return;
+        }
+        self.status = "正在搜索用户…".into();
+        self.status_kind = super::StatusKind::Info;
+        self.tell(UiCommand::SearchUsers { query }, cx);
+    }
+
+    pub(crate) fn on_add_search_user(&mut self, username: String, cx: &mut Context<Self>) {
+        self.status = format!("正在添加好友 {username}…");
+        self.status_kind = super::StatusKind::Info;
+        self.search_results.clear();
+        self.tell(UiCommand::AddFriend { username }, cx);
+    }
+
+    fn toggle_search(&mut self, cx: &mut Context<Self>) {
+        self.show_search = !self.show_search;
+        if !self.show_search {
+            self.message_results.clear();
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn on_toggle_search(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_search(cx);
+    }
+
+    pub(crate) fn on_search_messages(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(room) = self.room.as_ref().map(|view| view.id) else {
+            return;
+        };
+        let query = self
+            .message_search_input
+            .read(cx)
+            .content()
+            .trim()
+            .to_string();
+        if query.is_empty() {
+            return;
+        }
+        self.status = "正在搜索聊天记录…".into();
+        self.status_kind = super::StatusKind::Info;
+        self.tell(UiCommand::SearchMessages { room, query }, cx);
+    }
+
+    pub(crate) fn on_edit_message(&mut self, seq: i64, text: String, cx: &mut Context<Self>) {
+        if let Some(room) = self.room.as_ref().map(|view| view.id) {
+            self.editing = Some((room, seq));
+            self.message
+                .update(cx, |input, cx| input.set_content(text, cx));
+            self.message_menu = None;
+            self.status = "编辑消息：Enter 保存，Esc 取消".into();
+            self.status_kind = super::StatusKind::Info;
+            cx.notify();
+        }
+    }
+
+    #[cfg(any(test, feature = "ui-test"))]
+    pub fn debug_open_conversation(&mut self, room: RoomId, cx: &mut Context<Self>) {
+        self.open_conversation(room, cx);
+    }
+
+    pub(crate) fn on_jump_unread(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self.unread_marker_ix {
+            self.unread_prompt_done = true;
+            self.list.scroll_to(ListOffset {
+                item_ix: index,
+                offset_in_item: px(0.),
+            });
+        } else {
+            // 未读边界还在加载，等 History 插入分隔条后自动跳
+            self.jump_requested = true;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn on_drop_files(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        if self.room.is_none() {
+            return;
+        }
+        for path in paths {
+            self.tell(UiCommand::SendFile { path: path.clone() }, cx);
+        }
+    }
+
+    pub(crate) fn on_recall_message(&mut self, seq: i64, cx: &mut Context<Self>) {
+        if let Some(room) = self.room.as_ref().map(|view| view.id) {
+            self.message_menu = None;
+            self.tell(UiCommand::RecallMessage { room, seq }, cx);
+        }
+    }
+
+    pub(crate) fn on_remove_friend(&mut self, user: UserId, cx: &mut Context<Self>) {
+        self.friend_menu = None;
+        self.tell(UiCommand::RemoveFriend { user }, cx);
+    }
+
+    pub(crate) fn on_logout(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_members = false;
+        self.tell(UiCommand::Logout, cx);
     }
 
     pub(crate) fn on_open_direct(&mut self, user: UserId, name: String, cx: &mut Context<Self>) {
@@ -750,6 +917,30 @@ impl ChatApp {
     }
 }
 
+impl ChatApp {
+    /// 剪贴板里是图片时，写成临时文件后按文件消息发送。
+    fn paste_clipboard_image(&mut self, cx: &mut Context<Self>) {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        for entry in item.entries() {
+            if let gpui::ClipboardEntry::Image(image) = entry {
+                let path = std::env::temp_dir().join(format!(
+                    "libchat-paste-{}.png",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.as_millis())
+                        .unwrap_or(0)
+                ));
+                if std::fs::write(&path, &image.bytes).is_ok() {
+                    self.tell(UiCommand::SendFile { path }, cx);
+                }
+                return;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ChatLine, public_options};
@@ -778,11 +969,14 @@ mod tests {
     fn line_with(text: &str) -> ChatLine {
         ChatLine {
             seq: Some(1),
+            at: 0,
             sender: "某人".into(),
             text: text.into(),
             attachment: None,
             quote: None,
             mine: false,
+            mentioned: false,
+            unread_marker: false,
             system: false,
         }
     }

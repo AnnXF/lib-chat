@@ -259,6 +259,12 @@ impl Server {
             | ClientRequest::Logout
             | ClientRequest::ListFriends
             | ClientRequest::AddFriend { .. }
+            | ClientRequest::RemoveFriend { .. }
+            | ClientRequest::SearchUsers { .. }
+            | ClientRequest::SearchMessages { .. }
+            | ClientRequest::RecallMessage { .. }
+            | ClientRequest::EditMessage { .. }
+            | ClientRequest::MarkRead { .. }
             | ClientRequest::ListRooms
             | ClientRequest::CreateGroup { .. }
             | ClientRequest::OpenDirect { .. }

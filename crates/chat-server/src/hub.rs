@@ -221,6 +221,8 @@ impl Hub {
         )
         .await;
         self.send_rooms(conn, user.id).await;
+        self.send_friends_presence(conn, user.id).await;
+        self.broadcast_friend_presence(user.id, true).await;
         self.broadcast_presence(self.default_room).await;
     }
 
@@ -234,6 +236,7 @@ impl Hub {
             }
         };
         self.fill_summaries(&mut rooms).await;
+        self.fill_read_seqs(user, &mut rooms).await;
         self.send_to(conn, ServerEvent::Rooms { rooms }).await;
     }
 
@@ -251,7 +254,7 @@ impl Hub {
                     } else {
                         text
                     });
-                    room.last_at = Some(now_secs());
+                    room.last_at = Some(message.server_ts_ms / 1000);
                 }
             }
         }
@@ -263,6 +266,7 @@ impl Hub {
             return;
         };
         self.fill_summaries(&mut rooms).await;
+        self.fill_read_seqs(user, &mut rooms).await;
         let targets: Vec<ConnId> = self
             .conns
             .read()
@@ -279,6 +283,54 @@ impl Hub {
                 },
             )
             .await;
+        }
+    }
+
+    async fn send_mention(&self, room: RoomId, from: &UserSummary, text: &str, target: UserId) {
+        let targets: Vec<ConnId> = self
+            .conns
+            .read()
+            .await
+            .iter()
+            .filter(|(_, conn)| conn.user.as_ref().is_some_and(|known| known.id == target))
+            .map(|(id, _)| *id)
+            .collect();
+        for conn in targets {
+            self.send_to(
+                conn,
+                ServerEvent::Mention {
+                    room,
+                    from: from.clone(),
+                    text: text.to_string(),
+                },
+            )
+            .await;
+        }
+    }
+
+    /// 新消息/编辑/撤回后刷新所有成员（包括不在当前房间的人）的会话摘要。
+    async fn push_room_summaries(&self, room: RoomId) {
+        let Ok(members) = self.accounts.members_with_roles(room).await else {
+            return;
+        };
+        for member in members {
+            self.push_rooms_to(member.user.id).await;
+        }
+    }
+
+    /// 填充每个会话的已读位置；首次没有记录时，把当前历史视为已读。
+    async fn fill_read_seqs(&self, user: UserId, rooms: &mut [RoomSummary]) {
+        for room in rooms {
+            let read = match self.accounts.read_seq(user, room.room).await {
+                Ok(Some(seq)) => seq,
+                Ok(None) => {
+                    let latest = self.messages.latest_seq(room.room).await.unwrap_or(0);
+                    let _ = self.accounts.set_read_seq(user, room.room, latest).await;
+                    latest
+                }
+                Err(_) => 0,
+            };
+            room.read_seq = read.min(room.last_seq);
         }
     }
 
@@ -304,6 +356,56 @@ impl Hub {
                 },
             )
             .await;
+        }
+    }
+
+    async fn is_online(&self, user: UserId) -> bool {
+        self.conns
+            .read()
+            .await
+            .values()
+            .any(|conn| conn.user.as_ref().is_some_and(|known| known.id == user))
+    }
+
+    /// 把每个好友的在线状态推给这个连接。
+    async fn send_friends_presence(&self, conn: ConnId, user: UserId) {
+        let Ok(friends) = self.accounts.friends(user).await else {
+            return;
+        };
+        for friend in friends {
+            let online = self.is_online(friend.id).await;
+            self.send_to(
+                conn,
+                ServerEvent::FriendPresence {
+                    user: friend.id,
+                    online,
+                },
+            )
+            .await;
+        }
+    }
+
+    /// 把某个用户的上下线状态推给他的好友。
+    async fn broadcast_friend_presence(&self, user: UserId, online: bool) {
+        let Ok(friends) = self.accounts.friends(user).await else {
+            return;
+        };
+        let friend_ids: Vec<UserId> = friends.iter().map(|friend| friend.id).collect();
+        let targets: Vec<ConnId> = self
+            .conns
+            .read()
+            .await
+            .iter()
+            .filter(|(_, conn)| {
+                conn.user
+                    .as_ref()
+                    .is_some_and(|known| friend_ids.contains(&known.id))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for target in targets {
+            self.send_to(target, ServerEvent::FriendPresence { user, online })
+                .await;
         }
     }
 
@@ -364,11 +466,18 @@ impl Hub {
 
     async fn disconnect(&self, conn: ConnId) {
         let mut rooms = Vec::new();
+        let mut user = None;
         if let Some(state) = self.conns.write().await.remove(&conn) {
             rooms.extend(state.joined);
+            user = state.user.map(|known| known.id);
         }
         for room in rooms {
             self.broadcast_presence(room).await;
+        }
+        if let Some(user) = user {
+            if !self.is_online(user).await {
+                self.broadcast_friend_presence(user, false).await;
+            }
         }
     }
 
@@ -450,9 +559,15 @@ impl Hub {
                 Err(e) => self.account_error(conn, e).await,
             },
             ClientRequest::Logout => {
+                let user = self.user_of(conn).await;
                 if let Some(state) = self.conns.write().await.get_mut(&conn) {
                     state.user = None;
                     state.joined.clear();
+                }
+                if let Some(user) = user {
+                    if !self.is_online(user.id).await {
+                        self.broadcast_friend_presence(user.id, false).await;
+                    }
                 }
                 self.send_to(conn, ServerEvent::AuthRequired).await;
             }
@@ -478,8 +593,144 @@ impl Hub {
                         if let Some(friend) = friend {
                             self.push_friends(friend.id).await;
                         }
+                        self.send_friends_presence(conn, user.id).await;
+                        self.broadcast_friend_presence(user.id, true).await;
                     }
                     Err(e) => self.account_error(conn, e).await,
+                }
+            }
+
+            ClientRequest::RemoveFriend { user: target } => {
+                let Some(user) = self.user_of(conn).await else {
+                    return self.send_to(conn, ServerEvent::AuthRequired).await;
+                };
+                if let Err(e) = self.accounts.remove_friend(user.id, target).await {
+                    return self.account_error(conn, e).await;
+                }
+                self.push_friends(user.id).await;
+                self.push_friends(target).await;
+            }
+
+            ClientRequest::SearchUsers { query } => {
+                let Some(user) = self.user_of(conn).await else {
+                    return self.send_to(conn, ServerEvent::AuthRequired).await;
+                };
+                match self.accounts.search_users(user.id, &query).await {
+                    Ok(users) => self.send_to(conn, ServerEvent::UserSearch { users }).await,
+                    Err(e) => self.account_error(conn, e).await,
+                }
+            }
+
+            ClientRequest::SearchMessages { room, query } => {
+                let Some(user) = self.user_of(conn).await else {
+                    return self.send_to(conn, ServerEvent::AuthRequired).await;
+                };
+                if !self
+                    .accounts
+                    .is_member(room, user.id)
+                    .await
+                    .unwrap_or(false)
+                {
+                    return self
+                        .send_error(conn, ErrorCode::RoomMismatch, "房间不存在")
+                        .await;
+                }
+                match self.messages.search(room, &query, 50).await {
+                    Ok(messages) => {
+                        self.send_to(conn, ServerEvent::SearchResults { room, messages })
+                            .await
+                    }
+                    Err(e) => {
+                        self.send_error(conn, ErrorCode::Internal, &e.to_string())
+                            .await
+                    }
+                }
+            }
+
+            ClientRequest::EditMessage { room, seq, text } => {
+                let Some(user) = self.user_of(conn).await else {
+                    return self.send_to(conn, ServerEvent::AuthRequired).await;
+                };
+                if !self.joined(conn, room).await {
+                    return self
+                        .send_error(conn, ErrorCode::NotJoined, "未加入房间")
+                        .await;
+                }
+                let text = text.trim();
+                if text.is_empty() || text.len() > MAX_TEXT_BYTES {
+                    return self
+                        .send_error(conn, ErrorCode::InvalidRequest, "消息为空或超过长度限制")
+                        .await;
+                }
+                match self
+                    .messages
+                    .edit(room, seq, user.id, text.to_string())
+                    .await
+                {
+                    Ok(Some(message)) => {
+                        self.broadcast_room(room, ServerEvent::MessageEdited { message })
+                            .await;
+                        self.push_room_summaries(room).await;
+                    }
+                    Ok(None) => {
+                        self.send_error(conn, ErrorCode::NotFound, "消息不存在或不是自己发的")
+                            .await
+                    }
+                    Err(e) => {
+                        self.send_error(conn, ErrorCode::Internal, &e.to_string())
+                            .await
+                    }
+                }
+            }
+
+            ClientRequest::RecallMessage { room, seq } => {
+                let Some(user) = self.user_of(conn).await else {
+                    return self.send_to(conn, ServerEvent::AuthRequired).await;
+                };
+                if !self.joined(conn, room).await {
+                    return self
+                        .send_error(conn, ErrorCode::NotJoined, "未加入房间")
+                        .await;
+                }
+                match self.messages.recall(room, seq, user.id).await {
+                    Ok(true) => {
+                        self.broadcast_room(room, ServerEvent::MessageRecalled { room, seq })
+                            .await;
+                        self.push_room_summaries(room).await;
+                    }
+                    Ok(false) => {
+                        self.send_error(conn, ErrorCode::NotFound, "消息不存在或不是自己发的")
+                            .await
+                    }
+                    Err(e) => {
+                        self.send_error(conn, ErrorCode::Internal, &e.to_string())
+                            .await
+                    }
+                }
+            }
+
+            ClientRequest::MarkRead { room, seq } => {
+                let Some(user) = self.user_of(conn).await else {
+                    return self.send_to(conn, ServerEvent::AuthRequired).await;
+                };
+                if !self
+                    .accounts
+                    .is_member(room, user.id)
+                    .await
+                    .unwrap_or(false)
+                {
+                    return self
+                        .send_error(conn, ErrorCode::RoomMismatch, "房间不存在")
+                        .await;
+                }
+                let latest = self.messages.latest_seq(room).await.unwrap_or(0);
+                if let Err(e) = self
+                    .accounts
+                    .set_read_seq(user.id, room, seq.min(latest))
+                    .await
+                {
+                    self.send_error(conn, ErrorCode::Internal, &e.to_string())
+                        .await;
                 }
             }
 
@@ -720,6 +971,9 @@ impl Hub {
                     .display_name_of(conn)
                     .await
                     .unwrap_or_else(|| user.display_name.clone());
+                let mentions = mentioned_usernames(text);
+                let mention_text = text.to_string();
+                let from = user.clone();
                 let _publish = self.publish.lock().await;
                 let msg = NewMessage {
                     client_msg_id,
@@ -740,6 +994,15 @@ impl Hub {
                                 },
                             )
                             .await;
+                            for name in mentions {
+                                if let Ok(Some(target)) = self.accounts.find_user(&name).await {
+                                    if target.id != from.id {
+                                        self.send_mention(room, &from, &mention_text, target.id)
+                                            .await;
+                                    }
+                                }
+                            }
+                            self.push_room_summaries(room).await;
                         } else {
                             self.send_to(
                                 conn,
@@ -816,6 +1079,7 @@ impl Hub {
                             },
                         )
                         .await;
+                        self.push_room_summaries(room).await;
                     }
                     Ok(result) => {
                         self.send_to(
@@ -915,11 +1179,15 @@ impl Hub {
     }
 }
 
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
+fn mentioned_usernames(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter_map(|word| word.strip_prefix('@'))
+        .map(|name| {
+            name.trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
+                .to_ascii_lowercase()
+        })
+        .filter(|name| !name.is_empty())
+        .collect()
 }
 
 fn sanitize_quote(quote: Quote) -> Quote {

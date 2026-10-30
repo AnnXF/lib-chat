@@ -113,6 +113,8 @@ impl HostedRoom {
 pub struct ChatLine {
     pub(crate) seq: Option<Seq>,
     pub(crate) sender: String,
+    /// 服务端时间（毫秒）；系统提示为 0。
+    pub(crate) at: i64,
     pub(crate) text: String,
     /// 文件消息附带的元数据；文本消息为 `None`。
     pub(crate) attachment: Option<Attachment>,
@@ -120,6 +122,10 @@ pub struct ChatLine {
     pub(crate) quote: Option<Quote>,
     /// 是否由自己发出，决定气泡靠哪一边。
     pub(crate) mine: bool,
+    /// 这条消息 @ 了当前账号。
+    pub(crate) mentioned: bool,
+    /// 未读分隔条，不是真实消息。
+    pub(crate) unread_marker: bool,
     pub(crate) system: bool,
 }
 

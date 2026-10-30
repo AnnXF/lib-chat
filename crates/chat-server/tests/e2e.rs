@@ -375,6 +375,28 @@ impl MessageStore for FailingStore {
         }
     }
 
+    async fn search(&self, _: RoomId, _: &str, _: usize) -> chat_core::Result<Vec<Message>> {
+        Ok(Vec::new())
+    }
+
+    async fn recall(&self, _: RoomId, _: Seq, _: chat_core::UserId) -> chat_core::Result<bool> {
+        Ok(false)
+    }
+
+    async fn edit(
+        &self,
+        _: RoomId,
+        _: Seq,
+        _: chat_core::UserId,
+        _: String,
+    ) -> chat_core::Result<Option<Message>> {
+        Ok(None)
+    }
+
+    async fn clear(&self, _: RoomId) -> chat_core::Result<u64> {
+        Ok(0)
+    }
+
     async fn attachment(
         &self,
         _: RoomId,

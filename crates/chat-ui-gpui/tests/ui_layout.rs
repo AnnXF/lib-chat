@@ -384,6 +384,7 @@ fn file_message_renders_inside_the_window() {
             seq: 1,
             sender_id: UserId::new(),
             sender: "Bob".into(),
+            at: 0,
             text: String::new(),
             attachment: Some(Attachment {
                 id: AttachmentId::new(),
@@ -732,6 +733,7 @@ fn quoted_message_renders_a_quote_block() {
             seq: 1,
             sender_id: UserId::new(),
             sender: "Bob".into(),
+            at: 0,
             text: "这是回复".into(),
             attachment: None,
             quote: Some(Quote {
@@ -817,6 +819,7 @@ fn group_members_panel_fits_inside_the_window() {
                     last_seq: 0,
                     last_text: None,
                     last_at: None,
+                    read_seq: 0,
                 }],
             });
             app.debug_apply(UiEvent::Lobby {
@@ -845,4 +848,171 @@ fn group_members_panel_fits_inside_the_window() {
     let panel = bounds(cx, "members-panel");
     assert_inside(&panel, "members-panel");
     assert!(f32::from(panel.size.height) > 20.);
+}
+
+#[test]
+fn unread_banner_and_divider_are_rendered() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    let room = chat_core::RoomId::new();
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| {
+            app.debug_seed_read(room, 0);
+            app.debug_apply(UiEvent::Conversations {
+                rooms: vec![chat_core::RoomSummary {
+                    room,
+                    kind: chat_core::RoomKind::Group,
+                    name: "未读群".into(),
+                    member_count: 3,
+                    last_seq: 1,
+                    last_text: Some("新消息".into()),
+                    last_at: None,
+                    read_seq: 0,
+                }],
+            });
+            app.debug_apply(UiEvent::Lobby {
+                room,
+                name: "未读群".into(),
+                addr: "127.0.0.1:1".into(),
+                online: 1,
+            });
+            app.debug_open_conversation(room, cx);
+            app.debug_apply(UiEvent::History {
+                room,
+                messages: (1..=1)
+                    .map(|seq| chat_ui_gpui::service::HistoryMessage {
+                        seq,
+                        sender_id: chat_core::UserId::new(),
+                        sender: "Bob".into(),
+                        at: 0,
+                        text: format!("消息 {seq}"),
+                        attachment: None,
+                        quote: None,
+                    })
+                    .collect(),
+                has_more: false,
+            });
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    assert_inside(&bounds(cx, "unread-divider"), "unread-divider");
+}
+
+/// 进入会话后、历史还没加载完时，未读提示就应该出现。
+#[test]
+fn unread_banner_appears_before_history_loads() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    let room = chat_core::RoomId::new();
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| {
+            app.debug_seed_read(room, 0);
+            app.debug_apply(UiEvent::Conversations {
+                rooms: vec![chat_core::RoomSummary {
+                    room,
+                    kind: chat_core::RoomKind::Group,
+                    name: "未读群".into(),
+                    member_count: 3,
+                    last_seq: 12,
+                    last_text: Some("新消息".into()),
+                    last_at: None,
+                    read_seq: 0,
+                }],
+            });
+            app.debug_apply(UiEvent::Lobby {
+                room,
+                name: "未读群".into(),
+                addr: "127.0.0.1:1".into(),
+                online: 1,
+            });
+            app.debug_open_conversation(room, cx);
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    assert_inside(&bounds(cx, "unread-banner"), "unread-banner");
+}
+
+/// 重启后已读位置应从本地恢复，只把重启后的新消息算未读。
+#[test]
+fn unread_uses_server_read_position() {
+    let username = format!(
+        "restart-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let user = chat_core::UserSummary {
+        id: chat_core::UserId::new(),
+        username: username.clone(),
+        display_name: "重启用户".into(),
+    };
+    let room = chat_core::RoomId::new();
+
+    let mut first_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut first_cx);
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| {
+            app.debug_apply(UiEvent::Authenticated {
+                user: user.clone(),
+                token: "t".into(),
+            });
+            app.debug_seed_read(room, 0);
+            app.debug_apply(UiEvent::Conversations {
+                rooms: vec![chat_core::RoomSummary {
+                    room,
+                    kind: chat_core::RoomKind::Group,
+                    name: "重启群".into(),
+                    member_count: 2,
+                    last_seq: 10,
+                    last_text: None,
+                    last_at: None,
+                    read_seq: 10,
+                }],
+            });
+            app.debug_apply(UiEvent::Lobby {
+                room,
+                name: "重启群".into(),
+                addr: "127.0.0.1:1".into(),
+                online: 1,
+            });
+            app.debug_open_conversation(room, cx);
+        });
+    });
+    first_cx.run_until_parked();
+
+    let mut second_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut second_cx);
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| {
+            app.debug_apply(UiEvent::Authenticated {
+                user: user.clone(),
+                token: "t".into(),
+            });
+            app.debug_apply(UiEvent::Conversations {
+                rooms: vec![chat_core::RoomSummary {
+                    room,
+                    kind: chat_core::RoomKind::Group,
+                    name: "重启群".into(),
+                    member_count: 2,
+                    last_seq: 12,
+                    last_text: None,
+                    last_at: None,
+                    read_seq: 10,
+                }],
+            });
+            app.debug_apply(UiEvent::Lobby {
+                room,
+                name: "重启群".into(),
+                addr: "127.0.0.1:1".into(),
+                online: 1,
+            });
+            app.debug_open_conversation(room, cx);
+        });
+    });
+    second_cx.run_until_parked();
+    let unread = second_cx.update(|cx| view.read(cx).debug_unread_count());
+    assert_eq!(unread, 2, "重启后只应把 10 之后的两条算未读");
 }

@@ -64,7 +64,11 @@ impl ChatApp {
             .enumerate()
             .map(|(index, room)| {
                 let read = self.read_seqs.get(&room.room).copied().unwrap_or(0);
-                let unread = room.last_seq > read && current != Some(room.room);
+                let unread = if room.last_seq > read {
+                    room.last_seq - read
+                } else {
+                    0
+                };
                 conversation_item(index, room, current, unread, cx)
             })
             .collect();
@@ -123,15 +127,58 @@ impl ChatApp {
         let group_rows: Vec<_> = groups
             .into_iter()
             .enumerate()
-            .map(|(index, room)| conversation_item(index, room, None, false, cx))
+            .map(|(index, room)| {
+                let read = self.read_seqs.get(&room.room).copied().unwrap_or(0);
+                let unread = if room.last_seq > read {
+                    room.last_seq - read
+                } else {
+                    0
+                };
+                conversation_item(index, room, None, unread, cx)
+            })
             .collect();
         let selected = self.group_selected.clone();
+        let online = self.online_friends.clone();
         let friend_rows: Vec<_> = friends
             .into_iter()
             .enumerate()
             .map(|(index, user)| {
                 let checked = selected.contains(&user.id);
-                friend_item(index, user, checked, cx)
+                let is_online = online.contains(&user.id);
+                friend_item(index, user, checked, is_online, cx)
+            })
+            .collect();
+        let search_rows: Vec<_> = self
+            .search_results
+            .iter()
+            .enumerate()
+            .map(|(index, user)| {
+                let username = user.username.clone();
+                let label = format!("{} ({})", user.display_name, user.username);
+                div()
+                    .id(("search-user", index))
+                    .h(px(40.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_sm()
+                            .child(label),
+                    )
+                    .child(button(
+                        "添加",
+                        false,
+                        false,
+                        cx.listener(move |this, _, _, cx| {
+                            this.on_add_search_user(username.clone(), cx)
+                        }),
+                    ))
+                    .into_any_element()
             })
             .collect();
 
@@ -166,6 +213,24 @@ impl ChatApp {
                         true,
                         cx.listener(Self::on_add_friend),
                     )))
+                    .child(section_label("查找用户"))
+                    .child(padded(self.user_search.clone()))
+                    .child(padded(button(
+                        "搜索用户",
+                        false,
+                        true,
+                        cx.listener(Self::on_search_users),
+                    )))
+                    .child(
+                        div()
+                            .id("user-search-results")
+                            .flex()
+                            .flex_col()
+                            .when(search_rows.is_empty(), |this| {
+                                this.child(hint("搜索后可添加好友"))
+                            })
+                            .children(search_rows),
+                    )
                     .child(section_label("群聊"))
                     .child(
                         div()
@@ -195,6 +260,12 @@ impl ChatApp {
                         false,
                         true,
                         cx.listener(Self::on_create_group),
+                    )))
+                    .child(div().px_3().pt_3().child(button(
+                        "退出登录",
+                        false,
+                        true,
+                        cx.listener(Self::on_logout),
                     ))),
             )
             .into_any_element()
@@ -963,7 +1034,7 @@ fn conversation_item(
     index: usize,
     room: chat_core::RoomSummary,
     current: Option<RoomId>,
-    unread: bool,
+    unread: i64,
     cx: &mut Context<ChatApp>,
 ) -> AnyElement {
     let room_id = room.room;
@@ -1020,12 +1091,24 @@ fn conversation_item(
                         .child(subtitle),
                 ),
         )
-        .child(if unread {
+        .child(if unread > 0 {
             div()
-                .size(px(8.))
+                .min_w(px(18.))
+                .h(px(18.))
+                .px_1()
                 .flex_none()
                 .rounded_full()
                 .bg(rgb(theme::DANGER))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(10.))
+                .text_color(rgb(theme::ON_ACCENT))
+                .child(if unread > 99 {
+                    "99+".to_string()
+                } else {
+                    unread.to_string()
+                })
                 .into_any_element()
         } else if let Some(time) = time {
             div()
@@ -1053,6 +1136,7 @@ fn friend_item(
     index: usize,
     user: chat_core::UserSummary,
     selected: bool,
+    online: bool,
     cx: &mut Context<ChatApp>,
 ) -> AnyElement {
     let user_id = user.id;
@@ -1095,10 +1179,23 @@ fn friend_item(
                 .gap_1()
                 .child(
                     div()
-                        .truncate()
-                        .text_sm()
-                        .text_color(rgb(theme::TEXT))
-                        .child(name),
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .size(px(6.))
+                                .flex_none()
+                                .rounded_full()
+                                .bg(rgb(if online { theme::ACCENT } else { theme::FAINT })),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_sm()
+                                .text_color(rgb(theme::TEXT))
+                                .child(name),
+                        ),
                 )
                 .child(
                     div()

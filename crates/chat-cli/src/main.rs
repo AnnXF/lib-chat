@@ -48,8 +48,10 @@ fn usage() {
         "用法:\n  \
          libchat host [--port 0] [--name 房间名]\n  \
          libchat serve [--listen 0.0.0.0:4433] [--name 房间名] [--cert 证书链.pem --key 私钥.pem] [--data-dir 目录] [--announce 广播端口]\n  \
-         libchat register --server 主机:端口 [--fingerprint SHA-256 | --ca 根证书.pem] --user 账号 --password 密码 [--name 昵称]
-  
+         libchat register --server 主机:端口 [--fingerprint SHA-256 | --ca 根证书.pem] --user 账号 --password 密码 [--name 昵称]\n  \
+         libchat admin users|rooms|health [--data-dir 目录]\n  \
+         libchat admin ban|unban --user 账号 [--data-dir 目录]\n  \
+         libchat admin clear --room 房间标识 [--data-dir 目录]\n  \
          libchat join [--server 主机:端口 | --addr 主机:端口] [--fingerprint SHA-256 | --ca 根证书.pem] --user 账号 (--password 密码 | --token 令牌 | --register) [--name 昵称] [--data-dir 目录]"
     );
 }
@@ -61,6 +63,7 @@ async fn main() -> ExitCode {
         Some("host") => host(&args[1..]).await,
         Some("serve") => serve_cmd(&args[1..]).await,
         Some("register") => register_cmd(&args[1..]).await,
+        Some("admin") => admin_cmd(&args[1..]).await,
         Some("join") => join(&args[1..]).await,
         _ => {
             usage();
@@ -430,6 +433,61 @@ async fn register_cmd(args: &[String]) -> Result<(), AnyErr> {
             ServerEvent::AuthRequired => return Err("注册失败：服务端未返回登录态".into()),
             _ => {}
         }
+    }
+    Ok(())
+}
+
+/// 本地服务端管理：直接操作数据目录，不需要服务端进程。
+async fn admin_cmd(args: &[String]) -> Result<(), AnyErr> {
+    let action = args
+        .first()
+        .map(String::as_str)
+        .ok_or("需要 users/rooms/ban/unban/clear/health")?;
+    let dir = match opt(args, "--data-dir") {
+        Some(path) => PathBuf::from(path),
+        None => default_data_dir()?,
+    };
+    let accounts = chat_server::Accounts::open(&dir.join("accounts.db")).await?;
+    match action {
+        "users" => {
+            for user in accounts.admin_users().await? {
+                println!("{}\t{}", user.username, user.display_name);
+            }
+        }
+        "rooms" => {
+            for room in accounts.admin_rooms().await? {
+                println!(
+                    "{}\t{:?}\t{}\t{} 人",
+                    room.room, room.kind, room.name, room.member_count
+                );
+            }
+        }
+        "ban" | "unban" => {
+            let username = opt(args, "--user").ok_or("需要 --user 账号")?;
+            let banned = action == "ban";
+            if !accounts.set_banned(&username, banned).await? {
+                return Err(format!("账号不存在: {username}").into());
+            }
+            println!("{}: {username}", if banned { "已封禁" } else { "已解封" });
+        }
+        "clear" => {
+            let room: RoomId = opt(args, "--room")
+                .ok_or("需要 --room 房间标识")?
+                .parse()
+                .map_err(|e| format!("房间标识无效: {e}"))?;
+            let messages = chat_server::SqliteStore::open(&dir.join("messages.db")).await?;
+            let count = chat_core::MessageStore::clear(&messages, room).await?;
+            messages.close().await;
+            println!("已清空 {room} 的 {count} 条消息");
+        }
+        "health" => {
+            let users = accounts.admin_users().await?.len();
+            let rooms = accounts.admin_rooms().await?.len();
+            println!("数据目录: {}", dir.display());
+            println!("账号: {users}，房间: {rooms}");
+            println!("accounts.db / messages.db 可读");
+        }
+        _ => return Err(format!("未知管理命令: {action}").into()),
     }
     Ok(())
 }

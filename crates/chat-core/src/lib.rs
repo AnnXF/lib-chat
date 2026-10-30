@@ -127,6 +127,20 @@ pub trait MessageStore: Send + Sync {
     async fn since(&self, room: RoomId, after: Seq, limit: usize) -> Result<Vec<Message>>;
     /// 当前最大序号，空房间为 0。
     async fn latest_seq(&self, room: RoomId) -> Result<Seq>;
+    /// 按正文搜索消息，最近的结果优先，最多 `limit` 条。
+    async fn search(&self, room: RoomId, query: &str, limit: usize) -> Result<Vec<Message>>;
+    /// 撤回自己发送的消息；成功返回是否真的删掉了。
+    async fn recall(&self, room: RoomId, seq: Seq, sender: UserId) -> Result<bool>;
+    /// 编辑自己发送的文本消息，返回更新后的消息。
+    async fn edit(
+        &self,
+        room: RoomId,
+        seq: Seq,
+        sender: UserId,
+        text: String,
+    ) -> Result<Option<Message>>;
+    /// 管理命令：清空一个房间的全部消息，返回删除条数。
+    async fn clear(&self, room: RoomId) -> Result<u64>;
     /// 按附件标识查元数据；房间里没有这条附件时返回 `None`。
     async fn attachment(&self, room: RoomId, id: AttachmentId) -> Result<Option<Attachment>>;
 }

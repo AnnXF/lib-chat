@@ -88,6 +88,33 @@ pub struct ChatApp {
     pending_group_name: Option<String>,
     /// 通讯录里勾选要拉进群的好友。
     group_selected: Vec<UserId>,
+    /// 查找用户与结果。
+    user_search: Entity<TextInput>,
+    search_results: Vec<chat_core::UserSummary>,
+    /// 正在编辑的消息（房间 + 序号）。
+    editing: Option<(chat_core::RoomId, i64)>,
+    /// 进入会话时捕获的未读起点，用于插入未读分隔。
+    unread_after: Option<i64>,
+    unread_count: usize,
+    unread_room: Option<chat_core::RoomId>,
+    unread_marker_ix: Option<usize>,
+    /// 用户已点跳转，但未读边界还没加载完；加载后自动滚过去。
+    jump_requested: bool,
+    /// 已经跳转过一次（或未读分隔已进入视口），不再重复提示。
+    unread_prompt_done: bool,
+    /// 首次进入未读会话时自动向前翻到最早未读。
+    auto_unread: bool,
+    auto_unread_pages: usize,
+    /// 列表当前可见范围；未读分隔不可见时才显示跳转提示。
+    visible_range: std::ops::Range<usize>,
+    /// 窗口当前是否在前台；失焦时当前房间的新消息也计未读。
+    window_active: bool,
+    /// 聊天记录搜索。
+    message_search_input: Entity<TextInput>,
+    show_search: bool,
+    message_results: Vec<service::HistoryMessage>,
+    /// 在线好友集合。
+    online_friends: HashSet<UserId>,
     /// 当前群聊成员与成员面板。
     members: Vec<chat_core::RoomMember>,
     show_members: bool,
@@ -168,6 +195,16 @@ impl ChatApp {
         self.apply(event);
     }
 
+    #[cfg(any(test, feature = "ui-test"))]
+    pub fn debug_unread_count(&self) -> usize {
+        self.unread_count
+    }
+
+    #[cfg(any(test, feature = "ui-test"))]
+    pub fn debug_seed_read(&mut self, room: chat_core::RoomId, seq: i64) {
+        self.read_seqs.insert(room, seq);
+    }
+
     /// 当前输入框内容，供无头测试断言引用写入结果。
     #[cfg(any(test, feature = "ui-test"))]
     pub fn debug_message_input(&self, cx: &gpui::App) -> String {
@@ -213,6 +250,8 @@ impl ChatApp {
         let friend_input = cx.new(|cx| TextInput::new("好友用户名", cx));
         let group_input = cx.new(|cx| TextInput::new("群名称（拉入全部好友）", cx));
         let search = cx.new(|cx| TextInput::new("搜索会话或好友", cx));
+        let user_search = cx.new(|cx| TextInput::new("按用户名搜索用户", cx));
+        let message_search_input = cx.new(|cx| TextInput::new("搜索聊天记录", cx));
         let message = cx.new(|cx| {
             let mut input = TextInput::new("输入消息，Enter 发送", cx);
             // 外观由输入区容器负责，控件本身不再带底色与内边距
@@ -258,10 +297,24 @@ impl ChatApp {
         let list = ListState::new(0, ListAlignment::Bottom, px(200.));
         let this = cx.entity().downgrade();
         list.set_scroll_handler(move |event, _window, cx| {
-            if event.visible_range.start > 0 {
-                return;
-            }
-            let _ = this.update(cx, |app, cx| app.load_older(cx));
+            let visible = event.visible_range.clone();
+            let at_top = visible.start == 0;
+            let scrolled = event.is_scrolled;
+            let _ = this.update(cx, |app, cx| {
+                app.visible_range = visible.clone();
+                // 未读分隔已经出现在屏幕上，或用户自己滑动过，就不再提示跳转
+                if app
+                    .unread_marker_ix
+                    .is_some_and(|index| visible.contains(&index))
+                    || (scrolled && app.unread_count > 0)
+                {
+                    app.unread_prompt_done = true;
+                }
+                if at_top {
+                    app.load_older(cx);
+                }
+                cx.notify();
+            });
         });
 
         Self {
@@ -302,6 +355,23 @@ impl ChatApp {
             pending_direct: None,
             pending_group_name: None,
             group_selected: Vec::new(),
+            user_search,
+            search_results: Vec::new(),
+            editing: None,
+            unread_after: None,
+            unread_count: 0,
+            unread_room: None,
+            unread_marker_ix: None,
+            jump_requested: false,
+            unread_prompt_done: false,
+            auto_unread: false,
+            auto_unread_pages: 0,
+            visible_range: 0..0,
+            window_active: true,
+            message_search_input,
+            show_search: false,
+            message_results: Vec::new(),
+            online_friends: HashSet::new(),
             members: Vec::new(),
             show_members: false,
             read_seqs: std::collections::HashMap::new(),
@@ -317,7 +387,18 @@ impl ChatApp {
 }
 
 impl Render for ChatApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = window.is_window_active();
+        if active && !self.window_active {
+            // 回到前台时，当前正看着的房间视为已读
+            if let Some(current) = self.room.as_ref().map(|view| view.id)
+                && let Some(known) = self.conversations.iter().find(|room| room.room == current)
+            {
+                let last = known.last_seq;
+                self.mark_read(current, last);
+            }
+        }
+        self.window_active = active;
         let header = self.render_header();
         let sidebar = self.render_sidebar(cx);
         let main = self.render_main(cx);

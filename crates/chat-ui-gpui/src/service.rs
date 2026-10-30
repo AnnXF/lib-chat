@@ -23,6 +23,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use protocol::to_history_message;
+
 use chat_core::Client;
 use chat_core::{Attachment, AttachmentId};
 use chat_core::{ChatError, Connection, ConnectionAcceptor};
@@ -137,6 +139,7 @@ pub struct HistoryMessage {
     pub seq: Seq,
     pub sender_id: UserId,
     pub sender: String,
+    pub at: i64,
     pub text: String,
     pub attachment: Option<Attachment>,
     pub quote: Option<Quote>,
@@ -211,6 +214,7 @@ pub enum UiEvent {
         seq: Seq,
         sender_id: UserId,
         sender: String,
+        at: i64,
         text: String,
         attachment: Option<Attachment>,
         quote: Option<Quote>,
@@ -256,6 +260,35 @@ pub enum UiEvent {
     Friends {
         users: Vec<UserSummary>,
     },
+    /// 用户搜索结果。
+    UserSearch {
+        users: Vec<UserSummary>,
+    },
+    /// 当前房间的消息搜索结果。
+    SearchResults {
+        room: RoomId,
+        messages: Vec<HistoryMessage>,
+    },
+    MessageRecalled {
+        room: RoomId,
+        seq: Seq,
+    },
+    MessageEdited {
+        room: RoomId,
+        message: HistoryMessage,
+    },
+    Mention {
+        room: RoomId,
+        from: UserSummary,
+        text: String,
+    },
+    /// 好友上下线。
+    FriendPresence {
+        user: UserId,
+        online: bool,
+    },
+    /// 已退出登录。
+    LoggedOut,
     RoomMembers {
         room: RoomId,
         members: Vec<RoomMember>,
@@ -334,6 +367,30 @@ pub enum UiCommand {
     AddFriend {
         username: String,
     },
+    RemoveFriend {
+        user: UserId,
+    },
+    SearchUsers {
+        query: String,
+    },
+    SearchMessages {
+        room: RoomId,
+        query: String,
+    },
+    RecallMessage {
+        room: RoomId,
+        seq: Seq,
+    },
+    EditMessage {
+        room: RoomId,
+        seq: Seq,
+        text: String,
+    },
+    MarkRead {
+        room: RoomId,
+        seq: Seq,
+    },
+    Logout,
     OpenDirect {
         user: UserId,
     },
@@ -1146,6 +1203,150 @@ async fn run(
                     }
                     let _ = events.send_async(UiEvent::Left { room }).await;
                 }
+            }
+            UiCommand::RemoveFriend { user } => {
+                let Some(current) = &account else {
+                    let _ = events.send_async(UiEvent::Error("请先登录".into())).await;
+                    continue;
+                };
+                let client = match account_client(current, liveness).await {
+                    Ok(client) => client,
+                    Err(e) => {
+                        let _ = events.send_async(UiEvent::Error(e)).await;
+                        continue;
+                    }
+                };
+                if let Err(e) = client.remove_friend(user).await {
+                    let _ = events.send_async(UiEvent::Error(e.to_string())).await;
+                    continue;
+                }
+                for _ in 0..8 {
+                    match client.next_event().await {
+                        Ok(ServerEvent::Friends { users }) => {
+                            let _ = events.send_async(UiEvent::Friends { users }).await;
+                            break;
+                        }
+                        Ok(ServerEvent::Error { message, .. }) => {
+                            let _ = events.send_async(UiEvent::Error(message)).await;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+            UiCommand::SearchUsers { query } => {
+                let Some(current) = &account else {
+                    let _ = events.send_async(UiEvent::Error("请先登录".into())).await;
+                    continue;
+                };
+                let client = match account_client(current, liveness).await {
+                    Ok(client) => client,
+                    Err(e) => {
+                        let _ = events.send_async(UiEvent::Error(e)).await;
+                        continue;
+                    }
+                };
+                if let Err(e) = client.search_users(query).await {
+                    let _ = events.send_async(UiEvent::Error(e.to_string())).await;
+                    continue;
+                }
+                for _ in 0..8 {
+                    match client.next_event().await {
+                        Ok(ServerEvent::UserSearch { users }) => {
+                            let _ = events.send_async(UiEvent::UserSearch { users }).await;
+                            break;
+                        }
+                        Ok(ServerEvent::Error { message, .. }) => {
+                            let _ = events.send_async(UiEvent::Error(message)).await;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+            UiCommand::SearchMessages { room, query } => {
+                let Some(current) = &account else {
+                    let _ = events.send_async(UiEvent::Error("请先登录".into())).await;
+                    continue;
+                };
+                let client = match account_client(current, liveness).await {
+                    Ok(client) => client,
+                    Err(e) => {
+                        let _ = events.send_async(UiEvent::Error(e)).await;
+                        continue;
+                    }
+                };
+                if let Err(e) = client.search_messages(room, query).await {
+                    let _ = events.send_async(UiEvent::Error(e.to_string())).await;
+                    continue;
+                }
+                for _ in 0..8 {
+                    match client.next_event().await {
+                        Ok(ServerEvent::SearchResults { room, messages }) => {
+                            let messages = messages.into_iter().map(to_history_message).collect();
+                            let _ = events
+                                .send_async(UiEvent::SearchResults { room, messages })
+                                .await;
+                            break;
+                        }
+                        Ok(ServerEvent::Error { message, .. }) => {
+                            let _ = events.send_async(UiEvent::Error(message)).await;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+            UiCommand::RecallMessage { room, seq } => {
+                let Some(session) = active.as_ref().filter(|session| session.room == room) else {
+                    let _ = events
+                        .send_async(UiEvent::Error("只能撤回当前会话里的消息".into()))
+                        .await;
+                    continue;
+                };
+                send_session(session, SessionCmd::Recall(seq), &events).await;
+            }
+            UiCommand::EditMessage { room, seq, text } => {
+                let Some(session) = active.as_ref().filter(|session| session.room == room) else {
+                    let _ = events
+                        .send_async(UiEvent::Error("只能编辑当前会话里的消息".into()))
+                        .await;
+                    continue;
+                };
+                send_session(session, SessionCmd::Edit { seq, text }, &events).await;
+            }
+            UiCommand::MarkRead { room, seq } => {
+                if let Some(session) = active.as_ref().filter(|session| session.room == room) {
+                    send_session(session, SessionCmd::MarkRead(seq), &events).await;
+                }
+            }
+            UiCommand::Logout => {
+                let Some(current) = account.take() else {
+                    let _ = events.send_async(UiEvent::LoggedOut).await;
+                    continue;
+                };
+                if let Ok(client) = account_client(&current, liveness).await {
+                    let _ = client.logout().await;
+                    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            match client.next_event().await {
+                                Ok(ServerEvent::AuthRequired) | Ok(ServerEvent::Error { .. }) => {
+                                    break;
+                                }
+                                Ok(_) => {}
+                                Err(_) => break,
+                            }
+                        }
+                    })
+                    .await;
+                }
+                if let Some(previous) = active.take() {
+                    previous.end().await;
+                }
+                let _ = events.send_async(UiEvent::LoggedOut).await;
             }
             UiCommand::Host { name } => {
                 // 「我的房间」：本机已经有实例开着这个房间时接过去，没人开才自己开
