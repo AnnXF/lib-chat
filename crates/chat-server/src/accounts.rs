@@ -19,6 +19,8 @@ use crate::store::migrate::{self, Migration};
 
 /// 登录令牌有效期：30 天。
 const SESSION_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+/// 单个群聊的成员上限（含群主）。扇出成本与成员数成正比，先给出明确边界。
+pub const MAX_GROUP_MEMBERS: usize = 500;
 
 mod users {
     pub const TABLE: &str = "users";
@@ -78,6 +80,16 @@ mod read_markers {
     pub const ROOM_ID: &str = "room_id";
     pub const SEQ: &str = "seq";
     pub const UPDATED_AT: &str = "updated_at";
+}
+
+/// 群成员数（含群主）不能超过 [`MAX_GROUP_MEMBERS`]。
+fn ensure_group_size(total: usize) -> std::result::Result<(), AccountError> {
+    if total > MAX_GROUP_MEMBERS {
+        return Err(AccountError::Invalid(format!(
+            "群成员最多 {MAX_GROUP_MEMBERS} 人"
+        )));
+    }
+    Ok(())
 }
 
 /// 发起好友申请的结果。
@@ -603,6 +615,7 @@ impl Accounts {
             .collect();
         member_ids.sort_by_key(|member| member.to_string());
         member_ids.dedup();
+        ensure_group_size(member_ids.len() + 1)?;
 
         // 只允许把好友拉进群
         let known: std::collections::HashSet<UserId> = self
@@ -1547,6 +1560,14 @@ mod tests {
         assert!(accounts.friend_requests(bob.id).await.unwrap().is_empty());
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn groups_reject_more_members_than_the_cap() {
+        assert!(ensure_group_size(1).is_ok());
+        assert!(ensure_group_size(MAX_GROUP_MEMBERS).is_ok());
+        let error = ensure_group_size(MAX_GROUP_MEMBERS + 1).unwrap_err();
+        assert!(error.to_string().contains("最多"));
     }
 
     #[tokio::test]
