@@ -120,6 +120,8 @@ pub struct ChatLine {
     pub(crate) attachment: Option<Attachment>,
     /// 这条消息引用了哪条消息。
     pub(crate) quote: Option<Quote>,
+    /// 已撤回：只留占位行，序号不回收。
+    pub(crate) recalled: bool,
     /// 是否由自己发出，决定气泡靠哪一边。
     pub(crate) mine: bool,
     /// 这条消息 @ 了当前账号。

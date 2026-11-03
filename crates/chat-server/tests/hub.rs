@@ -468,6 +468,27 @@ async fn searches_messages_in_room() {
         matches!(event, ServerEvent::MessageRecalled { .. })
     })
     .await;
+
+    // 撤回保留序号占位：历史条数不变、内容清空，客户端分页不会出现空洞
+    alice.history(room, None, 10).await.unwrap();
+    match wait_for(&alice, |event| matches!(event, ServerEvent::History { .. })).await {
+        ServerEvent::History { messages, .. } => {
+            assert_eq!(messages.len(), 1);
+            let message = &messages[0];
+            assert_eq!(message.seq, seq);
+            assert!(message.recalled);
+            assert!(message.text.is_empty());
+            assert!(message.quote.is_none());
+        }
+        _ => unreachable!(),
+    }
+
+    // 撤回后不能再编辑，也不能重复撤回
+    alice.recall_message(room, seq).await.unwrap();
+    match wait_for(&alice, |event| matches!(event, ServerEvent::Error { .. })).await {
+        ServerEvent::Error { code, .. } => assert_eq!(code, ErrorCode::NotFound),
+        _ => unreachable!(),
+    }
 }
 
 #[tokio::test]

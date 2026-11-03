@@ -145,6 +145,8 @@ pub struct Message {
     pub attachment: Option<Attachment>,
     /// 这条消息引用了哪条消息；没有引用为 `None`。
     pub quote: Option<Quote>,
+    /// 已撤回：正文与附件都已清空，但仍占着这个序号。
+    pub recalled: bool,
     pub server_ts_ms: i64,
 }
 

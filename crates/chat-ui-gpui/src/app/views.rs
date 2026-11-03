@@ -271,6 +271,25 @@ fn render_line(line: &ChatLine, save: Option<SaveHandler>) -> AnyElement {
             .child(line.text.clone())
             .into_any_element();
     }
+    if line.recalled {
+        let text = if line.mine {
+            "你撤回了一条消息".to_string()
+        } else {
+            format!("{} 撤回了一条消息", line.sender)
+        };
+        return div()
+            .test_id("message-recalled")
+            .w_full()
+            .px_6()
+            .py_2()
+            .flex()
+            .flex_row()
+            .justify_center()
+            .text_size(px(11.))
+            .text_color(rgb(theme::FAINT))
+            .child(text)
+            .into_any_element();
+    }
 
     let (label, label_color) = if line.mine {
         ("我", theme::FAINT)
@@ -653,6 +672,7 @@ mod perf {
                     text: format!("这是第 {i} 条消息，长度大约二十来个字"),
                     attachment: None,
                     quote: None,
+                    recalled: false,
                     mine: i % 2 == 0,
                     mentioned: false,
                     unread_marker: false,

@@ -143,6 +143,7 @@ pub struct HistoryMessage {
     pub text: String,
     pub attachment: Option<Attachment>,
     pub quote: Option<Quote>,
+    pub recalled: bool,
 }
 
 /// 公网托管的接入信息：客户端据此决定填域名还是填指纹。
@@ -218,6 +219,7 @@ pub enum UiEvent {
         text: String,
         attachment: Option<Attachment>,
         quote: Option<Quote>,
+        recalled: bool,
     },
     /// 取回的一页历史（比当前会话更早），界面应插到列表最前。
     History {

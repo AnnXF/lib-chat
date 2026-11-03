@@ -52,6 +52,7 @@ impl MessageStore for InMemoryStore {
             text: msg.text,
             attachment: msg.attachment.clone(),
             quote: msg.quote.clone(),
+            recalled: false,
             server_ts_ms: now_ms(),
         };
         if let Some(attachment) = &stored.attachment {
@@ -132,7 +133,15 @@ impl MessageStore for InMemoryStore {
         else {
             return Ok(false);
         };
-        log.messages.remove(index);
+        // 撤回保留序号占位，否则历史里会出现空洞
+        let message = &mut log.messages[index];
+        if message.recalled {
+            return Ok(false);
+        }
+        message.recalled = true;
+        message.text.clear();
+        message.attachment = None;
+        message.quote = None;
         Ok(true)
     }
 
@@ -150,7 +159,7 @@ impl MessageStore for InMemoryStore {
         let Some(message) = log
             .messages
             .iter_mut()
-            .find(|message| message.seq == seq && message.sender == sender)
+            .find(|message| message.seq == seq && message.sender == sender && !message.recalled)
         else {
             return Ok(None);
         };

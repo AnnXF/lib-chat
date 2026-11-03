@@ -33,6 +33,7 @@ mod messages {
     pub const QUOTE_SENDER: &str = "quote_sender";
     pub const QUOTE_TEXT: &str = "quote_text";
     pub const QUOTE_SEQ: &str = "quote_seq";
+    pub const RECALLED_AT: &str = "recalled_at";
 }
 
 /// `room_meta` 表：单行，记着本库属于哪个房间。
@@ -46,7 +47,7 @@ mod room_meta {
 const ROOM_ROW: i32 = 1;
 
 /// 读消息时统一选出的列，顺序与 [`row_to_message`] 的下标一一对应。
-const MESSAGE_COLUMNS: [&str; 15] = [
+const MESSAGE_COLUMNS: [&str; 16] = [
     messages::SEQ,
     messages::MSG_ID,
     messages::SENDER,
@@ -62,6 +63,7 @@ const MESSAGE_COLUMNS: [&str; 15] = [
     messages::QUOTE_SENDER,
     messages::QUOTE_TEXT,
     messages::QUOTE_SEQ,
+    messages::RECALLED_AT,
 ];
 
 pub struct SqliteStore {
@@ -125,6 +127,7 @@ impl SqliteStore {
             .col(ColumnDef::new(messages::QUOTE_SENDER).text())
             .col(ColumnDef::new(messages::QUOTE_TEXT).text())
             .col(ColumnDef::new(messages::QUOTE_SEQ).big_integer())
+            .col(ColumnDef::new(messages::RECALLED_AT).big_integer())
             .primary_key(Index::create().col(messages::ROOM_ID).col(messages::SEQ))
             .to_owned();
 
@@ -253,6 +256,7 @@ impl MessageStore for SqliteStore {
                 text: msg.text,
                 attachment: msg.attachment,
                 quote: msg.quote,
+                recalled: false,
                 server_ts_ms: now_ms(),
             };
 
@@ -375,11 +379,23 @@ impl MessageStore for SqliteStore {
     }
 
     async fn recall(&self, room: RoomId, seq: Seq, sender: UserId) -> Result<bool> {
-        let (sql, values) = Query::delete()
-            .from_table(messages::TABLE)
+        // 保留这一行，只清内容并打上时间戳：历史与同步都按 seq 连续，不能留空洞
+        let (sql, values) = Query::update()
+            .table(messages::TABLE)
+            .value(messages::RECALLED_AT, now_ms())
+            .value(messages::BODY, "")
+            .value(messages::ATTACHMENT_ID, Option::<String>::None)
+            .value(messages::ATTACHMENT_NAME, Option::<String>::None)
+            .value(messages::ATTACHMENT_SIZE, Option::<i64>::None)
+            .value(messages::ATTACHMENT_MIME, Option::<String>::None)
+            .value(messages::ATTACHMENT_SHA256, Option::<String>::None)
+            .value(messages::QUOTE_SENDER, Option::<String>::None)
+            .value(messages::QUOTE_TEXT, Option::<String>::None)
+            .value(messages::QUOTE_SEQ, Option::<i64>::None)
             .and_where(Expr::col(messages::ROOM_ID).eq(room.to_string()))
             .and_where(Expr::col(messages::SEQ).eq(seq))
             .and_where(Expr::col(messages::SENDER).eq(sender.to_string()))
+            .and_where(Expr::col(messages::RECALLED_AT).is_null())
             .build(SqliteQueryBuilder);
         let result = bind(sqlx::query(&sql), values)
             .execute(&self.pool)
@@ -401,6 +417,7 @@ impl MessageStore for SqliteStore {
             .and_where(Expr::col(messages::ROOM_ID).eq(room.to_string()))
             .and_where(Expr::col(messages::SEQ).eq(seq))
             .and_where(Expr::col(messages::SENDER).eq(sender.to_string()))
+            .and_where(Expr::col(messages::RECALLED_AT).is_null())
             .build(SqliteQueryBuilder);
         let result = bind(sqlx::query(&sql), values)
             .execute(&self.pool)
@@ -516,6 +533,7 @@ fn row_to_message(room: RoomId, row: &sqlx::sqlite::SqliteRow) -> Result<Message
         text: row.get(5),
         attachment: row_to_attachment(row)?,
         quote: row_to_quote(row),
+        recalled: row.get::<Option<i64>, _>(15).is_some(),
         server_ts_ms: row.get(6),
     })
 }

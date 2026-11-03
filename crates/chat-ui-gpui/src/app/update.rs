@@ -190,6 +190,7 @@ impl ChatApp {
                 text,
                 attachment,
                 quote,
+                recalled,
             } => {
                 if self.showing(room).is_some() {
                     if self.window_active {
@@ -197,7 +198,7 @@ impl ChatApp {
                     }
                     let mentioned = self.mentions_me(&text);
                     let mut line = chat_line(
-                        seq, at, sender_id, sender, text, attachment, quote, self.my_id,
+                        seq, at, sender_id, sender, text, attachment, quote, recalled, self.my_id,
                     );
                     line.mentioned = mentioned;
                     self.push_line(line);
@@ -229,6 +230,7 @@ impl ChatApp {
                             m.text,
                             m.attachment,
                             m.quote,
+                            m.recalled,
                             my_id,
                         );
                         line.mentioned = mentioned;
@@ -292,6 +294,7 @@ impl ChatApp {
                             m.text,
                             m.attachment,
                             m.quote,
+                            m.recalled,
                             my_id,
                         );
                         line.mentioned = mentioned;
@@ -395,10 +398,15 @@ impl ChatApp {
             }
             UiEvent::MessageRecalled { room, seq } => {
                 if self.showing(room).is_some() {
-                    self.lines.retain(|line| line.seq != Some(seq));
-                    self.seen_seqs.remove(&seq);
-                    self.list.reset(self.lines.len());
-                    self.status = "消息已撤回".into();
+                    // 保留占位：删掉会让列表里少一个序号，和分页/补齐的游标对不上
+                    if let Some(line) = self.lines.iter_mut().find(|line| line.seq == Some(seq)) {
+                        line.recalled = true;
+                        line.text.clear();
+                        line.attachment = None;
+                        line.quote = None;
+                        line.mentioned = false;
+                        self.status = "消息已撤回".into();
+                    }
                 }
             }
             UiEvent::Mention { room, from, text } => {
@@ -561,6 +569,7 @@ impl ChatApp {
             text: format!("{} 条未读，以下是新消息", self.unread_count),
             attachment: None,
             quote: None,
+            recalled: false,
             mine: false,
             mentioned: false,
             unread_marker: true,
@@ -620,6 +629,7 @@ impl ChatApp {
             text,
             attachment: None,
             quote: None,
+            recalled: false,
             mine: false,
             mentioned: false,
             unread_marker: false,
@@ -637,6 +647,7 @@ fn chat_line(
     text: String,
     attachment: Option<Attachment>,
     quote: Option<chat_core::Quote>,
+    recalled: bool,
     mine: Option<UserId>,
 ) -> ChatLine {
     ChatLine {
@@ -646,6 +657,7 @@ fn chat_line(
         text,
         attachment,
         quote,
+        recalled,
         mine: mine == Some(sender_id),
         mentioned: false,
         unread_marker: false,

@@ -921,6 +921,7 @@ mod tests {
             text: format!("m{seq}"),
             attachment: None,
             quote: None,
+            recalled: false,
             server_ts_ms: 0,
         }
     }

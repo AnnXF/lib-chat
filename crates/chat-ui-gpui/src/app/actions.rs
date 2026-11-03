@@ -413,6 +413,10 @@ impl ChatApp {
         line: ChatLine,
         cx: &mut Context<Self>,
     ) {
+        // 撤回后的占位行没有可操作的内容
+        if line.recalled || line.system {
+            return;
+        }
         let menu_height = px(150.);
         let y = if position.y + menu_height > viewport.height {
             if position.y > menu_height {
@@ -565,6 +569,7 @@ impl ChatApp {
             text: "一条消息".into(),
             attachment: None,
             quote: None,
+            recalled: false,
             mine: false,
             mentioned: false,
             unread_marker: false,
@@ -974,6 +979,7 @@ mod tests {
             text: text.into(),
             attachment: None,
             quote: None,
+            recalled: false,
             mine: false,
             mentioned: false,
             unread_marker: false,

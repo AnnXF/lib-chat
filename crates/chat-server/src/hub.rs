@@ -268,8 +268,14 @@ impl Hub {
             room.last_seq = self.messages.latest_seq(room.room).await.unwrap_or(0);
             if let Ok(recent) = self.messages.history(room.room, None, 1).await {
                 if let Some(message) = recent.last() {
-                    let text = message.text.replace(['\n', '\r'], " ");
-                    room.last_text = Some(if message.kind == MessageKind::File {
+                    let text = if message.recalled {
+                        "消息已撤回".to_string()
+                    } else {
+                        message.text.replace(['\n', '\r'], " ")
+                    };
+                    room.last_text = Some(if message.recalled {
+                        text
+                    } else if message.kind == MessageKind::File {
                         "[文件]".to_string()
                     } else if room.kind == RoomKind::Group {
                         format!("{}: {text}", message.sender_name)

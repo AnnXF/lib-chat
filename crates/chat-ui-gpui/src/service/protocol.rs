@@ -49,6 +49,7 @@ pub(super) fn map_event(event: ServerEvent) -> Option<UiEvent> {
             text: message.text,
             attachment: message.attachment,
             quote: message.quote,
+            recalled: message.recalled,
         },
         ServerEvent::Presence { room, online_count } => UiEvent::Presence {
             room,
@@ -82,6 +83,7 @@ pub(super) fn to_history_message(message: Message) -> HistoryMessage {
         text: message.text,
         attachment: message.attachment,
         quote: message.quote,
+        recalled: message.recalled,
     }
 }
 
