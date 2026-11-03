@@ -7,6 +7,7 @@
 
 mod blobs;
 mod memory;
+pub mod migrate;
 mod sqlite;
 
 pub use blobs::{BlobStore, DiskBlobs, MemoryBlobs};

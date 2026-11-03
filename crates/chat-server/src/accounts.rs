@@ -10,10 +10,12 @@ use argon2::Argon2;
 use chat_core::{
     ChatError, MemberRole, RoomId, RoomKind, RoomMember, RoomSummary, Seq, UserId, UserSummary,
 };
-use sea_query::{ColumnDef, Expr, Query, SqliteQueryBuilder, Table};
+use sea_query::{ColumnDef, Expr, Query, SchemaStatement, SqliteQueryBuilder, Table};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
 use uuid::Uuid;
+
+use crate::store::migrate::{self, Migration};
 
 /// 登录令牌有效期：30 天。
 const SESSION_TTL_SECS: i64 = 30 * 24 * 60 * 60;
@@ -129,113 +131,9 @@ impl Accounts {
     }
 
     async fn migrate(&self) -> std::result::Result<(), AccountError> {
-        let users = Table::create()
-            .table(users::TABLE)
-            .if_not_exists()
-            .col(ColumnDef::new(users::ID).text().not_null().primary_key())
-            .col(
-                ColumnDef::new(users::USERNAME)
-                    .text()
-                    .not_null()
-                    .unique_key(),
-            )
-            .col(ColumnDef::new(users::DISPLAY_NAME).text().not_null())
-            .col(ColumnDef::new(users::PASSWORD_HASH).text().not_null())
-            .col(ColumnDef::new(users::CREATED_AT).big_integer().not_null())
-            .col(
-                ColumnDef::new(users::BANNED)
-                    .integer()
-                    .not_null()
-                    .default(0),
-            )
-            .to_owned();
-        let sessions = Table::create()
-            .table(sessions::TABLE)
-            .if_not_exists()
-            .col(
-                ColumnDef::new(sessions::TOKEN)
-                    .text()
-                    .not_null()
-                    .primary_key(),
-            )
-            .col(ColumnDef::new(sessions::USER_ID).text().not_null())
-            .col(
-                ColumnDef::new(sessions::CREATED_AT)
-                    .big_integer()
-                    .not_null(),
-            )
-            .col(
-                ColumnDef::new(sessions::EXPIRES_AT)
-                    .big_integer()
-                    .not_null(),
-            )
-            .to_owned();
-        let friends = Table::create()
-            .table(friends::TABLE)
-            .if_not_exists()
-            .col(ColumnDef::new(friends::USER_ID).text().not_null())
-            .col(ColumnDef::new(friends::FRIEND_ID).text().not_null())
-            .col(ColumnDef::new(friends::CREATED_AT).big_integer().not_null())
-            .primary_key(
-                sea_query::Index::create()
-                    .col(friends::USER_ID)
-                    .col(friends::FRIEND_ID),
-            )
-            .to_owned();
-        let rooms = Table::create()
-            .table(rooms::TABLE)
-            .if_not_exists()
-            .col(ColumnDef::new(rooms::ID).text().not_null().primary_key())
-            .col(ColumnDef::new(rooms::KIND).text().not_null())
-            .col(ColumnDef::new(rooms::NAME).text().not_null())
-            .col(ColumnDef::new(rooms::OWNER_ID).text())
-            .col(ColumnDef::new(rooms::DIRECT_KEY).text().unique_key())
-            .col(ColumnDef::new(rooms::CREATED_AT).big_integer().not_null())
-            .to_owned();
-        let members = Table::create()
-            .table(room_members::TABLE)
-            .if_not_exists()
-            .col(ColumnDef::new(room_members::ROOM_ID).text().not_null())
-            .col(ColumnDef::new(room_members::USER_ID).text().not_null())
-            .col(ColumnDef::new(room_members::ROLE).text().not_null())
-            .col(
-                ColumnDef::new(room_members::JOINED_AT)
-                    .big_integer()
-                    .not_null(),
-            )
-            .primary_key(
-                sea_query::Index::create()
-                    .col(room_members::ROOM_ID)
-                    .col(room_members::USER_ID),
-            )
-            .to_owned();
-        let read_markers = Table::create()
-            .table(read_markers::TABLE)
-            .if_not_exists()
-            .col(ColumnDef::new(read_markers::USER_ID).text().not_null())
-            .col(ColumnDef::new(read_markers::ROOM_ID).text().not_null())
-            .col(ColumnDef::new(read_markers::SEQ).big_integer().not_null())
-            .col(
-                ColumnDef::new(read_markers::UPDATED_AT)
-                    .big_integer()
-                    .not_null(),
-            )
-            .primary_key(
-                sea_query::Index::create()
-                    .col(read_markers::USER_ID)
-                    .col(read_markers::ROOM_ID),
-            )
-            .to_owned();
-
-        for table in [users, sessions, friends, rooms, members, read_markers] {
-            let sql = table.build(SqliteQueryBuilder);
-            sqlx::query(&sql).execute(&self.pool).await?;
-        }
-        // 旧库没有 banned 列，补一次；已存在时 SQLite 会报错，忽略即可
-        let _ = sqlx::query("ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0")
-            .execute(&self.pool)
-            .await;
-        Ok(())
+        migrate::apply(&self.pool, MIGRATIONS)
+            .await
+            .map_err(|e| AccountError::Storage(e.to_string()))
     }
 
     pub async fn register(
@@ -1249,6 +1147,118 @@ impl Accounts {
         }
         Ok(result)
     }
+}
+
+/// 库结构的演进顺序；只往后加，不改已经发出去的那几步。
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    name: "账号、好友与会话",
+    schema: v1_schema,
+}];
+
+fn v1_schema() -> Vec<SchemaStatement> {
+    let users = Table::create()
+        .table(users::TABLE)
+        .if_not_exists()
+        .col(ColumnDef::new(users::ID).text().not_null().primary_key())
+        .col(
+            ColumnDef::new(users::USERNAME)
+                .text()
+                .not_null()
+                .unique_key(),
+        )
+        .col(ColumnDef::new(users::DISPLAY_NAME).text().not_null())
+        .col(ColumnDef::new(users::PASSWORD_HASH).text().not_null())
+        .col(ColumnDef::new(users::CREATED_AT).big_integer().not_null())
+        .col(
+            ColumnDef::new(users::BANNED)
+                .integer()
+                .not_null()
+                .default(0),
+        )
+        .to_owned();
+    let sessions = Table::create()
+        .table(sessions::TABLE)
+        .if_not_exists()
+        .col(
+            ColumnDef::new(sessions::TOKEN)
+                .text()
+                .not_null()
+                .primary_key(),
+        )
+        .col(ColumnDef::new(sessions::USER_ID).text().not_null())
+        .col(
+            ColumnDef::new(sessions::CREATED_AT)
+                .big_integer()
+                .not_null(),
+        )
+        .col(
+            ColumnDef::new(sessions::EXPIRES_AT)
+                .big_integer()
+                .not_null(),
+        )
+        .to_owned();
+    let friends = Table::create()
+        .table(friends::TABLE)
+        .if_not_exists()
+        .col(ColumnDef::new(friends::USER_ID).text().not_null())
+        .col(ColumnDef::new(friends::FRIEND_ID).text().not_null())
+        .col(ColumnDef::new(friends::CREATED_AT).big_integer().not_null())
+        .primary_key(
+            sea_query::Index::create()
+                .col(friends::USER_ID)
+                .col(friends::FRIEND_ID),
+        )
+        .to_owned();
+    let rooms = Table::create()
+        .table(rooms::TABLE)
+        .if_not_exists()
+        .col(ColumnDef::new(rooms::ID).text().not_null().primary_key())
+        .col(ColumnDef::new(rooms::KIND).text().not_null())
+        .col(ColumnDef::new(rooms::NAME).text().not_null())
+        .col(ColumnDef::new(rooms::OWNER_ID).text())
+        .col(ColumnDef::new(rooms::DIRECT_KEY).text().unique_key())
+        .col(ColumnDef::new(rooms::CREATED_AT).big_integer().not_null())
+        .to_owned();
+    let members = Table::create()
+        .table(room_members::TABLE)
+        .if_not_exists()
+        .col(ColumnDef::new(room_members::ROOM_ID).text().not_null())
+        .col(ColumnDef::new(room_members::USER_ID).text().not_null())
+        .col(ColumnDef::new(room_members::ROLE).text().not_null())
+        .col(
+            ColumnDef::new(room_members::JOINED_AT)
+                .big_integer()
+                .not_null(),
+        )
+        .primary_key(
+            sea_query::Index::create()
+                .col(room_members::ROOM_ID)
+                .col(room_members::USER_ID),
+        )
+        .to_owned();
+    let read_markers = Table::create()
+        .table(read_markers::TABLE)
+        .if_not_exists()
+        .col(ColumnDef::new(read_markers::USER_ID).text().not_null())
+        .col(ColumnDef::new(read_markers::ROOM_ID).text().not_null())
+        .col(ColumnDef::new(read_markers::SEQ).big_integer().not_null())
+        .col(
+            ColumnDef::new(read_markers::UPDATED_AT)
+                .big_integer()
+                .not_null(),
+        )
+        .primary_key(
+            sea_query::Index::create()
+                .col(read_markers::USER_ID)
+                .col(read_markers::ROOM_ID),
+        )
+        .to_owned();
+
+    [users, sessions, friends, rooms, members, read_markers]
+        .into_iter()
+        .map(migrate::table)
+        .collect()
 }
 
 #[cfg(test)]

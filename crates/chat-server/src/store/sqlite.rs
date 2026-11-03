@@ -8,7 +8,9 @@ use std::path::Path;
 use async_trait::async_trait;
 use chat_core::{AppendResult, ChatError, MessageStore, NewMessage, Result};
 use chat_core::{Attachment, AttachmentId, Message, MessageKind, Quote, RoomId, Seq, UserId};
-use sea_query::{ColumnDef, Expr, Index, Order, Query, SqliteQueryBuilder, Table, Value, Values};
+use sea_query::{
+    ColumnDef, Expr, Index, Order, Query, SchemaStatement, SqliteQueryBuilder, Table, Value, Values,
+};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
 
@@ -108,61 +110,7 @@ impl SqliteStore {
     }
 
     async fn migrate(&self) -> Result<()> {
-        let messages_table = Table::create()
-            .table(messages::TABLE)
-            .if_not_exists()
-            .col(ColumnDef::new(messages::ROOM_ID).text().not_null())
-            .col(ColumnDef::new(messages::SEQ).big_integer().not_null())
-            .col(ColumnDef::new(messages::MSG_ID).text().not_null())
-            .col(ColumnDef::new(messages::SENDER).text().not_null())
-            .col(ColumnDef::new(messages::SENDER_NAME).text().not_null())
-            .col(ColumnDef::new(messages::KIND).text().not_null())
-            .col(ColumnDef::new(messages::BODY).text().not_null())
-            .col(ColumnDef::new(messages::SERVER_TS).big_integer().not_null())
-            .col(ColumnDef::new(messages::ATTACHMENT_ID).text())
-            .col(ColumnDef::new(messages::ATTACHMENT_NAME).text())
-            .col(ColumnDef::new(messages::ATTACHMENT_SIZE).big_integer())
-            .col(ColumnDef::new(messages::ATTACHMENT_MIME).text())
-            .col(ColumnDef::new(messages::ATTACHMENT_SHA256).text())
-            .col(ColumnDef::new(messages::QUOTE_SENDER).text())
-            .col(ColumnDef::new(messages::QUOTE_TEXT).text())
-            .col(ColumnDef::new(messages::QUOTE_SEQ).big_integer())
-            .col(ColumnDef::new(messages::RECALLED_AT).big_integer())
-            .primary_key(Index::create().col(messages::ROOM_ID).col(messages::SEQ))
-            .to_owned();
-
-        let meta_table = Table::create()
-            .table(room_meta::TABLE)
-            .if_not_exists()
-            .col(
-                ColumnDef::new(room_meta::ID)
-                    .integer()
-                    .not_null()
-                    .primary_key(),
-            )
-            .col(ColumnDef::new(room_meta::ROOM_ID).text().not_null())
-            .to_owned();
-
-        for statement in [messages_table, meta_table] {
-            let sql = statement.build(SqliteQueryBuilder);
-            sqlx::query(&sql)
-                .execute(&self.pool)
-                .await
-                .map_err(db_err)?;
-        }
-        let index = Index::create()
-            .name("idx_messages_room_msg_id")
-            .table(messages::TABLE)
-            .col(messages::ROOM_ID)
-            .col(messages::MSG_ID)
-            .unique()
-            .if_not_exists()
-            .to_owned();
-        sqlx::query(&index.build(SqliteQueryBuilder))
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?;
-        Ok(())
+        super::migrate::apply(&self.pool, MIGRATIONS).await
     }
 
     async fn load_or_init_room(&self) -> Result<RoomId> {
@@ -584,6 +532,65 @@ fn bind<'a>(
         };
     }
     query
+}
+
+/// 库结构的演进顺序；只往后加，不改已经发出去的那几步。
+const MIGRATIONS: &[super::migrate::Migration] = &[super::migrate::Migration {
+    version: 1,
+    name: "消息与房间标识",
+    schema: v1_schema,
+}];
+
+fn v1_schema() -> Vec<SchemaStatement> {
+    let messages_table = Table::create()
+        .table(messages::TABLE)
+        .if_not_exists()
+        .col(ColumnDef::new(messages::ROOM_ID).text().not_null())
+        .col(ColumnDef::new(messages::SEQ).big_integer().not_null())
+        .col(ColumnDef::new(messages::MSG_ID).text().not_null())
+        .col(ColumnDef::new(messages::SENDER).text().not_null())
+        .col(ColumnDef::new(messages::SENDER_NAME).text().not_null())
+        .col(ColumnDef::new(messages::KIND).text().not_null())
+        .col(ColumnDef::new(messages::BODY).text().not_null())
+        .col(ColumnDef::new(messages::SERVER_TS).big_integer().not_null())
+        .col(ColumnDef::new(messages::ATTACHMENT_ID).text())
+        .col(ColumnDef::new(messages::ATTACHMENT_NAME).text())
+        .col(ColumnDef::new(messages::ATTACHMENT_SIZE).big_integer())
+        .col(ColumnDef::new(messages::ATTACHMENT_MIME).text())
+        .col(ColumnDef::new(messages::ATTACHMENT_SHA256).text())
+        .col(ColumnDef::new(messages::QUOTE_SENDER).text())
+        .col(ColumnDef::new(messages::QUOTE_TEXT).text())
+        .col(ColumnDef::new(messages::QUOTE_SEQ).big_integer())
+        .col(ColumnDef::new(messages::RECALLED_AT).big_integer())
+        .primary_key(Index::create().col(messages::ROOM_ID).col(messages::SEQ))
+        .to_owned();
+
+    let meta_table = Table::create()
+        .table(room_meta::TABLE)
+        .if_not_exists()
+        .col(
+            ColumnDef::new(room_meta::ID)
+                .integer()
+                .not_null()
+                .primary_key(),
+        )
+        .col(ColumnDef::new(room_meta::ROOM_ID).text().not_null())
+        .to_owned();
+
+    let index = Index::create()
+        .name("idx_messages_room_msg_id")
+        .table(messages::TABLE)
+        .col(messages::ROOM_ID)
+        .col(messages::MSG_ID)
+        .unique()
+        .if_not_exists()
+        .to_owned();
+
+    vec![
+        super::migrate::table(messages_table),
+        super::migrate::table(meta_table),
+        super::migrate::index(index),
+    ]
 }
 
 #[cfg(test)]
