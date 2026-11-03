@@ -98,6 +98,11 @@ impl Hub {
         &self.default_name
     }
 
+    /// 进程内计数器快照，用于状态行与退出小结。
+    pub fn counters(&self) -> crate::obs::Counters {
+        crate::obs::Counters::snapshot()
+    }
+
     /// 默认大厅的在线人数，用于 CLI 状态行。
     pub async fn online_count(&self) -> u32 {
         self.presence(self.default_room).await
@@ -113,6 +118,7 @@ impl Hub {
         let (tx, rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
         let stream = EventStream::new(rx);
         let outbox = Outbox::new(tx, stream.lag());
+        crate::obs::connection_opened();
         self.conns.write().await.insert(
             id,
             Conn {
@@ -229,7 +235,10 @@ impl Hub {
             Ok(()) => {}
             // 队列满：记下缺口。客户端一有空位就会收到 `Lag` 并按游标补齐；
             // 真的彻底不动了，传输层的写超时会把连接判死，重连后照样补齐。
-            Err(mpsc::error::TrySendError::Full(_)) => outbox.lag.mark(),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                crate::obs::event_dropped();
+                outbox.lag.mark();
+            }
             Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
@@ -525,6 +534,21 @@ impl Hub {
         let mut rooms = Vec::new();
         let mut user = None;
         if let Some(state) = self.conns.write().await.remove(&conn) {
+            crate::obs::connection_closed();
+            crate::obs::info(
+                "connection_closed",
+                &[
+                    ("conn", conn.to_string()),
+                    (
+                        "user",
+                        state
+                            .user
+                            .as_ref()
+                            .map(|known| known.username.clone())
+                            .unwrap_or_default(),
+                    ),
+                ],
+            );
             rooms.extend(state.joined);
             user = state.user.map(|known| known.id);
         }
@@ -1090,6 +1114,15 @@ impl Hub {
                 match self.messages.append(room, msg).await {
                     Ok(result) => {
                         if result.inserted {
+                            crate::obs::message_appended();
+                            crate::obs::info(
+                                "message_appended",
+                                &[
+                                    ("room", room.to_string()),
+                                    ("seq", result.message.seq.to_string()),
+                                    ("sender", from.username.clone()),
+                                ],
+                            );
                             self.broadcast_room(
                                 room,
                                 ServerEvent::Message {
@@ -1175,6 +1208,7 @@ impl Hub {
                 };
                 match self.messages.append(room, msg).await {
                     Ok(result) if result.inserted => {
+                        crate::obs::message_appended();
                         self.broadcast_room(
                             room,
                             ServerEvent::Message {
@@ -1274,9 +1308,13 @@ impl Hub {
             AccountError::Invalid(message) => (ErrorCode::InvalidRequest, message.clone()),
             AccountError::UsernameTaken => (ErrorCode::Conflict, error.to_string()),
             AccountError::BadCredentials | AccountError::Unauthorized => {
+                crate::obs::auth_failed(&error.to_string());
                 (ErrorCode::Unauthorized, error.to_string())
             }
-            AccountError::Storage(message) => (ErrorCode::Internal, message.clone()),
+            AccountError::Storage(message) => {
+                crate::obs::warn("storage_error", &[("detail", message.clone())]);
+                (ErrorCode::Internal, message.clone())
+            }
         };
         self.send_error(conn, code, &message).await;
     }

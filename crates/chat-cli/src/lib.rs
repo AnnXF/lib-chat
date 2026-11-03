@@ -39,7 +39,8 @@ pub struct Serving {
     pub hub: Arc<Hub>,
     quic: Arc<QuicServer>,
     /// 仅用于保活广播。
-    _announcer: Option<RoomAnnouncer>,
+    /// 广播器：进程退出前 drop 掉就停止广播。
+    pub announcer: Option<RoomAnnouncer>,
 }
 
 impl Serving {
@@ -97,7 +98,7 @@ pub async fn serve(config: ServeConfig) -> CliResult<Serving> {
         fingerprint,
         hub,
         quic,
-        _announcer: announcer,
+        announcer,
     })
 }
 

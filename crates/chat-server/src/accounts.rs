@@ -165,6 +165,13 @@ impl Accounts {
             .map_err(|e| AccountError::Storage(e.to_string()))
     }
 
+    /// 当前库结构版本，`admin health` 用。
+    pub async fn schema_version(&self) -> std::result::Result<i64, AccountError> {
+        migrate::version(&self.pool)
+            .await
+            .map_err(|e| AccountError::Storage(e.to_string()))
+    }
+
     pub async fn register(
         &self,
         username: &str,

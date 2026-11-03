@@ -130,10 +130,46 @@ async fn serve_cmd(args: &[String]) -> Result<(), AnyErr> {
     }
     println!("按 Ctrl+C 退出");
 
+    let mut tick = tokio::time::interval(Duration::from_secs(30));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        tokio::time::sleep(Duration::from_secs(30)).await;
-        println!("[状态] 在线 {}", serving.hub.online_count().await);
+        tokio::select! {
+            _ = tick.tick() => {
+                println!(
+                    "[状态] 在线 {} · {}",
+                    serving.hub.online_count().await,
+                    serving.hub.counters()
+                );
+            }
+            signal = shutdown_signal() => {
+                // 先停掉广播与监听，再把小结打出来，避免退出前还在收新连接
+                drop(serving.announcer);
+                println!("收到 {signal}，已停止监听");
+                println!("[小结] {}", serving.hub.counters());
+                return Ok(());
+            }
+        }
     }
+}
+
+/// 等一个终止信号：Ctrl+C 或 SIGTERM（容器里通常是后者）。
+#[cfg(unix)]
+async fn shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+    let Ok(mut term) = signal(SignalKind::terminate()) else {
+        let _ = tokio::signal::ctrl_c().await;
+        return "SIGINT";
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        _ = term.recv() => "SIGTERM",
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> &'static str {
+    let _ = tokio::signal::ctrl_c().await;
+    "SIGINT"
 }
 
 async fn host(args: &[String]) -> Result<(), AnyErr> {
@@ -483,8 +519,10 @@ async fn admin_cmd(args: &[String]) -> Result<(), AnyErr> {
         "health" => {
             let users = accounts.admin_users().await?.len();
             let rooms = accounts.admin_rooms().await?.len();
+            let version = accounts.schema_version().await?;
             println!("数据目录: {}", dir.display());
             println!("账号: {users}，房间: {rooms}");
+            println!("库结构版本: {version}");
             println!("accounts.db / messages.db 可读");
         }
         _ => return Err(format!("未知管理命令: {action}").into()),

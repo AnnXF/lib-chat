@@ -54,8 +54,7 @@ pub async fn apply(pool: &SqlitePool, migrations: &[Migration]) -> Result<()> {
     Ok(())
 }
 
-/// 当前库结构版本，测试与诊断用。
-#[cfg(test)]
+/// 当前库结构版本，诊断用。
 pub async fn version(pool: &SqlitePool) -> Result<i64> {
     sqlx::query_scalar("PRAGMA user_version")
         .fetch_one(pool)

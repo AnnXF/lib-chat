@@ -648,3 +648,26 @@ async fn mark_read_persists_in_room_summary() {
     })
     .await;
 }
+
+/// 计数器跟随真实事件走，`libchat serve` 的状态行与退出小结才有意义。
+#[tokio::test]
+async fn counters_track_connections_and_messages() {
+    let dir = temp_dir("counters");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+    let before = hub.counters();
+
+    let (alice, _) = register(&hub, "alice").await;
+    let room = hub.default_room();
+    alice.join(room, "alice").await.unwrap();
+    wait_for(&alice, |event| matches!(event, ServerEvent::Joined { .. })).await;
+    alice.send_text(room, "计数").await.unwrap();
+    wait_for(&alice, |event| matches!(event, ServerEvent::Message { .. })).await;
+
+    let after = hub.counters();
+    assert!(after.connections_opened > before.connections_opened);
+    assert!(after.messages_appended > before.messages_appended);
+
+    drop(alice);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(hub.counters().connections_closed > after.connections_closed);
+}
