@@ -16,7 +16,7 @@ use chat_core::{
 };
 use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 
-use crate::accounts::{AccountError, Accounts};
+use crate::accounts::{AccountError, Accounts, FriendRequest};
 use crate::store::{BlobStore, DiskBlobs, SqliteStore};
 
 const MAX_TEXT_BYTES: usize = 8 * 1024;
@@ -183,6 +183,30 @@ impl Hub {
         }
     }
 
+    /// 把待处理的好友申请推给某个在线用户的所有连接。
+    async fn push_friend_requests(&self, user: UserId) {
+        let Ok(users) = self.accounts.friend_requests(user).await else {
+            return;
+        };
+        let targets: Vec<ConnId> = self
+            .conns
+            .read()
+            .await
+            .iter()
+            .filter(|(_, conn)| conn.user.as_ref().is_some_and(|known| known.id == user))
+            .map(|(id, _)| *id)
+            .collect();
+        for conn in targets {
+            self.send_to(
+                conn,
+                ServerEvent::FriendRequests {
+                    users: users.clone(),
+                },
+            )
+            .await;
+        }
+    }
+
     async fn joined(&self, conn: ConnId, room: RoomId) -> bool {
         self.conns
             .read()
@@ -247,6 +271,7 @@ impl Hub {
         )
         .await;
         self.send_rooms(conn, user.id).await;
+        self.push_friend_requests(user.id).await;
         self.send_friends_presence(conn, user.id).await;
         self.broadcast_friend_presence(user.id, true).await;
         self.broadcast_presence(self.default_room).await;
@@ -622,20 +647,58 @@ impl Hub {
                 let Some(user) = self.user_of(conn).await else {
                     return self.send_to(conn, ServerEvent::AuthRequired).await;
                 };
-                match self.accounts.add_friend(user.id, &username).await {
-                    Ok(users) => {
-                        let friend = users
-                            .iter()
-                            .find(|known| known.username == username.trim().to_ascii_lowercase())
-                            .cloned();
-                        self.send_to(conn, ServerEvent::Friends { users }).await;
-                        // 双方都更新，不必等对方重新登录
-                        if let Some(friend) = friend {
-                            self.push_friends(friend.id).await;
+                let target = self
+                    .accounts
+                    .find_user(username.trim().to_ascii_lowercase().as_str())
+                    .await
+                    .ok()
+                    .flatten();
+                match self.accounts.request_friend(user.id, &username).await {
+                    Ok(FriendRequest::Pending) => {
+                        // 对方在线就立刻看到新的申请
+                        if let Some(target) = target {
+                            self.push_friend_requests(target.id).await;
+                        }
+                        self.send_friends(conn, user.id).await;
+                    }
+                    Ok(FriendRequest::Accepted) => {
+                        // 互相申请过：直接成为好友，双方列表都要刷新
+                        self.push_friends(user.id).await;
+                        self.push_friend_requests(user.id).await;
+                        if let Some(target) = target {
+                            self.push_friends(target.id).await;
+                            self.push_friend_requests(target.id).await;
                         }
                         self.send_friends_presence(conn, user.id).await;
                         self.broadcast_friend_presence(user.id, true).await;
                     }
+                    Err(e) => self.account_error(conn, e).await,
+                }
+            }
+
+            ClientRequest::AcceptFriend { user: from } => {
+                let Some(user) = self.user_of(conn).await else {
+                    return self.send_to(conn, ServerEvent::AuthRequired).await;
+                };
+                match self.accounts.accept_friend(user.id, from).await {
+                    Ok(users) => {
+                        self.send_to(conn, ServerEvent::Friends { users }).await;
+                        self.push_friends(from).await;
+                        self.push_friend_requests(user.id).await;
+                        self.push_friend_requests(from).await;
+                        self.send_friends_presence(conn, user.id).await;
+                        self.broadcast_friend_presence(user.id, true).await;
+                    }
+                    Err(e) => self.account_error(conn, e).await,
+                }
+            }
+
+            ClientRequest::RejectFriend { user: from } => {
+                let Some(user) = self.user_of(conn).await else {
+                    return self.send_to(conn, ServerEvent::AuthRequired).await;
+                };
+                match self.accounts.reject_friend(user.id, from).await {
+                    Ok(()) => self.push_friend_requests(user.id).await,
                     Err(e) => self.account_error(conn, e).await,
                 }
             }

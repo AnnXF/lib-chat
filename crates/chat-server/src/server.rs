@@ -259,6 +259,8 @@ impl Server {
             | ClientRequest::Logout
             | ClientRequest::ListFriends
             | ClientRequest::AddFriend { .. }
+            | ClientRequest::AcceptFriend { .. }
+            | ClientRequest::RejectFriend { .. }
             | ClientRequest::RemoveFriend { .. }
             | ClientRequest::SearchUsers { .. }
             | ClientRequest::SearchMessages { .. }

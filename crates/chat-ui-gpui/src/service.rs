@@ -264,6 +264,10 @@ pub enum UiEvent {
     Friends {
         users: Vec<UserSummary>,
     },
+    /// 别人发给我、还没处理的好友申请。
+    FriendRequests {
+        users: Vec<UserSummary>,
+    },
     /// 用户搜索结果。
     UserSearch {
         users: Vec<UserSummary>,
@@ -370,6 +374,14 @@ pub enum UiCommand {
     },
     /// 用上次落盘的令牌恢复登录；令牌留在服务层，界面不接触。
     Resume,
+    /// 同意一条收到的好友申请。
+    AcceptFriend {
+        user: UserId,
+    },
+    /// 拒绝一条收到的好友申请。
+    RejectFriend {
+        user: UserId,
+    },
     /// 切换到会话列表里的某个房间。
     OpenRoom {
         room: RoomId,
@@ -1119,6 +1131,8 @@ async fn run(
             }
             UiCommand::RefreshRooms
             | UiCommand::AddFriend { .. }
+            | UiCommand::AcceptFriend { .. }
+            | UiCommand::RejectFriend { .. }
             | UiCommand::OpenDirect { .. }
             | UiCommand::CreateGroup { .. } => {
                 let Some(current) = &account else {
@@ -1135,6 +1149,8 @@ async fn run(
                 let sent = match cmd {
                     UiCommand::RefreshRooms => client.list_rooms().await,
                     UiCommand::AddFriend { username } => client.add_friend(username).await,
+                    UiCommand::AcceptFriend { user } => client.accept_friend(user).await,
+                    UiCommand::RejectFriend { user } => client.reject_friend(user).await,
                     UiCommand::OpenDirect { user } => client.open_direct(user).await,
                     UiCommand::CreateGroup { name, members } => {
                         client.create_group(name, members).await
@@ -1153,6 +1169,10 @@ async fn run(
                         }
                         Ok(ServerEvent::Friends { users }) => {
                             let _ = events.send_async(UiEvent::Friends { users }).await;
+                            break;
+                        }
+                        Ok(ServerEvent::FriendRequests { users }) => {
+                            let _ = events.send_async(UiEvent::FriendRequests { users }).await;
                             break;
                         }
                         Ok(ServerEvent::Error { message, .. }) => {

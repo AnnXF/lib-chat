@@ -1041,3 +1041,26 @@ fn saved_login_offers_a_resume_entry_on_the_login_page() {
     assert!(f32::from(resume.size.height) > 0., "恢复入口应有高度");
     assert_inside(&bounds(cx, "login-page"), "login-page");
 }
+
+/// 通讯录里的好友申请：有申请时列出条目与「接受/拒绝」，布局不溢出。
+#[test]
+fn friend_requests_are_listed_inside_the_contacts_sidebar() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| {
+            app.debug_nav(NavTab::Contacts, cx);
+            app.debug_apply(UiEvent::FriendRequests {
+                users: vec![chat_core::UserSummary {
+                    id: chat_core::UserId::new(),
+                    username: "bob".into(),
+                    display_name: "一个很长很长的显示名用来撑宽度".into(),
+                }],
+            });
+        });
+    });
+    cx.run_until_parked();
+
+    assert_inside(&bounds(cx, "friend-requests"), "friend-requests");
+    assert_inside(&bounds(cx, "contacts-body"), "contacts-body");
+}

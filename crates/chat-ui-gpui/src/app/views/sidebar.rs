@@ -148,6 +148,44 @@ impl ChatApp {
                 friend_item(index, user, checked, is_online, cx)
             })
             .collect();
+        let request_rows: Vec<_> = self
+            .friend_requests
+            .iter()
+            .enumerate()
+            .map(|(index, user)| {
+                let user_id = user.id;
+                let label = format!("{} ({})", user.display_name, user.username);
+                div()
+                    .id(("friend-request", index))
+                    .min_h(px(40.))
+                    .px_3()
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_sm()
+                            .child(label),
+                    )
+                    .child(button(
+                        "接受",
+                        true,
+                        false,
+                        cx.listener(move |this, _, _, cx| this.on_accept_friend(user_id, cx)),
+                    ))
+                    .child(button(
+                        "拒绝",
+                        false,
+                        false,
+                        cx.listener(move |this, _, _, cx| this.on_reject_friend(user_id, cx)),
+                    ))
+                    .into_any_element()
+            })
+            .collect();
         let search_rows: Vec<_> = self
             .search_results
             .iter()
@@ -213,6 +251,17 @@ impl ChatApp {
                         true,
                         cx.listener(Self::on_add_friend),
                     )))
+                    .child(
+                        div()
+                            .id("friend-requests")
+                            .test_id("friend-requests")
+                            .flex()
+                            .flex_col()
+                            .when(request_rows.is_empty(), |this| {
+                                this.child(hint("没有待处理的申请"))
+                            })
+                            .children(request_rows),
+                    )
                     .child(section_label("查找用户"))
                     .child(padded(self.user_search.clone()))
                     .child(padded(button(

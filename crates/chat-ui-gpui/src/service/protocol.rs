@@ -11,6 +11,7 @@ pub(super) fn map_event(event: ServerEvent) -> Option<UiEvent> {
         ServerEvent::Authenticated { user, token } => UiEvent::Authenticated { user, token },
         ServerEvent::AuthRequired => UiEvent::AuthRequired,
         ServerEvent::Friends { users } => UiEvent::Friends { users },
+        ServerEvent::FriendRequests { users } => UiEvent::FriendRequests { users },
         ServerEvent::UserSearch { users } => UiEvent::UserSearch { users },
         ServerEvent::SearchResults { room, messages } => UiEvent::SearchResults {
             room,

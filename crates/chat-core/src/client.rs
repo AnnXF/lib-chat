@@ -75,6 +75,18 @@ impl Client {
             .await
     }
 
+    pub async fn accept_friend(&self, user: UserId) -> Result<()> {
+        self.conn
+            .request(ClientRequest::AcceptFriend { user })
+            .await
+    }
+
+    pub async fn reject_friend(&self, user: UserId) -> Result<()> {
+        self.conn
+            .request(ClientRequest::RejectFriend { user })
+            .await
+    }
+
     pub async fn remove_friend(&self, user: UserId) -> Result<()> {
         self.conn
             .request(ClientRequest::RemoveFriend { user })

@@ -434,6 +434,13 @@ impl ChatApp {
                     self.show_search = true;
                 }
             }
+            UiEvent::FriendRequests { users } => {
+                if !users.is_empty() {
+                    self.status = format!("有 {} 条新的好友申请", users.len());
+                    self.status_kind = super::StatusKind::Info;
+                }
+                self.friend_requests = users;
+            }
             UiEvent::FriendPresence { user, online } => {
                 if online {
                     self.online_friends.insert(user);

@@ -45,6 +45,14 @@ mod friends {
     pub const CREATED_AT: &str = "created_at";
 }
 
+/// 待处理的好友申请：`from_id` 申请加 `to_id`。
+mod friend_requests {
+    pub const TABLE: &str = "friend_requests";
+    pub const FROM_ID: &str = "from_id";
+    pub const TO_ID: &str = "to_id";
+    pub const CREATED_AT: &str = "created_at";
+}
+
 mod rooms {
     pub const TABLE: &str = "rooms";
     pub const ID: &str = "id";
@@ -70,6 +78,15 @@ mod read_markers {
     pub const ROOM_ID: &str = "room_id";
     pub const SEQ: &str = "seq";
     pub const UPDATED_AT: &str = "updated_at";
+}
+
+/// 发起好友申请的结果。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FriendRequest {
+    /// 已发出，等对方处理。
+    Pending,
+    /// 对方之前也申请过，双方直接成为好友。
+    Accepted,
 }
 
 /// 账号层的错误，交给 Hub 映射成协议错误码。
@@ -290,11 +307,12 @@ impl Accounts {
         Ok(token)
     }
 
-    pub async fn add_friend(
+    /// 发起好友申请。
+    pub async fn request_friend(
         &self,
         user: UserId,
         username: &str,
-    ) -> std::result::Result<Vec<UserSummary>, AccountError> {
+    ) -> std::result::Result<FriendRequest, AccountError> {
         let username = username.trim();
         let (sql, values) = Query::select()
             .column(users::ID)
@@ -312,13 +330,121 @@ impl Accounts {
         if friend == user {
             return Err(AccountError::Invalid("不能添加自己为好友".into()));
         }
+        if self.are_friends(user, friend).await? {
+            return Err(AccountError::Invalid("你们已经是好友".into()));
+        }
 
+        // 对方也申请过我：不必再等，直接成为好友
+        if self.has_request(friend, user).await? {
+            self.link(user, friend).await?;
+            self.drop_request(user, friend).await?;
+            self.drop_request(friend, user).await?;
+            return Ok(FriendRequest::Accepted);
+        }
+
+        let (sql, values) = Query::insert()
+            .into_table(friend_requests::TABLE)
+            .columns([
+                friend_requests::FROM_ID,
+                friend_requests::TO_ID,
+                friend_requests::CREATED_AT,
+            ])
+            .values_panic([
+                user.to_string().into(),
+                friend.to_string().into(),
+                now_secs().into(),
+            ])
+            .on_conflict(
+                sea_query::OnConflict::columns([friend_requests::FROM_ID, friend_requests::TO_ID])
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .build(SqliteQueryBuilder);
+        bind(sqlx::query(&sql), values).execute(&self.pool).await?;
+        Ok(FriendRequest::Pending)
+    }
+
+    /// 别人发给我、还没处理的申请，最近的在最前。
+    pub async fn friend_requests(
+        &self,
+        user: UserId,
+    ) -> std::result::Result<Vec<UserSummary>, AccountError> {
+        let (sql, values) = Query::select()
+            .columns([
+                (users::TABLE, users::ID),
+                (users::TABLE, users::USERNAME),
+                (users::TABLE, users::DISPLAY_NAME),
+            ])
+            .from(friend_requests::TABLE)
+            .inner_join(
+                users::TABLE,
+                Expr::col((users::TABLE, users::ID)).eq(Expr::col((
+                    friend_requests::TABLE,
+                    friend_requests::FROM_ID,
+                ))),
+            )
+            .and_where(
+                Expr::col((friend_requests::TABLE, friend_requests::TO_ID)).eq(user.to_string()),
+            )
+            .order_by(
+                (friend_requests::TABLE, friend_requests::CREATED_AT),
+                sea_query::Order::Desc,
+            )
+            .build(SqliteQueryBuilder);
+        let rows = bind(sqlx::query(&sql), values)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(row_to_user).collect()
+    }
+
+    /// 同意一条申请，返回我这边最新的好友列表。
+    pub async fn accept_friend(
+        &self,
+        user: UserId,
+        from: UserId,
+    ) -> std::result::Result<Vec<UserSummary>, AccountError> {
+        if !self.has_request(from, user).await? {
+            return Err(AccountError::Invalid("这条好友申请已经处理过了".into()));
+        }
+        self.link(user, from).await?;
+        self.drop_request(from, user).await?;
+        self.drop_request(user, from).await?;
+        self.friends(user).await
+    }
+
+    pub async fn reject_friend(
+        &self,
+        user: UserId,
+        from: UserId,
+    ) -> std::result::Result<(), AccountError> {
+        self.drop_request(from, user).await
+    }
+
+    async fn has_request(
+        &self,
+        from: UserId,
+        to: UserId,
+    ) -> std::result::Result<bool, AccountError> {
+        let (sql, values) = Query::select()
+            .column(friend_requests::FROM_ID)
+            .from(friend_requests::TABLE)
+            .and_where(Expr::col(friend_requests::FROM_ID).eq(from.to_string()))
+            .and_where(Expr::col(friend_requests::TO_ID).eq(to.to_string()))
+            .build(SqliteQueryBuilder);
+        Ok(bind(sqlx::query(&sql), values)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some())
+    }
+
+    /// 建立双向好友关系。
+    async fn link(&self, a: UserId, b: UserId) -> std::result::Result<(), AccountError> {
         let now = now_secs();
-        for (a, b) in [(user, friend), (friend, user)] {
+        for (x, y) in [(a, b), (b, a)] {
             let (sql, values) = Query::insert()
                 .into_table(friends::TABLE)
                 .columns([friends::USER_ID, friends::FRIEND_ID, friends::CREATED_AT])
-                .values_panic([a.to_string().into(), b.to_string().into(), now.into()])
+                .values_panic([x.to_string().into(), y.to_string().into(), now.into()])
                 .on_conflict(
                     sea_query::OnConflict::columns([friends::USER_ID, friends::FRIEND_ID])
                         .do_nothing()
@@ -327,7 +453,21 @@ impl Accounts {
                 .build(SqliteQueryBuilder);
             bind(sqlx::query(&sql), values).execute(&self.pool).await?;
         }
-        self.friends(user).await
+        Ok(())
+    }
+
+    async fn drop_request(
+        &self,
+        from: UserId,
+        to: UserId,
+    ) -> std::result::Result<(), AccountError> {
+        let (sql, values) = Query::delete()
+            .from_table(friend_requests::TABLE)
+            .and_where(Expr::col(friend_requests::FROM_ID).eq(from.to_string()))
+            .and_where(Expr::col(friend_requests::TO_ID).eq(to.to_string()))
+            .build(SqliteQueryBuilder);
+        bind(sqlx::query(&sql), values).execute(&self.pool).await?;
+        Ok(())
     }
 
     pub async fn friends(
@@ -1173,11 +1313,38 @@ impl Accounts {
 }
 
 /// 库结构的演进顺序；只往后加，不改已经发出去的那几步。
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "账号、好友与会话",
-    schema: v1_schema,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "账号、好友与会话",
+        schema: v1_schema,
+    },
+    Migration {
+        version: 2,
+        name: "好友申请",
+        schema: v2_schema,
+    },
+];
+
+fn v2_schema() -> Vec<SchemaStatement> {
+    let requests = Table::create()
+        .table(friend_requests::TABLE)
+        .if_not_exists()
+        .col(ColumnDef::new(friend_requests::FROM_ID).text().not_null())
+        .col(ColumnDef::new(friend_requests::TO_ID).text().not_null())
+        .col(
+            ColumnDef::new(friend_requests::CREATED_AT)
+                .big_integer()
+                .not_null(),
+        )
+        .primary_key(
+            sea_query::Index::create()
+                .col(friend_requests::FROM_ID)
+                .col(friend_requests::TO_ID),
+        )
+        .to_owned();
+    vec![migrate::table(requests)]
+}
 
 fn v1_schema() -> Vec<SchemaStatement> {
     let users = Table::create()
@@ -1322,7 +1489,11 @@ mod tests {
         let (bob, _) = accounts.register("bob", "password123", "").await.unwrap();
         let (carol, _) = accounts.register("carol", "password123", "").await.unwrap();
 
-        accounts.add_friend(alice.id, "bob").await.unwrap();
+        assert_eq!(
+            accounts.request_friend(alice.id, "bob").await.unwrap(),
+            FriendRequest::Pending
+        );
+        accounts.accept_friend(bob.id, alice.id).await.unwrap();
         assert_eq!(accounts.friends(alice.id).await.unwrap().len(), 1);
         assert_eq!(accounts.friends(bob.id).await.unwrap().len(), 1);
 
@@ -1343,11 +1514,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn friend_requests_need_an_answer_and_mutual_ones_link_at_once() {
+        let (accounts, path) = accounts("requests").await;
+        let (alice, _) = accounts.register("alice", "password123", "").await.unwrap();
+        let (bob, _) = accounts.register("bob", "password123", "").await.unwrap();
+
+        assert_eq!(
+            accounts.request_friend(alice.id, "bob").await.unwrap(),
+            FriendRequest::Pending
+        );
+        // 还没同意，就不算好友
+        assert!(accounts.friends(alice.id).await.unwrap().is_empty());
+        assert_eq!(accounts.friend_requests(bob.id).await.unwrap().len(), 1);
+        assert!(accounts.friend_requests(alice.id).await.unwrap().is_empty());
+
+        accounts.accept_friend(bob.id, alice.id).await.unwrap();
+        assert_eq!(accounts.friends(alice.id).await.unwrap().len(), 1);
+        assert_eq!(accounts.friends(bob.id).await.unwrap().len(), 1);
+        assert!(accounts.friend_requests(bob.id).await.unwrap().is_empty());
+
+        // 同一条申请不能被处理两次
+        assert!(accounts.accept_friend(bob.id, alice.id).await.is_err());
+
+        // 双方都申请：直接成为好友，谁也不用再点
+        let (carol, _) = accounts.register("carol", "password123", "").await.unwrap();
+        accounts.request_friend(carol.id, "bob").await.unwrap();
+        assert_eq!(
+            accounts.request_friend(bob.id, "carol").await.unwrap(),
+            FriendRequest::Accepted
+        );
+        assert_eq!(accounts.friends(carol.id).await.unwrap().len(), 1);
+        assert!(accounts.friend_requests(bob.id).await.unwrap().is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn direct_rooms_are_reused() {
         let (accounts, path) = accounts("direct").await;
         let (alice, _) = accounts.register("alice", "password123", "").await.unwrap();
         let (bob, _) = accounts.register("bob", "password123", "").await.unwrap();
-        accounts.add_friend(alice.id, "bob").await.unwrap();
+        accounts.request_friend(alice.id, "bob").await.unwrap();
+        accounts.accept_friend(bob.id, alice.id).await.unwrap();
 
         let first = accounts.open_direct(alice.id, bob.id).await.unwrap();
         let second = accounts.open_direct(bob.id, alice.id).await.unwrap();

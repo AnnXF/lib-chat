@@ -188,9 +188,17 @@ pub enum ClientRequest {
 
     // ---------------------------------------------------------------- 好友
     ListFriends,
-    /// 按用户名添加好友；双方直接建立关系，MVP 不做申请审批。
+    /// 按用户名发起好友申请；对方如果也申请过自己，双方直接成为好友。
     AddFriend {
         username: String,
+    },
+    /// 同意一条收到的好友申请。
+    AcceptFriend {
+        user: UserId,
+    },
+    /// 拒绝一条收到的好友申请。
+    RejectFriend {
+        user: UserId,
     },
     /// 解除好友关系，双方列表同时移除。
     RemoveFriend {
@@ -304,6 +312,10 @@ pub enum ServerEvent {
     /// 当前连接还没有登录，除注册/登录外的请求都会被拒绝。
     AuthRequired,
     Friends {
+        users: Vec<UserSummary>,
+    },
+    /// 别人发给我的、还没处理的好友申请。
+    FriendRequests {
         users: Vec<UserSummary>,
     },
     /// 用户搜索结果。

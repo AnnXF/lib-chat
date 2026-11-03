@@ -130,6 +130,8 @@ pub struct ChatApp {
     /// 我的会话列表（群聊 + 单聊）。
     conversations: Vec<chat_core::RoomSummary>,
     friends: Vec<chat_core::UserSummary>,
+    /// 别人发给我、还没处理的好友申请。
+    friend_requests: Vec<chat_core::UserSummary>,
     /// 微信式左侧导航：聊天 / 通讯录 / 房间。
     nav: NavTab,
     /// 会话与好友搜索。
@@ -383,6 +385,7 @@ impl ChatApp {
             account: None,
             conversations: Vec::new(),
             friends: Vec::new(),
+            friend_requests: Vec::new(),
             nav: NavTab::Chats,
             search,
         }

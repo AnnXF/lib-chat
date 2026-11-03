@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use chat_core::{Client, DeviceId, ErrorCode, RoomKind, ServerEvent, UserSummary};
+use chat_core::{Client, DeviceId, ErrorCode, RoomKind, ServerEvent, UserId, UserSummary};
 use chat_server::Hub;
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -40,6 +40,17 @@ async fn register(hub: &std::sync::Arc<Hub>, name: &str) -> (Client, UserSummary
     }
 }
 
+/// 走完一次好友申请：requester 申请、target 同意。
+async fn be_friends(
+    requester: &Client,
+    requester_id: UserId,
+    target: &Client,
+    target_username: &str,
+) {
+    requester.add_friend(target_username).await.unwrap();
+    target.accept_friend(requester_id).await.unwrap();
+}
+
 async fn rooms(client: &Client) -> Vec<chat_core::RoomSummary> {
     client.list_rooms().await.unwrap();
     match wait_for(client, |event| matches!(event, ServerEvent::Rooms { .. })).await {
@@ -56,8 +67,13 @@ async fn accounts_friends_direct_chat_and_messages() {
     let (alice, alice_user) = register(&hub, "alice").await;
     let (bob, bob_user) = register(&hub, "bob").await;
 
-    alice.add_friend("bob").await.unwrap();
-    match wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await {
+    be_friends(&alice, alice_user.id, &bob, "bob").await;
+    match wait_for(
+        &alice,
+        |event| matches!(event, ServerEvent::Friends { users } if !users.is_empty()),
+    )
+    .await
+    {
         ServerEvent::Friends { users } => {
             assert_eq!(
                 users.iter().map(|u| &u.username).collect::<Vec<_>>(),
@@ -141,8 +157,8 @@ async fn lagging_client_is_told_to_resync_instead_of_silently_losing_events() {
     let hub = Hub::open(&dir, "大厅").await.unwrap();
     let room = hub.default_room();
 
-    let (alice, _) = register(&hub, "alice").await;
-    let (bob, _) = register(&hub, "bob").await;
+    let (alice, _alice_user) = register(&hub, "alice").await;
+    let (bob, _bob_user) = register(&hub, "bob").await;
     alice.join(room, "alice").await.unwrap();
     wait_for(&alice, |event| matches!(event, ServerEvent::Joined { .. })).await;
     bob.join(room, "bob").await.unwrap();
@@ -173,10 +189,10 @@ async fn groups_only_include_friends_and_reject_outsiders() {
     let dir = temp_dir("group");
     let hub = Hub::open(&dir, "大厅").await.unwrap();
 
-    let (alice, _) = register(&hub, "alice").await;
+    let (alice, alice_user) = register(&hub, "alice").await;
     let (bob, bob_user) = register(&hub, "bob").await;
     let (carol, _) = register(&hub, "carol").await;
-    alice.add_friend("bob").await.unwrap();
+    be_friends(&alice, alice_user.id, &bob, "bob").await;
     wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
 
     alice
@@ -252,43 +268,66 @@ async fn room_members_are_visible_to_members() {
 }
 
 #[tokio::test]
-async fn adding_a_friend_notifies_both_online_sides() {
+async fn a_friend_request_reaches_the_target_and_acceptance_refreshes_both_sides() {
     let dir = temp_dir("friend-notify");
     let hub = Hub::open(&dir, "大厅").await.unwrap();
-    let (alice, _) = register(&hub, "alice").await;
-    let (bob, _) = register(&hub, "bob").await;
+    let (alice, alice_user) = register(&hub, "alice").await;
+    let (bob, bob_user) = register(&hub, "bob").await;
 
     alice.add_friend("bob").await.unwrap();
-    match wait_for(&alice, |event| {
-        matches!(event, ServerEvent::Friends { users }
-            if users.iter().any(|user| user.username == "bob"))
-    })
-    .await
-    {
-        ServerEvent::Friends { .. } => {}
-        _ => unreachable!(),
-    }
-
-    // 被添加的一方在线时也该立刻刷新，不必重新登录
+    // 被申请的一方在线时立刻看到待处理申请，不必重新登录
     match wait_for(&bob, |event| {
-        matches!(event, ServerEvent::Friends { users }
+        matches!(event, ServerEvent::FriendRequests { users }
             if users.iter().any(|user| user.username == "alice"))
     })
     .await
     {
-        ServerEvent::Friends { .. } => {}
+        ServerEvent::FriendRequests { .. } => {}
         _ => unreachable!(),
     }
+    // 申请方此时还不是好友
+    match wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await {
+        ServerEvent::Friends { users } => assert!(users.is_empty()),
+        _ => unreachable!(),
+    }
+
+    bob.accept_friend(alice_user.id).await.unwrap();
+    for client in [&alice, &bob] {
+        let peer = if std::ptr::eq(client, &alice) {
+            "bob"
+        } else {
+            "alice"
+        };
+        match wait_for(client, |event| {
+            matches!(event, ServerEvent::Friends { users }
+                if users.iter().any(|user| user.username == peer))
+        })
+        .await
+        {
+            ServerEvent::Friends { .. } => {}
+            _ => unreachable!(),
+        }
+    }
+    // 处理完之后申请列表清空
+    match wait_for(&bob, |event| {
+        matches!(event, ServerEvent::FriendRequests { .. })
+    })
+    .await
+    {
+        ServerEvent::FriendRequests { users } => assert!(users.is_empty()),
+        _ => unreachable!(),
+    }
+    let _ = bob_user;
 }
 
 #[tokio::test]
 async fn group_and_direct_creation_push_rooms_to_members() {
     let dir = temp_dir("rooms-push");
     let hub = Hub::open(&dir, "大厅").await.unwrap();
-    let (alice, _) = register(&hub, "alice").await;
+    let (alice, alice_user) = register(&hub, "alice").await;
     let (bob, bob_user) = register(&hub, "bob").await;
 
-    alice.add_friend("bob").await.unwrap();
+    be_friends(&alice, alice_user.id, &bob, "bob").await;
     wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
     wait_for(&bob, |event| matches!(event, ServerEvent::Friends { .. })).await;
 
@@ -325,9 +364,9 @@ async fn owner_can_remove_member_and_dissolve_group() {
     let (bob, bob_user) = register(&hub, "bob").await;
     let (carol, carol_user) = register(&hub, "carol").await;
 
-    alice.add_friend("bob").await.unwrap();
+    be_friends(&alice, alice_user.id, &bob, "bob").await;
     wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
-    alice.add_friend("carol").await.unwrap();
+    be_friends(&alice, alice_user.id, &carol, "carol").await;
     wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
 
     alice
@@ -393,7 +432,7 @@ async fn owner_can_remove_member_and_dissolve_group() {
 async fn search_remove_friend_and_presence() {
     let dir = temp_dir("friend-search-remove");
     let hub = Hub::open(&dir, "大厅").await.unwrap();
-    let (alice, _) = register(&hub, "alice").await;
+    let (alice, alice_user) = register(&hub, "alice").await;
     let (bob, bob_user) = register(&hub, "bob").await;
 
     alice.search_users("bo").await.unwrap();
@@ -408,7 +447,7 @@ async fn search_remove_friend_and_presence() {
         _ => unreachable!(),
     }
 
-    alice.add_friend("bob").await.unwrap();
+    be_friends(&alice, alice_user.id, &bob, "bob").await;
     wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
     wait_for(&bob, |event| matches!(event, ServerEvent::Friends { .. })).await;
     // 双方都能看到对方在线
@@ -426,7 +465,7 @@ async fn search_remove_friend_and_presence() {
     }
 
     // 重新加好友，bob 退出后 alice 应收到离线
-    alice.add_friend("bob").await.unwrap();
+    be_friends(&alice, alice_user.id, &bob, "bob").await;
     wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
     wait_for(&bob, |event| matches!(event, ServerEvent::Friends { .. })).await;
     bob.logout().await.unwrap();
@@ -440,10 +479,10 @@ async fn search_remove_friend_and_presence() {
 async fn searches_messages_in_room() {
     let dir = temp_dir("message-search");
     let hub = Hub::open(&dir, "大厅").await.unwrap();
-    let (alice, _) = register(&hub, "alice").await;
+    let (alice, alice_user) = register(&hub, "alice").await;
     let (bob, bob_user) = register(&hub, "bob").await;
 
-    alice.add_friend("bob").await.unwrap();
+    be_friends(&alice, alice_user.id, &bob, "bob").await;
     wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
     wait_for(&bob, |event| matches!(event, ServerEvent::Friends { .. })).await;
     alice.open_direct(bob_user.id).await.unwrap();
@@ -529,10 +568,10 @@ async fn searches_messages_in_room() {
 async fn messages_push_room_summaries_to_members_not_in_the_room() {
     let dir = temp_dir("rooms-unread");
     let hub = Hub::open(&dir, "大厅").await.unwrap();
-    let (alice, _) = register(&hub, "alice").await;
+    let (alice, alice_user) = register(&hub, "alice").await;
     let (bob, bob_user) = register(&hub, "bob").await;
 
-    alice.add_friend("bob").await.unwrap();
+    be_friends(&alice, alice_user.id, &bob, "bob").await;
     wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
     wait_for(&bob, |event| matches!(event, ServerEvent::Friends { .. })).await;
     alice.open_direct(bob_user.id).await.unwrap();
@@ -571,10 +610,10 @@ async fn messages_push_room_summaries_to_members_not_in_the_room() {
 async fn mark_read_persists_in_room_summary() {
     let dir = temp_dir("mark-read");
     let hub = Hub::open(&dir, "大厅").await.unwrap();
-    let (alice, _) = register(&hub, "alice").await;
+    let (alice, alice_user) = register(&hub, "alice").await;
     let (bob, bob_user) = register(&hub, "bob").await;
 
-    alice.add_friend("bob").await.unwrap();
+    be_friends(&alice, alice_user.id, &bob, "bob").await;
     wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
     wait_for(&bob, |event| matches!(event, ServerEvent::Friends { .. })).await;
     alice.open_direct(bob_user.id).await.unwrap();

@@ -618,6 +618,16 @@ impl ChatApp {
         self.perform_login(false, cx);
     }
 
+    /// 同意一条收到的好友申请。
+    pub(crate) fn on_accept_friend(&mut self, user: UserId, cx: &mut Context<Self>) {
+        self.tell(crate::service::UiCommand::AcceptFriend { user }, cx);
+    }
+
+    /// 拒绝一条收到的好友申请。
+    pub(crate) fn on_reject_friend(&mut self, user: UserId, cx: &mut Context<Self>) {
+        self.tell(crate::service::UiCommand::RejectFriend { user }, cx);
+    }
+
     /// 用本机保存的令牌恢复登录。
     pub(crate) fn on_resume_login(
         &mut self,
@@ -676,7 +686,7 @@ impl ChatApp {
         if username.is_empty() {
             return;
         }
-        self.status = format!("正在添加好友 {username}…");
+        self.status = format!("已向 {username} 发送好友申请…");
         self.status_kind = super::StatusKind::Info;
         self.tell(UiCommand::AddFriend { username }, cx);
         self.friend_input
@@ -702,7 +712,7 @@ impl ChatApp {
     }
 
     pub(crate) fn on_add_search_user(&mut self, username: String, cx: &mut Context<Self>) {
-        self.status = format!("正在添加好友 {username}…");
+        self.status = format!("已向 {username} 发送好友申请…");
         self.status_kind = super::StatusKind::Info;
         self.search_results.clear();
         self.tell(UiCommand::AddFriend { username }, cx);
