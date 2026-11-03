@@ -1410,16 +1410,19 @@ const MIGRATIONS: &[Migration] = &[
         version: 1,
         name: "账号、好友与会话",
         schema: v1_schema,
+        raw: &[],
     },
     Migration {
         version: 2,
         name: "好友申请",
         schema: v2_schema,
+        raw: &[],
     },
     Migration {
         version: 3,
         name: "操作审计",
         schema: v3_schema,
+        raw: &[],
     },
 ];
 

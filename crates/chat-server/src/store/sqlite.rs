@@ -74,6 +74,34 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
+    /// 少于三个字符的查询：trigram 索引用不上，只能逐条比对。
+    async fn search_substring(
+        &self,
+        room: RoomId,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
+        let (sql, values) = Query::select()
+            .columns(MESSAGE_COLUMNS)
+            .from(messages::TABLE)
+            .and_where(Expr::col(messages::ROOM_ID).eq(room.to_string()))
+            .and_where(Expr::col(messages::BODY).like(&pattern))
+            .order_by(messages::SEQ, Order::Desc)
+            .limit(limit as u64)
+            .build(SqliteQueryBuilder);
+        let rows = bind(sqlx::query(&sql), values)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+        let mut messages = rows
+            .iter()
+            .map(|row| row_to_message(room, row))
+            .collect::<Result<Vec<_>>>()?;
+        messages.reverse();
+        Ok(messages)
+    }
+
     /// 打开（或新建）库文件，并把房间标识固定下来：库里已有就复用，没有才生成。
     pub async fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -252,6 +280,7 @@ impl MessageStore for SqliteStore {
                 .execute(&mut *transaction)
                 .await
                 .map_err(db_err)?;
+            index_written_body(&mut transaction, &stored.text).await?;
             Ok(AppendResult {
                 message: stored,
                 inserted: true,
@@ -305,16 +334,25 @@ impl MessageStore for SqliteStore {
     }
 
     async fn search(&self, room: RoomId, query: &str, limit: usize) -> Result<Vec<Message>> {
-        let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
-        let (sql, values) = Query::select()
-            .columns(MESSAGE_COLUMNS)
-            .from(messages::TABLE)
-            .and_where(Expr::col(messages::ROOM_ID).eq(room.to_string()))
-            .and_where(Expr::col(messages::BODY).like(&pattern))
-            .order_by(messages::SEQ, Order::Desc)
-            .limit(limit as u64)
-            .build(SqliteQueryBuilder);
-        let rows = bind(sqlx::query(&sql), values)
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        // trigram 分词至少要三个字符才建得出索引项，短查询退回逐字匹配
+        if query.chars().count() < 3 {
+            return self.search_substring(room, query, limit).await;
+        }
+        // FTS5 的 MATCH 语法无法用 sea-query 构造，这里直接写 SQL
+        let sql = format!(
+            "SELECT {} FROM messages WHERE room_id = ? AND rowid IN \
+             (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?) \
+             ORDER BY seq DESC LIMIT ?",
+            MESSAGE_COLUMNS.join(", ")
+        );
+        let rows = sqlx::query(&sql)
+            .bind(room.to_string())
+            .bind(phrase(query))
+            .bind(limit as i64)
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
@@ -349,6 +387,9 @@ impl MessageStore for SqliteStore {
             .execute(&self.pool)
             .await
             .map_err(db_err)?;
+        if result.rows_affected() > 0 {
+            drop_indexed_body(&self.pool, room, seq).await?;
+        }
         Ok(result.rows_affected() > 0)
     }
 
@@ -361,7 +402,7 @@ impl MessageStore for SqliteStore {
     ) -> Result<Option<Message>> {
         let (sql, values) = Query::update()
             .table(messages::TABLE)
-            .value(messages::BODY, text)
+            .value(messages::BODY, text.clone())
             .and_where(Expr::col(messages::ROOM_ID).eq(room.to_string()))
             .and_where(Expr::col(messages::SEQ).eq(seq))
             .and_where(Expr::col(messages::SENDER).eq(sender.to_string()))
@@ -374,6 +415,16 @@ impl MessageStore for SqliteStore {
         if result.rows_affected() == 0 {
             return Ok(None);
         }
+        sqlx::query(
+            "UPDATE messages_fts SET body = ? WHERE rowid = \
+             (SELECT rowid FROM messages WHERE room_id = ? AND seq = ?)",
+        )
+        .bind(&text)
+        .bind(room.to_string())
+        .bind(seq)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
         let (sql, values) = Query::select()
             .columns(MESSAGE_COLUMNS)
             .from(messages::TABLE)
@@ -388,6 +439,15 @@ impl MessageStore for SqliteStore {
     }
 
     async fn clear(&self, room: RoomId) -> Result<u64> {
+        // 先清索引：消息行删掉之后就找不回 rowid 了
+        sqlx::query(
+            "DELETE FROM messages_fts WHERE rowid IN \
+             (SELECT rowid FROM messages WHERE room_id = ?)",
+        )
+        .bind(room.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
         let (sql, values) = Query::delete()
             .from_table(messages::TABLE)
             .and_where(Expr::col(messages::ROOM_ID).eq(room.to_string()))
@@ -535,11 +595,31 @@ fn bind<'a>(
 }
 
 /// 库结构的演进顺序；只往后加，不改已经发出去的那几步。
-const MIGRATIONS: &[super::migrate::Migration] = &[super::migrate::Migration {
-    version: 1,
-    name: "消息与房间标识",
-    schema: v1_schema,
-}];
+const MIGRATIONS: &[super::migrate::Migration] = &[
+    super::migrate::Migration {
+        version: 1,
+        name: "消息与房间标识",
+        schema: v1_schema,
+        raw: &[],
+    },
+    super::migrate::Migration {
+        version: 2,
+        name: "全文搜索索引",
+        schema: empty_schema,
+        raw: &[
+            // FTS5 虚拟表与 trigram 分词无法用 sea-query 表达。
+            // trigram 让中文按三字窗口切分，`MATCH` 才能命中子串。
+            "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts \
+             USING fts5(body, tokenize='trigram')",
+            "INSERT INTO messages_fts(rowid, body) \
+             SELECT rowid, body FROM messages WHERE recalled_at IS NULL AND body != ''",
+        ],
+    },
+];
+
+fn empty_schema() -> Vec<SchemaStatement> {
+    Vec::new()
+}
 
 fn v1_schema() -> Vec<SchemaStatement> {
     let messages_table = Table::create()
@@ -591,6 +671,38 @@ fn v1_schema() -> Vec<SchemaStatement> {
         super::migrate::table(meta_table),
         super::migrate::index(index),
     ]
+}
+
+/// 把刚写入的消息正文放进全文索引；文件消息没有正文，跳过。
+async fn index_written_body(tx: &mut sqlx::SqliteConnection, text: &str) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    sqlx::query("INSERT INTO messages_fts(rowid, body) VALUES (last_insert_rowid(), ?)")
+        .bind(text)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+/// 撤回时把正文从索引里删掉。
+async fn drop_indexed_body(pool: &SqlitePool, room: RoomId, seq: Seq) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM messages_fts WHERE rowid = \
+         (SELECT rowid FROM messages WHERE room_id = ? AND seq = ?)",
+    )
+    .bind(room.to_string())
+    .bind(seq)
+    .execute(pool)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// 把用户输入包成一个 FTS5 短语，避免其中的符号被当成查询语法。
+fn phrase(query: &str) -> String {
+    format!("\"{}\"", query.replace('"', "\"\""))
 }
 
 #[cfg(test)]
@@ -731,5 +843,92 @@ mod tests {
 
     fn texts(messages: &[Message]) -> Vec<&str> {
         messages.iter().map(|m| m.text.as_str()).collect()
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use chat_core::{MessageStore, NewMessage, RoomId, UserId};
+    use uuid::Uuid;
+
+    use super::SqliteStore;
+
+    fn path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("libchat-fts-{tag}-{}.db", std::process::id()))
+    }
+
+    fn message(text: &str) -> NewMessage {
+        NewMessage {
+            client_msg_id: Uuid::new_v4(),
+            sender: UserId::new(),
+            sender_name: "alice".into(),
+            kind: chat_core::MessageKind::Text,
+            text: text.to_string(),
+            attachment: None,
+            quote: None,
+        }
+    }
+
+    /// 中文按 trigram 建索引：任意三字以上的子串都能命中。
+    #[tokio::test]
+    async fn searches_chinese_by_substring_through_the_full_text_index() {
+        let path = path("zh");
+        let _ = std::fs::remove_file(&path);
+        let store = SqliteStore::open(&path).await.unwrap();
+        let room = store.room();
+
+        store
+            .append(room, message("今天的部署流程有问题"))
+            .await
+            .unwrap();
+        store.append(room, message("午饭吃什么")).await.unwrap();
+        store.append(room, message("部署完了再吃饭")).await.unwrap();
+
+        let hits = store.search(room, "部署", 10).await.unwrap();
+        assert_eq!(hits.len(), 2, "两个字走逐字匹配");
+        let hits = store.search(room, "部署流程", 10).await.unwrap();
+        assert_eq!(hits.len(), 1, "四个字走全文索引");
+        assert_eq!(hits[0].text, "今天的部署流程有问题");
+        // 结果按时间正序
+        let hits = store.search(room, "吃饭", 10).await.unwrap();
+        assert_eq!(hits.last().unwrap().text, "部署完了再吃饭");
+
+        store.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 撤回与编辑都要同步索引，否则会搜到已经不存在的内容。
+    #[tokio::test]
+    async fn recalled_and_edited_text_leave_the_index_in_sync() {
+        let path = path("sync");
+        let _ = std::fs::remove_file(&path);
+        let store = SqliteStore::open(&path).await.unwrap();
+        let room: RoomId = store.room();
+
+        let first = store
+            .append(room, message("要撤回的敏感内容"))
+            .await
+            .unwrap();
+        let second = store.append(room, message("要改写的旧内容")).await.unwrap();
+
+        store
+            .recall(room, first.message.seq, first.message.sender)
+            .await
+            .unwrap();
+        assert!(
+            store.search(room, "敏感内容", 10).await.unwrap().is_empty(),
+            "撤回后不该再搜到"
+        );
+
+        let sender = second.message.sender;
+        store
+            .edit(room, second.message.seq, sender, "改写后的新内容".into())
+            .await
+            .unwrap();
+        assert!(store.search(room, "旧内容", 10).await.unwrap().is_empty());
+        assert_eq!(store.search(room, "改写后", 10).await.unwrap().len(), 1);
+
+        store.close().await;
+        let _ = std::fs::remove_file(&path);
     }
 }

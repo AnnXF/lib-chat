@@ -27,6 +27,8 @@ pub struct Migration {
     pub version: i64,
     pub name: &'static str,
     pub schema: fn() -> Vec<SchemaStatement>,
+    /// sea-query 表达不了的语句：FTS5 虚拟表、回填与其它扩展语法。
+    pub raw: &'static [&'static str],
 }
 
 /// 把库升到最新版本；已经是最新就什么都不做。
@@ -40,6 +42,12 @@ pub async fn apply(pool: &SqlitePool, migrations: &[Migration]) -> Result<()> {
         let mut tx = pool.begin().await.map_err(storage)?;
         for statement in (migration.schema)() {
             sqlx::query(&build(&statement))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| ChatError::Storage(format!("迁移 {} 失败: {e}", migration.name)))?;
+        }
+        for statement in migration.raw {
+            sqlx::query(statement)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| ChatError::Storage(format!("迁移 {} 失败: {e}", migration.name)))?;
@@ -122,11 +130,13 @@ mod tests {
                 version: 1,
                 name: "第一步",
                 schema: v1,
+                raw: &[],
             },
             Migration {
                 version: 2,
                 name: "第二步",
                 schema: v2,
+                raw: &[],
             },
         ];
 
@@ -162,6 +172,7 @@ mod tests {
             version: 1,
             name: "会失败的一步",
             schema: broken,
+            raw: &[],
         }];
         // 同一张表建两次：第二句必然报错，整步回滚
         assert!(apply(&pool, &migrations).await.is_err());
