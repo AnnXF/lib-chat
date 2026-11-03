@@ -6,7 +6,7 @@ pub mod obs;
 mod server;
 mod store;
 
-pub use accounts::{AccountError, Accounts};
+pub use accounts::{AccountError, Accounts, AuditEntry};
 pub use hub::{Hub, HubAcceptor, HubConnection, HubHandle};
 pub use obs::Counters;
 pub use server::{Acceptor, ConnId, InProcConnection, Server, ServerHandle};

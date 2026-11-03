@@ -412,5 +412,7 @@ pub enum ErrorCode {
     TooLarge,
     /// 附件不存在或尚未上传完成。
     NotFound,
+    /// 发得太快，稍后再发。
+    RateLimited,
     Internal,
 }

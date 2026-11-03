@@ -24,9 +24,21 @@ pub fn connection_closed() {
     CONNECTIONS_CLOSED.fetch_add(1, Ordering::Relaxed);
 }
 
-/// 写入一条消息。
-pub fn message_appended() {
+/// 写入一条消息。逐条日志量太大，只有设了 `LIBCHAT_LOG` 才打。
+pub fn message_appended(room: &str, seq: i64, sender: &str) {
     MESSAGES_APPENDED.fetch_add(1, Ordering::Relaxed);
+    if std::env::var_os("LIBCHAT_LOG").is_none() {
+        return;
+    }
+    emit(
+        "info",
+        "message_appended",
+        &[
+            ("room", room.to_string()),
+            ("seq", seq.to_string()),
+            ("sender", sender.to_string()),
+        ],
+    );
 }
 
 /// 事件队列满，丢弃了一条推送。
@@ -117,7 +129,7 @@ mod tests {
         let before = Counters::snapshot();
         connection_opened();
         connection_closed();
-        message_appended();
+        message_appended("room", 1, "alice");
         event_dropped();
         let after = Counters::snapshot();
         assert_eq!(after.connections_opened, before.connections_opened + 1);

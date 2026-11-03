@@ -20,6 +20,41 @@ use crate::accounts::{AccountError, Accounts, FriendRequest};
 use crate::store::{BlobStore, DiskBlobs, SqliteStore};
 
 const MAX_TEXT_BYTES: usize = 8 * 1024;
+/// 每条连接的消息令牌桶：突发 100 条，之后每秒回 20 条。
+/// 人手打字远低于这个速度，批量粘贴或脚本刷屏会被挡住。
+const SEND_BURST: f64 = 100.0;
+const SEND_PER_SEC: f64 = 20.0;
+
+/// 令牌桶：按时间匀速回填，用完就拒绝。
+struct Bucket {
+    tokens: f64,
+    capacity: f64,
+    per_sec: f64,
+    last: std::time::Instant,
+}
+
+impl Bucket {
+    fn new(capacity: f64, per_sec: f64) -> Self {
+        Self {
+            tokens: capacity,
+            capacity,
+            per_sec,
+            last: std::time::Instant::now(),
+        }
+    }
+
+    fn try_take(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * self.per_sec).min(self.capacity);
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
 
 type ConnId = u64;
 
@@ -40,6 +75,8 @@ impl Outbox {
 
 struct Conn {
     outbox: Arc<Outbox>,
+    /// 发送限流；`Conn` 只被读引用，所以用内部可变。
+    bucket: std::sync::Mutex<Bucket>,
     user: Option<UserSummary>,
     /// 这条连接登录时拿到的令牌；登出要吊销的就是它。
     token: Option<String>,
@@ -57,10 +94,23 @@ pub struct Hub {
     conns: RwLock<HashMap<ConnId, Conn>>,
     publish: Mutex<()>,
     next_conn: AtomicU64,
+    /// 每条连接的消息限流参数；测试与压测用 [`Hub::open_with_limit`] 放宽。
+    send_capacity: f64,
+    send_per_sec: f64,
 }
 
 impl Hub {
     pub async fn open(data_dir: &Path, name: &str) -> std::result::Result<Arc<Self>, String> {
+        Self::open_with_limit(data_dir, name, SEND_BURST, SEND_PER_SEC).await
+    }
+
+    /// 指定发送限流参数；`capacity`/`per_sec` 取 [`f64::INFINITY`] 表示不限速。
+    pub async fn open_with_limit(
+        data_dir: &Path,
+        name: &str,
+        send_capacity: f64,
+        send_per_sec: f64,
+    ) -> std::result::Result<Arc<Self>, String> {
         std::fs::create_dir_all(data_dir).map_err(|e| format!("创建数据目录失败: {e}"))?;
         let accounts = Arc::new(
             Accounts::open(&data_dir.join("accounts.db"))
@@ -87,6 +137,8 @@ impl Hub {
             conns: RwLock::new(HashMap::new()),
             publish: Mutex::new(()),
             next_conn: AtomicU64::new(0),
+            send_capacity,
+            send_per_sec,
         }))
     }
 
@@ -123,6 +175,7 @@ impl Hub {
             id,
             Conn {
                 outbox,
+                bucket: std::sync::Mutex::new(Bucket::new(self.send_capacity, self.send_per_sec)),
                 user: None,
                 token: None,
                 display_name: None,
@@ -241,6 +294,19 @@ impl Hub {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
+    }
+
+    /// 取一个发送令牌；没有就由调用方回限流错误。
+    async fn allow_send(&self, conn: ConnId) -> bool {
+        let conns = self.conns.read().await;
+        let Some(state) = conns.get(&conn) else {
+            return false;
+        };
+        let mut bucket = state
+            .bucket
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        bucket.try_take()
     }
 
     async fn send_error(&self, conn: ConnId, code: ErrorCode, message: &str) {
@@ -963,6 +1029,13 @@ impl Hub {
                         if let Err(e) = self.accounts.remove_member(room, target).await {
                             return self.account_error(conn, e).await;
                         }
+                        self.accounts
+                            .record_audit(
+                                &user.username,
+                                "remove_member",
+                                &format!("房间 {room} 移出 {target}"),
+                            )
+                            .await;
                         self.push_rooms_to(target).await;
                         self.push_rooms_to(user.id).await;
                         let members = self
@@ -1004,6 +1077,9 @@ impl Hub {
                 if let Err(e) = self.accounts.dissolve_group(room).await {
                     return self.account_error(conn, e).await;
                 }
+                self.accounts
+                    .record_audit(&user.username, "dissolve_group", &format!("房间 {room}"))
+                    .await;
                 for member in members {
                     self.push_rooms_to(member.user.id).await;
                 }
@@ -1077,6 +1153,11 @@ impl Hub {
                 let Some(user) = self.user_of(conn).await else {
                     return self.send_to(conn, ServerEvent::AuthRequired).await;
                 };
+                if !self.allow_send(conn).await {
+                    return self
+                        .send_error(conn, ErrorCode::RateLimited, "发得太快了，稍等一下")
+                        .await;
+                }
                 if !self
                     .accounts
                     .is_member(room, user.id)
@@ -1114,14 +1195,10 @@ impl Hub {
                 match self.messages.append(room, msg).await {
                     Ok(result) => {
                         if result.inserted {
-                            crate::obs::message_appended();
-                            crate::obs::info(
-                                "message_appended",
-                                &[
-                                    ("room", room.to_string()),
-                                    ("seq", result.message.seq.to_string()),
-                                    ("sender", from.username.clone()),
-                                ],
+                            crate::obs::message_appended(
+                                &room.to_string(),
+                                result.message.seq,
+                                &from.username,
                             );
                             self.broadcast_room(
                                 room,
@@ -1208,7 +1285,11 @@ impl Hub {
                 };
                 match self.messages.append(room, msg).await {
                     Ok(result) if result.inserted => {
-                        crate::obs::message_appended();
+                        crate::obs::message_appended(
+                            &room.to_string(),
+                            result.message.seq,
+                            &user.username,
+                        );
                         self.broadcast_room(
                             room,
                             ServerEvent::Message {

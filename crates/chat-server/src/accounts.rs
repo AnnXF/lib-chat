@@ -47,6 +47,16 @@ mod friends {
     pub const CREATED_AT: &str = "created_at";
 }
 
+/// 管理动作留痕：谁对谁做了什么。
+mod audit_log {
+    pub const TABLE: &str = "audit_log";
+    pub const ID: &str = "id";
+    pub const ACTOR: &str = "actor";
+    pub const ACTION: &str = "action";
+    pub const DETAIL: &str = "detail";
+    pub const CREATED_AT: &str = "created_at";
+}
+
 /// 待处理的好友申请：`from_id` 申请加 `to_id`。
 mod friend_requests {
     pub const TABLE: &str = "friend_requests";
@@ -90,6 +100,15 @@ fn ensure_group_size(total: usize) -> std::result::Result<(), AccountError> {
         )));
     }
     Ok(())
+}
+
+/// 一条管理动作记录。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditEntry {
+    pub actor: String,
+    pub action: String,
+    pub detail: String,
+    pub at: i64,
 }
 
 /// 发起好友申请的结果。
@@ -163,6 +182,59 @@ impl Accounts {
         migrate::apply(&self.pool, MIGRATIONS)
             .await
             .map_err(|e| AccountError::Storage(e.to_string()))
+    }
+
+    /// 记一条管理动作。写失败不影响主流程，只打一条告警。
+    pub async fn record_audit(&self, actor: &str, action: &str, detail: &str) {
+        let (sql, values) = Query::insert()
+            .into_table(audit_log::TABLE)
+            .columns([
+                audit_log::ACTOR,
+                audit_log::ACTION,
+                audit_log::DETAIL,
+                audit_log::CREATED_AT,
+            ])
+            .values_panic([
+                actor.to_string().into(),
+                action.to_string().into(),
+                detail.to_string().into(),
+                now_secs().into(),
+            ])
+            .build(SqliteQueryBuilder);
+        if let Err(e) = bind(sqlx::query(&sql), values).execute(&self.pool).await {
+            crate::obs::warn("audit_write_failed", &[("detail", e.to_string())]);
+        }
+    }
+
+    /// 最近的管理动作，新的在前。
+    pub async fn audit_entries(
+        &self,
+        limit: usize,
+    ) -> std::result::Result<Vec<AuditEntry>, AccountError> {
+        let (sql, values) = Query::select()
+            .columns([
+                audit_log::ACTOR,
+                audit_log::ACTION,
+                audit_log::DETAIL,
+                audit_log::CREATED_AT,
+            ])
+            .from(audit_log::TABLE)
+            .order_by(audit_log::CREATED_AT, sea_query::Order::Desc)
+            .order_by(audit_log::ID, sea_query::Order::Desc)
+            .limit(limit as u64)
+            .build(SqliteQueryBuilder);
+        let rows = bind(sqlx::query(&sql), values)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| AuditEntry {
+                actor: row.get(0),
+                action: row.get(1),
+                detail: row.get(2),
+                at: row.get(3),
+            })
+            .collect())
     }
 
     /// 当前库结构版本，`admin health` 用。
@@ -1344,7 +1416,35 @@ const MIGRATIONS: &[Migration] = &[
         name: "好友申请",
         schema: v2_schema,
     },
+    Migration {
+        version: 3,
+        name: "操作审计",
+        schema: v3_schema,
+    },
 ];
+
+fn v3_schema() -> Vec<SchemaStatement> {
+    let table = Table::create()
+        .table(audit_log::TABLE)
+        .if_not_exists()
+        .col(
+            ColumnDef::new(audit_log::ID)
+                .integer()
+                .not_null()
+                .auto_increment()
+                .primary_key(),
+        )
+        .col(ColumnDef::new(audit_log::ACTOR).text().not_null())
+        .col(ColumnDef::new(audit_log::ACTION).text().not_null())
+        .col(ColumnDef::new(audit_log::DETAIL).text().not_null())
+        .col(
+            ColumnDef::new(audit_log::CREATED_AT)
+                .big_integer()
+                .not_null(),
+        )
+        .to_owned();
+    vec![migrate::table(table)]
+}
 
 fn v2_schema() -> Vec<SchemaStatement> {
     let requests = Table::create()
@@ -1566,6 +1666,25 @@ mod tests {
         assert_eq!(accounts.friends(carol.id).await.unwrap().len(), 1);
         assert!(accounts.friend_requests(bob.id).await.unwrap().is_empty());
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn audit_entries_report_who_did_what_newest_first() {
+        let (accounts, path) = accounts("audit").await;
+        accounts.record_audit("alice", "ban", "账号 bob").await;
+        accounts
+            .record_audit("alice", "dissolve_group", "房间 r1")
+            .await;
+
+        let entries = accounts.audit_entries(10).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].action, "dissolve_group");
+        assert_eq!(entries[1].action, "ban");
+        assert!(entries.iter().all(|entry| entry.actor == "alice"));
+
+        // 只取最近一条
+        assert_eq!(accounts.audit_entries(1).await.unwrap().len(), 1);
         let _ = std::fs::remove_file(path);
     }
 

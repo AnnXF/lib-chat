@@ -154,7 +154,10 @@ async fn logging_out_revokes_the_token_for_good() {
 #[tokio::test]
 async fn lagging_client_is_told_to_resync_instead_of_silently_losing_events() {
     let dir = temp_dir("lag");
-    let hub = Hub::open(&dir, "大厅").await.unwrap();
+    // 这条用例靠灌满队列，先关掉限流
+    let hub = Hub::open_with_limit(&dir, "大厅", f64::INFINITY, f64::INFINITY)
+        .await
+        .unwrap();
     let room = hub.default_room();
 
     let (alice, _alice_user) = register(&hub, "alice").await;
@@ -670,4 +673,31 @@ async fn counters_track_connections_and_messages() {
     drop(alice);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(hub.counters().connections_closed > after.connections_closed);
+}
+
+/// 刷屏会被限速，但正常节奏的聊天不受影响。
+#[tokio::test]
+async fn sending_faster_than_the_bucket_allows_is_rate_limited() {
+    let dir = temp_dir("rate");
+    let hub = Hub::open_with_limit(&dir, "大厅", 3.0, 0.0001)
+        .await
+        .unwrap();
+    let (alice, _) = register(&hub, "alice").await;
+    let room = hub.default_room();
+    alice.join(room, "alice").await.unwrap();
+    wait_for(&alice, |event| matches!(event, ServerEvent::Joined { .. })).await;
+
+    for index in 0..3 {
+        alice
+            .send_text(room, &format!("第 {index} 条"))
+            .await
+            .unwrap();
+        wait_for(&alice, |event| matches!(event, ServerEvent::Message { .. })).await;
+    }
+
+    alice.send_text(room, "第四条").await.unwrap();
+    match wait_for(&alice, |event| matches!(event, ServerEvent::Error { .. })).await {
+        ServerEvent::Error { code, .. } => assert_eq!(code, ErrorCode::RateLimited),
+        _ => unreachable!(),
+    }
 }
