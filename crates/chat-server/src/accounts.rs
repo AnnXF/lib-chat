@@ -355,6 +355,29 @@ impl Accounts {
         rows.into_iter().map(row_to_user).collect()
     }
 
+    /// 吊销一枚令牌：登出之后同一个令牌不能再 `Resume`。
+    pub async fn revoke_session(&self, token: &str) -> std::result::Result<(), AccountError> {
+        let (sql, values) = Query::delete()
+            .from_table(sessions::TABLE)
+            .and_where(Expr::col(sessions::TOKEN).eq(token))
+            .build(SqliteQueryBuilder);
+        bind(sqlx::query(&sql), values).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// 吊销某个账号的全部令牌，「其他设备下线」用。
+    pub async fn revoke_user_sessions(
+        &self,
+        user: UserId,
+    ) -> std::result::Result<(), AccountError> {
+        let (sql, values) = Query::delete()
+            .from_table(sessions::TABLE)
+            .and_where(Expr::col(sessions::USER_ID).eq(user.to_string()))
+            .build(SqliteQueryBuilder);
+        bind(sqlx::query(&sql), values).execute(&self.pool).await?;
+        Ok(())
+    }
+
     pub async fn remove_friend(
         &self,
         user: UserId,

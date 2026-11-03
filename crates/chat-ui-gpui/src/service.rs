@@ -15,6 +15,7 @@ mod hosting;
 mod protocol;
 mod remote;
 mod session;
+mod session_store;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -44,7 +45,8 @@ use hosting::{
     Hosting, PublicStart, RoomHostLock, claim_local_room, local_room, start_host, start_public_host,
 };
 use remote::RemoteServers;
-use session::{Active, Auth, SessionCmd, await_auth, open_session};
+use session::{Active, Auth, AuthInfo, SessionCmd, await_auth, open_session};
+use session_store::SavedLogin;
 
 /// 房间列表的人数复查间隔。房间要在未加入时也能看到人数，只能周期性探测。
 const PROBE_INTERVAL: Duration = Duration::from_secs(3);
@@ -291,6 +293,11 @@ pub enum UiEvent {
     },
     /// 已退出登录。
     LoggedOut,
+    /// 本机存着上次的登录：界面提出要不要恢复。
+    SavedLogin {
+        addr: String,
+        username: String,
+    },
     RoomMembers {
         room: RoomId,
         members: Vec<RoomMember>,
@@ -361,6 +368,8 @@ pub enum UiCommand {
         password: String,
         register: bool,
     },
+    /// 用上次落盘的令牌恢复登录；令牌留在服务层，界面不接触。
+    Resume,
     /// 切换到会话列表里的某个房间。
     OpenRoom {
         room: RoomId,
@@ -840,6 +849,81 @@ async fn account_client(account: &AccountState, liveness: Liveness) -> Result<Cl
     Ok(client)
 }
 
+/// 登录成功后的共同收尾：记账号、落盘令牌、拉一次会话与好友、接管连接。
+#[allow(clippy::too_many_arguments)]
+async fn accept_login(
+    events: &Sender<UiEvent>,
+    liveness: Liveness,
+    data_dir: &Path,
+    account: &mut Option<AccountState>,
+    active: &mut Option<Active>,
+    addr: String,
+    identity: ServerIdentity,
+    session: Active,
+    lobby: UiEvent,
+    auth: AuthInfo,
+) {
+    let display = auth.user.display_name.clone();
+    let fingerprint = match &identity {
+        ServerIdentity::Fingerprint(fingerprint) => Some(fingerprint.clone()),
+        ServerIdentity::PublicCa(_) => None,
+    };
+    // 下次启动直接恢复，不用再输密码
+    let _ = session_store::save(
+        data_dir,
+        &SavedLogin {
+            addr: addr.clone(),
+            fingerprint,
+            username: auth.user.username.clone(),
+            display_name: auth.user.display_name.clone(),
+            token: auth.token.clone(),
+        },
+    );
+
+    *account = Some(AccountState {
+        addr,
+        identity,
+        token: auth.token.clone(),
+        user: auth.user.clone(),
+    });
+    let _ = events.send_async(lobby).await;
+    let _ = events
+        .send_async(UiEvent::Authenticated {
+            user: auth.user,
+            token: auth.token,
+        })
+        .await;
+
+    // open_session 的 lobby 查询会顺手吃掉 Rooms 推送，这里主动拉一次
+    if let Some(current) = account.as_ref()
+        && let Ok(client) = account_client(current, liveness).await
+    {
+        let _ = client.list_rooms().await;
+        let _ = client.list_friends().await;
+        // 两条应答都读完就回到主循环；不要在这里无限等，否则后续命令全被堵住
+        for _ in 0..4 {
+            match tokio::time::timeout(Duration::from_millis(300), client.next_event()).await {
+                Ok(Ok(ServerEvent::Rooms { rooms })) => {
+                    let _ = events.send_async(UiEvent::Conversations { rooms }).await;
+                }
+                Ok(Ok(ServerEvent::Friends { users })) => {
+                    let _ = events.send_async(UiEvent::Friends { users }).await;
+                }
+                Ok(Ok(ServerEvent::Error { .. })) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(_)) => {}
+            }
+        }
+    }
+
+    if let Some(previous) = active.take() {
+        previous.end().await;
+    }
+    *active = Some(session);
+    if let Some(session) = active.as_ref() {
+        send_session(session, SessionCmd::Join(display), events).await;
+    }
+}
+
 async fn run(
     events: Sender<UiEvent>,
     cmds: Receiver<UiCommand>,
@@ -870,6 +954,16 @@ async fn run(
     let mut account: Option<AccountState> = None;
     let trust = TrustStore::new(&data_dir);
     let mut pending_trust: Option<(RoomId, String, String)> = None;
+
+    // 上次登录还在就把令牌留在服务层，只告诉界面「可以恢复」
+    if let Some(saved) = session_store::load(&data_dir) {
+        let _ = events
+            .send_async(UiEvent::SavedLogin {
+                addr: saved.addr,
+                username: saved.username,
+            })
+            .await;
+    }
 
     while let Ok(cmd) = cmds.recv_async().await {
         match cmd {
@@ -905,68 +999,86 @@ async fn run(
                 )
                 .await
                 {
-                    Ok((session, lobby, auth)) => {
-                        let Some(auth) = auth else {
-                            let _ = session.end().await;
-                            let _ = events
-                                .send_async(UiEvent::Error("登录没有返回身份".into()))
-                                .await;
-                            continue;
-                        };
-                        let display = auth.user.display_name.clone();
-                        let state = AccountState {
+                    Ok((session, lobby, Some(auth))) => {
+                        accept_login(
+                            &events,
+                            liveness,
+                            &data_dir,
+                            &mut account,
+                            &mut active,
                             addr,
                             identity,
-                            token: auth.token.clone(),
-                            user: auth.user.clone(),
-                        };
-                        account = Some(state);
-                        let _ = events.send_async(lobby).await;
+                            session,
+                            lobby,
+                            auth,
+                        )
+                        .await
+                    }
+                    Ok((session, _, None)) => {
+                        let _ = session.end().await;
                         let _ = events
-                            .send_async(UiEvent::Authenticated {
-                                user: auth.user,
-                                token: auth.token,
-                            })
+                            .send_async(UiEvent::Error("登录没有返回身份".into()))
                             .await;
-                        // open_session 的 lobby 查询会顺手吃掉 Rooms 推送，这里主动拉一次
-                        if let Some(current) = &account
-                            && let Ok(client) = account_client(current, liveness).await
-                        {
-                            let _ = client.list_rooms().await;
-                            let _ = client.list_friends().await;
-                            // 两条应答都读完就回到主循环；不要在这里无限等，否则后续命令全被堵住
-                            for _ in 0..4 {
-                                match tokio::time::timeout(
-                                    Duration::from_millis(300),
-                                    client.next_event(),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(ServerEvent::Rooms { rooms })) => {
-                                        let _ = events
-                                            .send_async(UiEvent::Conversations { rooms })
-                                            .await;
-                                    }
-                                    Ok(Ok(ServerEvent::Friends { users })) => {
-                                        let _ = events.send_async(UiEvent::Friends { users }).await;
-                                    }
-                                    Ok(Ok(ServerEvent::Error { .. })) | Ok(Err(_)) | Err(_) => {
-                                        break;
-                                    }
-                                    Ok(Ok(_)) => {}
-                                }
-                            }
-                        }
-                        if let Some(previous) = active.take() {
-                            previous.end().await;
-                        }
-                        active = Some(session);
-                        if let Some(session) = &active {
-                            send_session(session, SessionCmd::Join(display), &events).await;
-                        }
                     }
                     Err(e) => {
                         let _ = events.send_async(UiEvent::Error(e)).await;
+                    }
+                }
+            }
+            UiCommand::Resume => {
+                let Some(saved) = session_store::load(&data_dir) else {
+                    let _ = events
+                        .send_async(UiEvent::Error("没有可恢复的登录".into()))
+                        .await;
+                    continue;
+                };
+                let identity = match manual_identity(&saved.addr, saved.fingerprint.clone()) {
+                    Ok(identity) => identity,
+                    Err(e) => {
+                        let _ = events.send_async(UiEvent::Error(e)).await;
+                        continue;
+                    }
+                };
+                match open_session(
+                    &saved.addr,
+                    &identity,
+                    &events,
+                    liveness,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(Auth::Resume(saved.token.clone())),
+                )
+                .await
+                {
+                    Ok((session, lobby, Some(auth))) => {
+                        accept_login(
+                            &events,
+                            liveness,
+                            &data_dir,
+                            &mut account,
+                            &mut active,
+                            saved.addr,
+                            identity,
+                            session,
+                            lobby,
+                            auth,
+                        )
+                        .await
+                    }
+                    Ok((session, _, None)) => {
+                        let _ = session.end().await;
+                        // 令牌过期或已被吊销：清掉本地记录，回到登录页
+                        session_store::clear(&data_dir);
+                        let _ = events
+                            .send_async(UiEvent::Error("登录已过期，请重新登录".into()))
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = events
+                            .send_async(UiEvent::Error(format!("恢复登录失败: {e}")))
+                            .await;
                     }
                 }
             }
@@ -1326,6 +1438,8 @@ async fn run(
                 }
             }
             UiCommand::Logout => {
+                // 主动登出就不再「重启免登录」
+                session_store::clear(&data_dir);
                 let Some(current) = account.take() else {
                     let _ = events.send_async(UiEvent::LoggedOut).await;
                     continue;

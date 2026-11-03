@@ -46,6 +46,8 @@ pub struct ChatApp {
     login_user: Entity<TextInput>,
     login_password: Entity<TextInput>,
     login_fingerprint: Entity<TextInput>,
+    /// 本机存着的上次登录（地址、用户名）；令牌留在服务层。
+    saved_login: Option<(String, String)>,
     /// 好友与建群输入。
     friend_input: Entity<TextInput>,
     group_input: Entity<TextInput>,
@@ -333,6 +335,7 @@ impl ChatApp {
             login_user,
             login_password,
             login_fingerprint,
+            saved_login: None,
             friend_input,
             group_input,
             pending_trust: None,

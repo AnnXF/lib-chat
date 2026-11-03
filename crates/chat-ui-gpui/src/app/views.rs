@@ -565,6 +565,22 @@ impl ChatApp {
                                 cx.listener(Self::on_register),
                             ))),
                     )
+                    .when_some(self.saved_login.clone(), |this, (addr, username)| {
+                        this.child(
+                            div()
+                                .test_id("resume-login")
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(button(
+                                    &format!("继续以 {username} 登录"),
+                                    false,
+                                    true,
+                                    cx.listener(Self::on_resume_login),
+                                ))
+                                .child(hint(&format!("{addr} · 令牌已保存，不必再输密码"))),
+                        )
+                    })
                     .child(hint("登录成功后会自动进入默认大厅")),
             )
             .into_any_element()

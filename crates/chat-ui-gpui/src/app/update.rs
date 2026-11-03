@@ -332,8 +332,13 @@ impl ChatApp {
             }
             UiEvent::Authenticated { user, .. } => {
                 self.account = Some(user);
+                self.saved_login = None;
                 self.read_seqs.clear();
                 self.status = "已登录".into();
+            }
+            UiEvent::SavedLogin { addr, username } => {
+                self.status = format!("本机存着 {username} 的登录，可以直接恢复");
+                self.saved_login = Some((addr, username));
             }
             UiEvent::Conversations { rooms } => {
                 self.conversations = rooms;
@@ -437,6 +442,7 @@ impl ChatApp {
                 }
             }
             UiEvent::LoggedOut => {
+                self.saved_login = None;
                 self.account = None;
                 self.conversations.clear();
                 self.friends.clear();

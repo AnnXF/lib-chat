@@ -102,6 +102,40 @@ async fn accounts_friends_direct_chat_and_messages() {
 }
 
 #[tokio::test]
+async fn logging_out_revokes_the_token_for_good() {
+    let dir = temp_dir("logout");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+    let client = Client::new(hub.connect(DeviceId::new()).await);
+    client
+        .register("dave", "password123", "dave")
+        .await
+        .unwrap();
+    let token = match wait_for(&client, |event| {
+        matches!(event, ServerEvent::Authenticated { .. })
+    })
+    .await
+    {
+        ServerEvent::Authenticated { token, .. } => token,
+        _ => unreachable!(),
+    };
+
+    client.logout().await.unwrap();
+    wait_for(&client, |event| matches!(event, ServerEvent::AuthRequired)).await;
+
+    // 同一个令牌再拿来恢复登录必须被拒
+    let other = Client::new(hub.connect(DeviceId::new()).await);
+    other.resume(&token).await.unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(2), other.next_event())
+        .await
+        .expect("等待事件超时")
+        .expect("连接已关闭");
+    assert!(
+        matches!(event, ServerEvent::AuthRequired),
+        "登出后的令牌应失效，实际收到 {event:?}"
+    );
+}
+
+#[tokio::test]
 async fn lagging_client_is_told_to_resync_instead_of_silently_losing_events() {
     let dir = temp_dir("lag");
     let hub = Hub::open(&dir, "大厅").await.unwrap();

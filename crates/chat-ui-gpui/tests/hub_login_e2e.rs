@@ -86,3 +86,61 @@ async fn login_list_rooms_and_chat_through_hub() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn login_is_remembered_across_restarts_until_logout() {
+    let dir = temp_dir();
+    let hub = Hub::open(&dir.join("server"), "测试大厅").await.unwrap();
+    let quic = Arc::new(QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+    let acceptor: Arc<dyn ConnectionAcceptor> = Arc::new(HubAcceptor(Arc::clone(&hub)));
+    tokio::spawn(Arc::clone(&quic).serve(acceptor));
+
+    let client_dir = dir.join("client");
+    let addr = format!("127.0.0.1:{}", quic.local_addr().port());
+    let fingerprint = Some(quic.fingerprint().to_string());
+    let (cmds, events) = spawn_with_data(0, Liveness::default(), client_dir.clone());
+    cmds.send(UiCommand::Login {
+        addr: addr.clone(),
+        fingerprint: fingerprint.clone(),
+        username: "alice".into(),
+        password: "password123".into(),
+        register: true,
+    })
+    .unwrap();
+    recv_until(&events, |event| {
+        matches!(event, UiEvent::Authenticated { .. })
+    });
+    assert!(
+        client_dir.join("session.json").exists(),
+        "登录成功后应把令牌落盘"
+    );
+    drop(cmds);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 重启后只提示「可以恢复」，令牌不出服务层
+    let (cmds, events) = spawn_with_data(0, Liveness::default(), client_dir.clone());
+    match recv_until(&events, |event| matches!(event, UiEvent::SavedLogin { .. })) {
+        UiEvent::SavedLogin {
+            addr: saved,
+            username,
+        } => {
+            assert_eq!(saved, addr);
+            assert_eq!(username, "alice");
+        }
+        _ => unreachable!(),
+    }
+    cmds.send(UiCommand::Resume).unwrap();
+    recv_until(
+        &events,
+        |event| matches!(event, UiEvent::Authenticated { user, .. } if user.username == "alice"),
+    );
+
+    // 主动登出后本地不再保留令牌
+    cmds.send(UiCommand::Logout).unwrap();
+    recv_until(&events, |event| matches!(event, UiEvent::LoggedOut));
+    assert!(
+        !client_dir.join("session.json").exists(),
+        "登出应清掉本地登录态"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}

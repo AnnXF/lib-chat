@@ -41,6 +41,8 @@ impl Outbox {
 struct Conn {
     outbox: Arc<Outbox>,
     user: Option<UserSummary>,
+    /// 这条连接登录时拿到的令牌；登出要吊销的就是它。
+    token: Option<String>,
     /// Join 里带的昵称；没给就用账号显示名。
     display_name: Option<String>,
     joined: HashSet<RoomId>,
@@ -116,6 +118,7 @@ impl Hub {
             Conn {
                 outbox,
                 user: None,
+                token: None,
                 display_name: None,
                 joined: HashSet::new(),
             },
@@ -232,6 +235,7 @@ impl Hub {
             let mut conns = self.conns.write().await;
             if let Some(state) = conns.get_mut(&conn) {
                 state.user = Some(user.clone());
+                state.token = Some(token.clone());
             }
         }
         self.send_to(
@@ -588,9 +592,17 @@ impl Hub {
             },
             ClientRequest::Logout => {
                 let user = self.user_of(conn).await;
+                let mut token = None;
                 if let Some(state) = self.conns.write().await.get_mut(&conn) {
                     state.user = None;
                     state.joined.clear();
+                    token = state.token.take();
+                }
+                // 令牌必须真的作废，否则登出后它仍然能 Resume
+                if let Some(token) = token {
+                    if let Err(e) = self.accounts.revoke_session(&token).await {
+                        self.account_error(conn, e).await;
+                    }
                 }
                 if let Some(user) = user {
                     if !self.is_online(user.id).await {

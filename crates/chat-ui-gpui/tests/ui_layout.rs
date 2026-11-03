@@ -394,6 +394,7 @@ fn file_message_renders_inside_the_window() {
                 sha256: "ab".repeat(32),
             }),
             quote: None,
+            recalled: false,
         },
     );
 
@@ -741,6 +742,7 @@ fn quoted_message_renders_a_quote_block() {
                 text: "这是被引用的原文".into(),
                 seq: Some(0),
             }),
+            recalled: false,
         },
     );
 
@@ -888,6 +890,7 @@ fn unread_banner_and_divider_are_rendered() {
                         text: format!("消息 {seq}"),
                         attachment: None,
                         quote: None,
+                        recalled: false,
                     })
                     .collect(),
                 has_more: false,
@@ -1015,4 +1018,26 @@ fn unread_uses_server_read_position() {
     second_cx.run_until_parked();
     let unread = second_cx.update(|cx| view.read(cx).debug_unread_count());
     assert_eq!(unread, 2, "重启后只应把 10 之后的两条算未读");
+}
+
+/// 本机有保存的登录时，登录页多一个恢复入口，且不挤出窗口。
+#[test]
+fn saved_login_offers_a_resume_entry_on_the_login_page() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| {
+            app.debug_logout(cx);
+            app.debug_apply(UiEvent::SavedLogin {
+                addr: "chat.example.com:4433".into(),
+                username: "alice".into(),
+            });
+        });
+    });
+    cx.run_until_parked();
+
+    let resume = bounds(cx, "resume-login");
+    assert_inside(&resume, "resume-login");
+    assert!(f32::from(resume.size.height) > 0., "恢复入口应有高度");
+    assert_inside(&bounds(cx, "login-page"), "login-page");
 }

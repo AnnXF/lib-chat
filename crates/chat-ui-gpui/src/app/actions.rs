@@ -618,6 +618,18 @@ impl ChatApp {
         self.perform_login(false, cx);
     }
 
+    /// 用本机保存的令牌恢复登录。
+    pub(crate) fn on_resume_login(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.status = "正在恢复上次的登录…".into();
+        self.status_kind = super::StatusKind::Info;
+        self.tell(crate::service::UiCommand::Resume, cx);
+    }
+
     pub(crate) fn on_register(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.perform_login(true, cx);
     }
