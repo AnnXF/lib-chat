@@ -14,6 +14,7 @@ pub use attachment::{guess_mime, sha256_hex, validate_attachment};
 pub use client::Client;
 pub use proto::*;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -68,7 +69,60 @@ pub trait Connection: Send + Sync {
 ///
 /// 容量要能吸收一次突发广播：32 太浅，客户端只落后一帧就可能被判定为慢连接而清退。
 pub const EVENT_QUEUE_CAPACITY: usize = 256;
-pub type EventStream = mpsc::Receiver<ServerEvent>;
+
+/// 「这条连接被丢过事件」的标记，服务端与事件流共享。
+#[derive(Clone, Default)]
+pub struct LagFlag(Arc<AtomicBool>);
+
+impl LagFlag {
+    pub fn mark(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// 取走标记；之前丢过事件时返回 `true`。
+    pub fn take(&self) -> bool {
+        self.0.swap(false, Ordering::AcqRel)
+    }
+}
+
+/// 一条连接的服务端事件流。
+///
+/// 服务端推不动时会丢事件，只置位 [`LagFlag`]；这里在下次读取时先吐一条
+/// [`ServerEvent::Lag`]，客户端据此按游标补齐，不会永久缺一截。
+pub struct EventStream {
+    rx: mpsc::Receiver<ServerEvent>,
+    lag: LagFlag,
+}
+
+impl EventStream {
+    pub fn new(rx: mpsc::Receiver<ServerEvent>) -> Self {
+        Self {
+            rx,
+            lag: LagFlag::default(),
+        }
+    }
+
+    /// `lag` 由服务端持有；它置位时，读取方会收到 [`ServerEvent::Lag`]。
+    pub fn with_lag(rx: mpsc::Receiver<ServerEvent>, lag: LagFlag) -> Self {
+        Self { rx, lag }
+    }
+
+    pub fn lag(&self) -> LagFlag {
+        self.lag.clone()
+    }
+
+    /// 取下一个事件。取消安全。
+    pub async fn recv(&mut self) -> Option<ServerEvent> {
+        if self.lag.take() {
+            return Some(ServerEvent::Lag);
+        }
+        self.rx.recv().await
+    }
+
+    pub fn try_recv(&mut self) -> std::result::Result<ServerEvent, mpsc::error::TryRecvError> {
+        self.rx.try_recv()
+    }
+}
 
 /// 一条连接的请求入口，传输层把收到的请求交给它。
 ///

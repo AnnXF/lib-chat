@@ -5,9 +5,9 @@
 
 use super::*;
 
-/// 服务端事件 → 界面事件。
-pub(super) fn map_event(event: ServerEvent) -> UiEvent {
-    match event {
+/// 服务端事件 → 界面事件。返回 `None` 表示这条事件只给会话层看。
+pub(super) fn map_event(event: ServerEvent) -> Option<UiEvent> {
+    Some(match event {
         ServerEvent::Authenticated { user, token } => UiEvent::Authenticated { user, token },
         ServerEvent::AuthRequired => UiEvent::AuthRequired,
         ServerEvent::Friends { users } => UiEvent::Friends { users },
@@ -67,8 +67,10 @@ pub(super) fn map_event(event: ServerEvent) -> UiEvent {
             room,
             messages: messages.into_iter().map(to_history_message).collect(),
         },
+        // 缺口补齐由会话层处理，界面看到的是补齐后的正常消息。
+        ServerEvent::Lag => return None,
         ServerEvent::Error { message, .. } => UiEvent::Error(message),
-    }
+    })
 }
 
 pub(super) fn to_history_message(message: Message) -> HistoryMessage {

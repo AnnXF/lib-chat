@@ -370,6 +370,11 @@ pub enum ServerEvent {
         room: RoomId,
         online_count: u32,
     },
+    /// 这条连接落后太多，服务端丢过它的事件。
+    ///
+    /// 队列满时没法推送具体内容，只能事后告诉一声。客户端收到后应按本地游标
+    /// 发 [`ClientRequest::Sync`] 补齐，并重新拉一次会话列表。
+    Lag,
     Error {
         code: ErrorCode,
         message: String,

@@ -102,6 +102,39 @@ async fn accounts_friends_direct_chat_and_messages() {
 }
 
 #[tokio::test]
+async fn lagging_client_is_told_to_resync_instead_of_silently_losing_events() {
+    let dir = temp_dir("lag");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+    let room = hub.default_room();
+
+    let (alice, _) = register(&hub, "alice").await;
+    let (bob, _) = register(&hub, "bob").await;
+    alice.join(room, "alice").await.unwrap();
+    wait_for(&alice, |event| matches!(event, ServerEvent::Joined { .. })).await;
+    bob.join(room, "bob").await.unwrap();
+    wait_for(&bob, |event| matches!(event, ServerEvent::Joined { .. })).await;
+
+    // alice 不读事件，bob 一直发，直到 alice 的事件队列被灌满
+    for i in 0..400 {
+        bob.send_text(room, &format!("第 {i} 条")).await.unwrap();
+    }
+
+    // alice 开始读：丢过事件就必须先被告知，否则这一截永远补不回来
+    let mut saw_lag = false;
+    for _ in 0..600 {
+        let event = tokio::time::timeout(Duration::from_secs(2), alice.next_event())
+            .await
+            .expect("等待事件超时")
+            .expect("连接已关闭");
+        if matches!(event, ServerEvent::Lag) {
+            saw_lag = true;
+            break;
+        }
+    }
+    assert!(saw_lag, "队列溢出后必须下发 Lag，而不是静默丢弃");
+}
+
+#[tokio::test]
 async fn groups_only_include_friends_and_reject_outsiders() {
     let dir = temp_dir("group");
     let hub = Hub::open(&dir, "大厅").await.unwrap();

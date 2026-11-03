@@ -492,7 +492,9 @@ impl Session {
                     Ok(event) => {
                         self.observe(client, &event).await;
                         // 界面已经没了，会话没必要继续
-                        if self.events.send_async(map_event(event)).await.is_err() {
+                        if let Some(event) = map_event(event)
+                            && self.events.send_async(event).await.is_err()
+                        {
                             let _ = client.close().await;
                             return ServeEnd::Done;
                         }
@@ -626,6 +628,12 @@ impl Session {
                     self.newest = self.newest.max(last.seq);
                     self.request_sync(client, *has_more).await;
                 }
+            }
+            // 服务端丢过事件：按本地游标补齐，并把会话摘要重新拉一次。
+            ServerEvent::Lag => {
+                self.syncing = false;
+                self.request_sync(client, true).await;
+                let _ = client.list_rooms().await;
             }
             ServerEvent::Error { .. } => {
                 self.syncing = false;

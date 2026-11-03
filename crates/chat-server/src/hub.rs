@@ -10,9 +10,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chat_core::{
     sha256_hex, validate_attachment, Attachment, AttachmentId, ChatError, ClientRequest,
-    Connection, ConnectionAcceptor, DeviceId, ErrorCode, EventStream, LobbyInfo, MemberRole,
-    MessageKind, MessageStore, NewMessage, Quote, RequestSink, Result, RoomId, RoomInfo, RoomKind,
-    RoomSummary, ServerEvent, UserId, UserSummary, EVENT_QUEUE_CAPACITY,
+    Connection, ConnectionAcceptor, DeviceId, ErrorCode, EventStream, LagFlag, LobbyInfo,
+    MemberRole, MessageKind, MessageStore, NewMessage, Quote, RequestSink, Result, RoomId,
+    RoomInfo, RoomKind, RoomSummary, ServerEvent, UserId, UserSummary, EVENT_QUEUE_CAPACITY,
 };
 use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 
@@ -23,8 +23,23 @@ const MAX_TEXT_BYTES: usize = 8 * 1024;
 
 type ConnId = u64;
 
-struct Conn {
+/// 一条连接的发件箱。
+///
+/// 队列满时不能只是丢事件：客户端会永久缺那一截。丢过一次就置位 [`LagFlag`]，
+/// 事件流会把它变成一条 [`ServerEvent::Lag`] 交给客户端，由客户端按游标补齐。
+struct Outbox {
     tx: mpsc::Sender<ServerEvent>,
+    lag: LagFlag,
+}
+
+impl Outbox {
+    fn new(tx: mpsc::Sender<ServerEvent>, lag: LagFlag) -> Arc<Self> {
+        Arc::new(Self { tx, lag })
+    }
+}
+
+struct Conn {
+    outbox: Arc<Outbox>,
     user: Option<UserSummary>,
     /// Join 里带的昵称；没给就用账号显示名。
     display_name: Option<String>,
@@ -94,10 +109,12 @@ impl Hub {
     async fn attach(self: &Arc<Self>, device: DeviceId) -> (HubHandle, EventStream) {
         let id = self.next_conn.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+        let stream = EventStream::new(rx);
+        let outbox = Outbox::new(tx, stream.lag());
         self.conns.write().await.insert(
             id,
             Conn {
-                tx,
+                outbox,
                 user: None,
                 display_name: None,
                 joined: HashSet::new(),
@@ -109,15 +126,15 @@ impl Hub {
                 conn: id,
                 device,
             },
-            rx,
+            stream,
         )
     }
 
     pub async fn connect(self: &Arc<Self>, device: DeviceId) -> Arc<dyn Connection> {
-        let (handle, rx) = self.attach(device).await;
+        let (handle, stream) = self.attach(device).await;
         Arc::new(HubConnection {
             handle,
-            rx: Mutex::new(rx),
+            rx: Mutex::new(stream),
             closed: AtomicBool::new(false),
             notify: Notify::new(),
         })
@@ -172,16 +189,21 @@ impl Hub {
     }
 
     async fn send_to(&self, conn: ConnId, event: ServerEvent) {
-        let tx = self
+        let outbox = self
             .conns
             .read()
             .await
             .get(&conn)
-            .map(|state| state.tx.clone());
-        if let Some(tx) = tx {
-            // 队列满说明这个客户端已经跟不上，丢掉这条事件即可；
-            // 连接本身会在关闭或 detach 时清理，避免在这里递归回 disconnect
-            let _ = tx.try_send(event);
+            .map(|state| Arc::clone(&state.outbox));
+        let Some(outbox) = outbox else {
+            return;
+        };
+        match outbox.tx.try_send(event) {
+            Ok(()) => {}
+            // 队列满：记下缺口。客户端一有空位就会收到 `Lag` 并按游标补齐；
+            // 真的彻底不动了，传输层的写超时会把连接判死，重连后照样补齐。
+            Err(mpsc::error::TrySendError::Full(_)) => outbox.lag.mark(),
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
 
@@ -1256,14 +1278,14 @@ impl ConnectionAcceptor for HubAcceptor {
     }
 
     async fn accept(&self, device: DeviceId) -> (Arc<dyn RequestSink>, EventStream) {
-        let (handle, rx) = self.0.attach(device).await;
-        (Arc::new(handle), rx)
+        let (handle, stream) = self.0.attach(device).await;
+        (Arc::new(handle), stream)
     }
 }
 
 pub struct HubConnection {
     handle: HubHandle,
-    rx: Mutex<mpsc::Receiver<ServerEvent>>,
+    rx: Mutex<EventStream>,
     closed: AtomicBool,
     notify: Notify,
 }

@@ -853,7 +853,7 @@ async fn handshake(
     Ok(QuicConnection {
         room,
         write: Mutex::new(send),
-        events: Mutex::new(events),
+        events: Mutex::new(EventStream::new(events)),
         conn,
         endpoint,
         closed: AtomicBool::new(false),

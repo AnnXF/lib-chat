@@ -73,7 +73,7 @@ impl ConnectionAcceptor for Acceptor {
 
     async fn accept(&self, device: DeviceId) -> (Arc<dyn RequestSink>, EventStream) {
         let (handle, rx) = self.0.attach(device).await;
-        (Arc::new(handle), rx)
+        (Arc::new(handle), EventStream::new(rx))
     }
 }
 
