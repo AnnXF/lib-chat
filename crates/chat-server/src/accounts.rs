@@ -80,6 +80,8 @@ mod room_members {
     pub const TABLE: &str = "room_members";
     pub const ROOM_ID: &str = "room_id";
     pub const USER_ID: &str = "user_id";
+    /// 1 表示这个房间对本人静音。
+    pub const MUTED: &str = "muted";
     pub const ROLE: &str = "role";
     pub const JOINED_AT: &str = "joined_at";
 }
@@ -182,6 +184,41 @@ impl Accounts {
         migrate::apply(&self.pool, MIGRATIONS)
             .await
             .map_err(|e| AccountError::Storage(e.to_string()))
+    }
+
+    /// 这个房间对 `user` 是否静音。
+    pub async fn muted(
+        &self,
+        room: RoomId,
+        user: UserId,
+    ) -> std::result::Result<bool, AccountError> {
+        let (sql, values) = Query::select()
+            .column(room_members::MUTED)
+            .from(room_members::TABLE)
+            .and_where(Expr::col(room_members::ROOM_ID).eq(room.to_string()))
+            .and_where(Expr::col(room_members::USER_ID).eq(user.to_string()))
+            .build(SqliteQueryBuilder);
+        let row = bind(sqlx::query(&sql), values)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|row| row.get::<i64, _>(0) != 0).unwrap_or(false))
+    }
+
+    /// 设置静音；非成员设置无效。
+    pub async fn set_muted(
+        &self,
+        room: RoomId,
+        user: UserId,
+        muted: bool,
+    ) -> std::result::Result<(), AccountError> {
+        let (sql, values) = Query::update()
+            .table(room_members::TABLE)
+            .value(room_members::MUTED, i64::from(muted))
+            .and_where(Expr::col(room_members::ROOM_ID).eq(room.to_string()))
+            .and_where(Expr::col(room_members::USER_ID).eq(user.to_string()))
+            .build(SqliteQueryBuilder);
+        bind(sqlx::query(&sql), values).execute(&self.pool).await?;
+        Ok(())
     }
 
     /// 记一条管理动作。写失败不影响主流程，只打一条告警。
@@ -793,6 +830,7 @@ impl Accounts {
                 (rooms::TABLE, rooms::ID),
                 (rooms::TABLE, rooms::KIND),
                 (rooms::TABLE, rooms::NAME),
+                (room_members::TABLE, room_members::MUTED),
             ])
             .from(room_members::TABLE)
             .inner_join(
@@ -831,6 +869,7 @@ impl Accounts {
                 last_text: None,
                 last_at: None,
                 read_seq: 0,
+                muted: row.get::<i64, _>(3) != 0,
             });
         }
         Ok(result)
@@ -1147,6 +1186,7 @@ impl Accounts {
             last_text: None,
             last_at: None,
             read_seq: 0,
+            muted: self.muted(room, viewer).await?,
         }))
     }
 
@@ -1398,6 +1438,7 @@ impl Accounts {
                 last_text: None,
                 last_at: None,
                 read_seq: 0,
+                muted: false,
             });
         }
         Ok(result)
@@ -1424,7 +1465,28 @@ const MIGRATIONS: &[Migration] = &[
         schema: v3_schema,
         raw: &[],
     },
+    Migration {
+        version: 4,
+        name: "房间静音",
+        schema: v4_schema,
+        raw: &[],
+    },
 ];
+
+fn v4_schema() -> Vec<SchemaStatement> {
+    let alter = Table::alter()
+        .table(room_members::TABLE)
+        .add_column(
+            ColumnDef::new(room_members::MUTED)
+                .integer()
+                .not_null()
+                .default(0),
+        )
+        .to_owned();
+    vec![SchemaStatement::TableStatement(
+        sea_query::TableStatement::Alter(alter),
+    )]
+}
 
 fn v3_schema() -> Vec<SchemaStatement> {
     let table = Table::create()

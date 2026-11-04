@@ -822,6 +822,7 @@ fn group_members_panel_fits_inside_the_window() {
                     last_text: None,
                     last_at: None,
                     read_seq: 0,
+                            muted: false,
                 }],
             });
             app.debug_apply(UiEvent::Lobby {
@@ -870,6 +871,7 @@ fn unread_banner_and_divider_are_rendered() {
                     last_text: Some("新消息".into()),
                     last_at: None,
                     read_seq: 0,
+                            muted: false,
                 }],
             });
             app.debug_apply(UiEvent::Lobby {
@@ -921,6 +923,7 @@ fn unread_banner_appears_before_history_loads() {
                     last_text: Some("新消息".into()),
                     last_at: None,
                     read_seq: 0,
+                            muted: false,
                 }],
             });
             app.debug_apply(UiEvent::Lobby {
@@ -973,6 +976,7 @@ fn unread_uses_server_read_position() {
                     last_text: None,
                     last_at: None,
                     read_seq: 10,
+                            muted: false,
                 }],
             });
             app.debug_apply(UiEvent::Lobby {
@@ -1004,6 +1008,7 @@ fn unread_uses_server_read_position() {
                     last_text: None,
                     last_at: None,
                     read_seq: 10,
+                            muted: false,
                 }],
             });
             app.debug_apply(UiEvent::Lobby {

@@ -618,6 +618,17 @@ impl ChatApp {
         self.perform_login(false, cx);
     }
 
+    /// 静音/取消静音当前会话。
+    pub(crate) fn on_toggle_mute(&mut self, room: RoomId, muted: bool, cx: &mut Context<Self>) {
+        self.status = if muted {
+            "已静音：不再计未读角标，@我 仍会提醒".into()
+        } else {
+            "已取消静音".into()
+        };
+        self.status_kind = super::StatusKind::Info;
+        self.tell(crate::service::UiCommand::SetMuted { room, muted }, cx);
+    }
+
     /// 同意一条收到的好友申请。
     pub(crate) fn on_accept_friend(&mut self, user: UserId, cx: &mut Context<Self>) {
         self.tell(crate::service::UiCommand::AcceptFriend { user }, cx);

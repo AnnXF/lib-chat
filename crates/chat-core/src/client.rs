@@ -75,6 +75,12 @@ impl Client {
             .await
     }
 
+    pub async fn set_muted(&self, room: RoomId, muted: bool) -> Result<()> {
+        self.conn
+            .request(ClientRequest::SetMuted { room, muted })
+            .await
+    }
+
     pub async fn accept_friend(&self, user: UserId) -> Result<()> {
         self.conn
             .request(ClientRequest::AcceptFriend { user })

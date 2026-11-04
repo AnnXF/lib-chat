@@ -20,6 +20,18 @@ impl ChatApp {
             ),
         };
 
+        // 当前会话是否静音；静音只挡角标与通知，`@我` 仍然提醒
+        let muted = self
+            .room
+            .as_ref()
+            .and_then(|room| {
+                self.conversations
+                    .iter()
+                    .find(|known| known.room == room.id)
+            })
+            .is_some_and(|known| known.muted);
+        let room_id = self.room.as_ref().map(|room| room.id);
+
         // 没连上房间时不摆「加入」：那会儿点下去什么也不会发生，只会让人以为界面卡住了
         let action = match self.room.as_ref().map(|room| room.joined) {
             None => div().into_any_element(),
@@ -141,6 +153,16 @@ impl ChatApp {
                                     .child(subtitle),
                             ),
                     )
+                    .when_some(room_id, |this, room| {
+                        this.child(button(
+                            if muted { "取消静音" } else { "静音" },
+                            false,
+                            false,
+                            cx.listener(move |this, _, _, cx| {
+                                this.on_toggle_mute(room, !muted, cx)
+                            }),
+                        ))
+                    })
                     .child(button(
                         "搜索",
                         false,

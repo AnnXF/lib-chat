@@ -701,3 +701,41 @@ async fn sending_faster_than_the_bucket_allows_is_rate_limited() {
         _ => unreachable!(),
     }
 }
+
+/// 静音按人存：只影响自己看到的摘要，另一个人仍然正常计数。
+#[tokio::test]
+async fn muting_a_room_is_per_member_and_survives_relisting() {
+    let dir = temp_dir("mute");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+    let (alice, alice_user) = register(&hub, "alice").await;
+    let (bob, bob_user) = register(&hub, "bob").await;
+    be_friends(&alice, alice_user.id, &bob, "bob").await;
+    wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
+    wait_for(&bob, |event| matches!(event, ServerEvent::Friends { .. })).await;
+
+    let room = hub.default_room();
+    assert!(!rooms(&alice).await.iter().any(|known| known.muted));
+
+    alice.set_muted(room, true).await.unwrap();
+    let muted = match wait_for(&alice, |event| matches!(event, ServerEvent::Rooms { .. })).await {
+        ServerEvent::Rooms { rooms } => rooms
+            .into_iter()
+            .find(|known| known.room == room)
+            .expect("大厅应在列表里"),
+        _ => unreachable!(),
+    };
+    assert!(muted.muted, "自己看到的是静音");
+
+    // 重新拉一次列表，静音要还在
+    assert!(rooms(&alice)
+        .await
+        .iter()
+        .any(|known| known.room == room && known.muted));
+    // 对方不受影响
+    assert!(rooms(&bob)
+        .await
+        .iter()
+        .all(|known| !known.muted || known.room != room));
+
+    let _ = bob_user;
+}

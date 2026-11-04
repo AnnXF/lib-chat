@@ -64,7 +64,8 @@ impl ChatApp {
             .enumerate()
             .map(|(index, room)| {
                 let read = self.read_seqs.get(&room.room).copied().unwrap_or(0);
-                let unread = if room.last_seq > read {
+                // 静音的房间照常收消息，只是不显示角标
+                let unread = if !room.muted && room.last_seq > read {
                     room.last_seq - read
                 } else {
                     0
@@ -129,7 +130,7 @@ impl ChatApp {
             .enumerate()
             .map(|(index, room)| {
                 let read = self.read_seqs.get(&room.room).copied().unwrap_or(0);
-                let unread = if room.last_seq > read {
+                let unread = if !room.muted && room.last_seq > read {
                     room.last_seq - read
                 } else {
                     0

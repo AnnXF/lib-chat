@@ -902,6 +902,16 @@ impl Hub {
                 }
             }
 
+            ClientRequest::SetMuted { room, muted } => {
+                let Some(user) = self.user_of(conn).await else {
+                    return self.send_to(conn, ServerEvent::AuthRequired).await;
+                };
+                if let Err(e) = self.accounts.set_muted(room, user.id, muted).await {
+                    return self.account_error(conn, e).await;
+                }
+                self.push_rooms_to(user.id).await;
+            }
+
             ClientRequest::MarkRead { room, seq } => {
                 let Some(user) = self.user_of(conn).await else {
                     return self.send_to(conn, ServerEvent::AuthRequired).await;

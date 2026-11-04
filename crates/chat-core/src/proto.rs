@@ -116,6 +116,8 @@ pub struct RoomSummary {
     pub last_at: Option<i64>,
     /// 当前账号在这个房间已读到的最新序号，由服务端持久化。
     pub read_seq: Seq,
+    /// 这个房间对我静音：不弹通知、不计未读角标，`@我` 仍然提醒。
+    pub muted: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +209,11 @@ pub enum ClientRequest {
     /// 按用户名或昵称搜索用户，最多 20 条。
     SearchUsers {
         query: String,
+    },
+    /// 设置某个房间是否静音。
+    SetMuted {
+        room: RoomId,
+        muted: bool,
     },
     /// 在当前房间内按正文搜索消息，最多 50 条。
     SearchMessages {
