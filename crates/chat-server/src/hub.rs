@@ -97,6 +97,8 @@ pub struct Hub {
     /// 每条连接的消息限流参数；测试与压测用 [`Hub::open_with_limit`] 放宽。
     send_capacity: f64,
     send_per_sec: f64,
+    /// 待推送会话摘要的房间；后台任务按窗口合并后统一推。
+    summary_dirty: std::sync::Mutex<HashSet<RoomId>>,
 }
 
 impl Hub {
@@ -128,7 +130,7 @@ impl Hub {
             .ensure_default_room(name)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(Arc::new(Self {
+        let hub = Arc::new(Self {
             accounts,
             messages,
             blobs,
@@ -139,7 +141,10 @@ impl Hub {
             next_conn: AtomicU64::new(0),
             send_capacity,
             send_per_sec,
-        }))
+            summary_dirty: std::sync::Mutex::new(HashSet::new()),
+        });
+        spawn_summary_flusher(&hub);
+        Ok(hub)
     }
 
     pub fn default_room(&self) -> RoomId {
@@ -467,7 +472,19 @@ impl Hub {
     }
 
     /// 新消息/编辑/撤回后刷新所有成员（包括不在当前房间的人）的会话摘要。
+    /// 标记「这个房间的摘要变了」。
+    ///
+    /// 消息密集时每个房间在每个窗口内只推一次，把推送频率与消息频率解耦；
+    /// 真正的推送由后台任务完成。
     async fn push_room_summaries(&self, room: RoomId) {
+        self.summary_dirty
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(room);
+    }
+
+    /// 立刻把房间摘要推给所有成员。
+    async fn flush_room_summaries(&self, room: RoomId) {
         let Ok(members) = self.accounts.members_with_roles(room).await else {
             return;
         };
@@ -1618,6 +1635,34 @@ impl Hub {
         };
         self.send_error(conn, code, &message).await;
     }
+}
+
+/// 摘要合并窗口：同一房间在这段时间内的多次变更只推一次。
+const SUMMARY_WINDOW: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// 后台合并任务：定期把「摘要变脏」的房间统一推一遍。
+///
+/// 用弱引用持有 Hub，进程退出（或测试结束）时任务自然结束。
+fn spawn_summary_flusher(hub: &Arc<Hub>) {
+    let weak = Arc::downgrade(hub);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(SUMMARY_WINDOW).await;
+            let Some(hub) = weak.upgrade() else {
+                return;
+            };
+            let rooms: Vec<RoomId> = {
+                let mut dirty = hub
+                    .summary_dirty
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                dirty.drain().collect()
+            };
+            for room in rooms {
+                hub.flush_room_summaries(room).await;
+            }
+        }
+    });
 }
 
 fn mentioned_usernames(text: &str) -> Vec<String> {

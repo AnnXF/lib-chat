@@ -1092,3 +1092,69 @@ async fn only_the_owner_can_mention_everyone() {
         }
     }
 }
+
+/// 连发一串消息时，会话摘要按窗口合并，不会一条推一次。
+#[tokio::test]
+async fn room_summaries_are_coalesced_under_a_burst() {
+    let dir = temp_dir("coalesce");
+    // 关掉限流，专测合并
+    let hub = Hub::open_with_limit(&dir, "大厅", f64::INFINITY, f64::INFINITY)
+        .await
+        .unwrap();
+    let (alice, alice_user) = register(&hub, "alice").await;
+    let (bob, bob_user) = register(&hub, "bob").await;
+    be_friends(&alice, alice_user.id, &bob, "bob").await;
+    wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
+    wait_for(&bob, |event| matches!(event, ServerEvent::Friends { .. })).await;
+
+    alice
+        .create_group("合并群", vec![bob_user.id])
+        .await
+        .unwrap();
+    let group = match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Rooms { rooms } if rooms.iter().any(|room| room.name == "合并群"))
+    })
+    .await
+    {
+        ServerEvent::Rooms { rooms } => rooms
+            .into_iter()
+            .find(|room| room.name == "合并群")
+            .unwrap()
+            .room,
+        _ => unreachable!(),
+    };
+    for (client, name) in [(&alice, "Alice"), (&bob, "Bob")] {
+        client.join(group, name).await.unwrap();
+        wait_for(client, |event| matches!(event, ServerEvent::Joined { .. })).await;
+    }
+    // 先清掉加入阶段留下的摘要推送
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    while tokio::time::timeout(Duration::from_millis(50), bob.next_event())
+        .await
+        .is_ok()
+    {}
+
+    let burst = 30;
+    for index in 0..burst {
+        alice
+            .send_text(group, &format!("第 {index} 句"))
+            .await
+            .unwrap();
+    }
+
+    // 收集 700ms 内的摘要推送次数
+    let mut summaries = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(700);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(ServerEvent::Rooms { .. })) =
+            tokio::time::timeout(Duration::from_millis(100), bob.next_event()).await
+        {
+            summaries += 1;
+        }
+    }
+    assert!(summaries > 0, "至少要推一次摘要，否则客户端看不到新消息");
+    assert!(
+        summaries < burst,
+        "{burst} 条消息只应推少量摘要，实际 {summaries} 次"
+    );
+}
