@@ -485,6 +485,24 @@ impl ChatApp {
                             this.quote_message(line_for_quote.clone(), window, cx);
                         }),
                     ))
+                    .when_some(line.seq, |this, seq| {
+                        let pinned = self
+                            .room
+                            .as_ref()
+                            .and_then(|room| {
+                                self.conversations
+                                    .iter()
+                                    .find(|known| known.room == room.id)
+                            })
+                            .and_then(|known| known.pinned.clone())
+                            .is_some_and(|pinned| pinned.seq == seq);
+                        this.child(menu_item(
+                            if pinned { "取消置顶" } else { "置顶" },
+                            cx.listener(move |this, _, _, cx| {
+                                this.on_pin_message(seq, pinned, cx);
+                            }),
+                        ))
+                    })
                     .when(can_announce, |this| {
                         let announced = line.text.clone();
                         this.child(menu_item(

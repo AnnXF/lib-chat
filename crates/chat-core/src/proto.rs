@@ -122,6 +122,16 @@ pub struct RoomSummary {
     pub announcement: Option<String>,
     /// 我是不是这个房间的群主。
     pub owner: bool,
+    /// 置顶消息的快照；没有置顶为 `None`。
+    pub pinned: Option<PinnedMessage>,
+}
+
+/// 置顶消息：序号 + 发送者 + 正文快照，客户端不必等历史加载就能显示。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedMessage {
+    pub seq: Seq,
+    pub sender: String,
+    pub text: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +223,11 @@ pub enum ClientRequest {
     /// 按用户名或昵称搜索用户，最多 20 条。
     SearchUsers {
         query: String,
+    },
+    /// 置顶一条消息；`seq` 为 `None` 表示取消置顶。
+    PinMessage {
+        room: RoomId,
+        seq: Option<Seq>,
     },
     /// 设置群公告；传 `None` 表示清空。只有群主能改。
     SetAnnouncement {

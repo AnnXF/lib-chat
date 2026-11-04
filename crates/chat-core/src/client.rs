@@ -75,6 +75,12 @@ impl Client {
             .await
     }
 
+    pub async fn pin_message(&self, room: RoomId, seq: Option<Seq>) -> Result<()> {
+        self.conn
+            .request(ClientRequest::PinMessage { room, seq })
+            .await
+    }
+
     pub async fn set_announcement(&self, room: RoomId, text: Option<String>) -> Result<()> {
         self.conn
             .request(ClientRequest::SetAnnouncement { room, text })

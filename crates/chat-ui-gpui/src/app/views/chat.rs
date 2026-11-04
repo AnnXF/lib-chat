@@ -31,6 +31,15 @@ impl ChatApp {
             })
             .is_some_and(|known| known.muted);
         let room_id = self.room.as_ref().map(|room| room.id);
+        let pinned = self
+            .room
+            .as_ref()
+            .and_then(|room| {
+                self.conversations
+                    .iter()
+                    .find(|known| known.room == room.id)
+            })
+            .and_then(|known| known.pinned.clone());
         let announcement = self
             .room
             .as_ref()
@@ -193,6 +202,39 @@ impl ChatApp {
                     })
                     .child(action),
             )
+            .when_some(pinned, |this, pinned| {
+                this.child(
+                    div()
+                        .id("pinned-banner")
+                        .test_id("pinned-banner")
+                        .flex_none()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .px_6()
+                        .py_2()
+                        .bg(rgb(theme::SURFACE))
+                        .border_b_1()
+                        .border_color(rgb(theme::BORDER))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.))
+                                .text_color(rgb(theme::WARN))
+                                .child("置顶"),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(px(12.))
+                                .text_color(rgb(theme::MUTED))
+                                .child(format!("{}：{}", pinned.sender, pinned.text)),
+                        ),
+                )
+            })
             .when_some(announcement, |this, text| {
                 this.child(
                     div()

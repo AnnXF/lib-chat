@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use crate::app::{FriendMenu, NavTab};
-use chat_core::{Attachment, RoomId, UserId};
+use chat_core::{Attachment, RoomId, Seq, UserId};
 use chat_transport_quic::validate_fingerprint;
 use gpui::{
     Context, Focusable as _, KeyDownEvent, ListOffset, MouseDownEvent, MouseUpEvent,
@@ -616,6 +616,27 @@ impl ChatApp {
 
     pub(crate) fn on_login(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.perform_login(false, cx);
+    }
+
+    /// 置顶/取消置顶一条消息。
+    pub(crate) fn on_pin_message(&mut self, seq: Seq, pinned: bool, cx: &mut Context<Self>) {
+        let Some(room) = self.room.as_ref().map(|room| room.id) else {
+            return;
+        };
+        self.status = if pinned {
+            "已取消置顶".into()
+        } else {
+            "已置顶这条消息".into()
+        };
+        self.status_kind = super::StatusKind::Info;
+        self.message_menu = None;
+        self.tell(
+            crate::service::UiCommand::PinMessage {
+                room,
+                seq: (!pinned).then_some(seq),
+            },
+            cx,
+        );
     }
 
     /// 把某条消息设为群公告。

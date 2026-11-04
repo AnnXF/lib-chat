@@ -269,6 +269,7 @@ impl Server {
             | ClientRequest::MarkRead { .. }
             | ClientRequest::SetMuted { .. }
             | ClientRequest::SetAnnouncement { .. }
+            | ClientRequest::PinMessage { .. }
             | ClientRequest::ListRooms
             | ClientRequest::CreateGroup { .. }
             | ClientRequest::OpenDirect { .. }

@@ -8,7 +8,8 @@ use std::path::Path;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 use chat_core::{
-    ChatError, MemberRole, RoomId, RoomKind, RoomMember, RoomSummary, Seq, UserId, UserSummary,
+    ChatError, MemberRole, PinnedMessage, RoomId, RoomKind, RoomMember, RoomSummary, Seq, UserId,
+    UserSummary,
 };
 use sea_query::{ColumnDef, Expr, Query, SchemaStatement, SqliteQueryBuilder, Table};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
@@ -75,6 +76,10 @@ mod rooms {
     pub const DIRECT_KEY: &str = "direct_key";
     /// 群公告，为空表示没设置。
     pub const ANNOUNCEMENT: &str = "announcement";
+    /// 置顶消息的序号与快照；都没有表示没置顶。
+    pub const PINNED_SEQ: &str = "pinned_seq";
+    pub const PINNED_SENDER: &str = "pinned_sender";
+    pub const PINNED_TEXT: &str = "pinned_text";
     pub const CREATED_AT: &str = "created_at";
 }
 
@@ -94,6 +99,16 @@ mod read_markers {
     pub const ROOM_ID: &str = "room_id";
     pub const SEQ: &str = "seq";
     pub const UPDATED_AT: &str = "updated_at";
+}
+
+/// 从行里读置顶快照；任一列为空就当作没置顶。
+fn pinned_from_row(row: &sqlx::sqlite::SqliteRow, at: usize) -> Option<PinnedMessage> {
+    let seq = row.get::<Option<i64>, _>(at)?;
+    Some(PinnedMessage {
+        seq,
+        sender: row.get::<Option<String>, _>(at + 1).unwrap_or_default(),
+        text: row.get::<Option<String>, _>(at + 2).unwrap_or_default(),
+    })
 }
 
 /// 群成员数（含群主）不能超过 [`MAX_GROUP_MEMBERS`]。
@@ -204,6 +219,31 @@ impl Accounts {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(|row| row.get::<i64, _>(0) != 0).unwrap_or(false))
+    }
+
+    /// 置顶或取消置顶。
+    pub async fn set_pinned(
+        &self,
+        room: RoomId,
+        pinned: Option<(Seq, String, String)>,
+    ) -> std::result::Result<(), AccountError> {
+        let (seq, sender, text) = match pinned {
+            Some((seq, sender, text)) => (
+                Some(seq),
+                Some(sender),
+                Some(text.chars().take(500).collect::<String>()),
+            ),
+            None => (None, None, None),
+        };
+        let (sql, values) = Query::update()
+            .table(rooms::TABLE)
+            .value(rooms::PINNED_SEQ, seq)
+            .value(rooms::PINNED_SENDER, sender)
+            .value(rooms::PINNED_TEXT, text)
+            .and_where(Expr::col(rooms::ID).eq(room.to_string()))
+            .build(SqliteQueryBuilder);
+        bind(sqlx::query(&sql), values).execute(&self.pool).await?;
+        Ok(())
     }
 
     /// 设置群公告；传 `None` 清空。
@@ -850,6 +890,9 @@ impl Accounts {
                 (room_members::TABLE, room_members::MUTED),
                 (rooms::TABLE, rooms::ANNOUNCEMENT),
                 (rooms::TABLE, rooms::OWNER_ID),
+                (rooms::TABLE, rooms::PINNED_SEQ),
+                (rooms::TABLE, rooms::PINNED_SENDER),
+                (rooms::TABLE, rooms::PINNED_TEXT),
             ])
             .from(room_members::TABLE)
             .inner_join(
@@ -891,6 +934,7 @@ impl Accounts {
                 muted: row.get::<i64, _>(3) != 0,
                 announcement: row.get::<Option<String>, _>(4),
                 owner: row.get::<Option<String>, _>(5).as_deref() == Some(&user.to_string()),
+                pinned: pinned_from_row(&row, 6),
             });
         }
         Ok(result)
@@ -1181,6 +1225,9 @@ impl Accounts {
                 rooms::NAME,
                 rooms::ANNOUNCEMENT,
                 rooms::OWNER_ID,
+                rooms::PINNED_SEQ,
+                rooms::PINNED_SENDER,
+                rooms::PINNED_TEXT,
             ])
             .from(rooms::TABLE)
             .and_where(Expr::col(rooms::ID).eq(room.to_string()))
@@ -1216,6 +1263,7 @@ impl Accounts {
             muted: self.muted(room, viewer).await?,
             announcement: row.get::<Option<String>, _>(3),
             owner: row.get::<Option<String>, _>(4).as_deref() == Some(&viewer.to_string()),
+            pinned: pinned_from_row(&row, 5),
         }))
     }
 
@@ -1470,6 +1518,7 @@ impl Accounts {
                 muted: false,
                 announcement: None,
                 owner: false,
+                pinned: None,
             });
         }
         Ok(result)
@@ -1508,7 +1557,32 @@ const MIGRATIONS: &[Migration] = &[
         schema: v5_schema,
         raw: &[],
     },
+    Migration {
+        version: 6,
+        name: "置顶消息",
+        schema: v6_schema,
+        raw: &[],
+    },
 ];
+
+fn v6_schema() -> Vec<SchemaStatement> {
+    // SQLite 一条 ALTER TABLE 只能加一列
+    [
+        ColumnDef::new(rooms::PINNED_SEQ).big_integer().to_owned(),
+        ColumnDef::new(rooms::PINNED_SENDER).text().to_owned(),
+        ColumnDef::new(rooms::PINNED_TEXT).text().to_owned(),
+    ]
+    .into_iter()
+    .map(|column| {
+        SchemaStatement::TableStatement(sea_query::TableStatement::Alter(
+            Table::alter()
+                .table(rooms::TABLE)
+                .add_column(column)
+                .to_owned(),
+        ))
+    })
+    .collect()
+}
 
 fn v5_schema() -> Vec<SchemaStatement> {
     let alter = Table::alter()

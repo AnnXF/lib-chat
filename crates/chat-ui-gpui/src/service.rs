@@ -388,6 +388,11 @@ pub enum UiCommand {
     },
     /// 用上次落盘的令牌恢复登录；令牌留在服务层，界面不接触。
     Resume,
+    /// 置顶一条消息；`seq` 为 `None` 表示取消。
+    PinMessage {
+        room: RoomId,
+        seq: Option<Seq>,
+    },
     /// 设置群公告。
     SetAnnouncement {
         room: RoomId,
@@ -1179,6 +1184,7 @@ async fn run(
             }
             UiCommand::RefreshRooms
             | UiCommand::AddFriend { .. }
+            | UiCommand::PinMessage { .. }
             | UiCommand::SetAnnouncement { .. }
             | UiCommand::SetMuted { .. }
             | UiCommand::AcceptFriend { .. }
@@ -1199,6 +1205,7 @@ async fn run(
                 let sent = match cmd {
                     UiCommand::RefreshRooms => client.list_rooms().await,
                     UiCommand::AddFriend { username } => client.add_friend(username).await,
+                    UiCommand::PinMessage { room, seq } => client.pin_message(room, seq).await,
                     UiCommand::SetAnnouncement { room, text } => {
                         client.set_announcement(room, text).await
                     }

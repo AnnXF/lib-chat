@@ -825,6 +825,7 @@ fn group_members_panel_fits_inside_the_window() {
                     muted: false,
                     announcement: None,
                     owner: false,
+                    pinned: None,
                 }],
             });
             app.debug_apply(UiEvent::Lobby {
@@ -876,6 +877,7 @@ fn unread_banner_and_divider_are_rendered() {
                     muted: false,
                     announcement: None,
                     owner: false,
+                    pinned: None,
                 }],
             });
             app.debug_apply(UiEvent::Lobby {
@@ -930,6 +932,7 @@ fn unread_banner_appears_before_history_loads() {
                     muted: false,
                     announcement: None,
                     owner: false,
+                    pinned: None,
                 }],
             });
             app.debug_apply(UiEvent::Lobby {
@@ -985,6 +988,7 @@ fn unread_uses_server_read_position() {
                     muted: false,
                     announcement: None,
                     owner: false,
+                    pinned: None,
                 }],
             });
             app.debug_apply(UiEvent::Lobby {
@@ -1019,6 +1023,7 @@ fn unread_uses_server_read_position() {
                     muted: false,
                     announcement: None,
                     owner: false,
+                    pinned: None,
                 }],
             });
             app.debug_apply(UiEvent::Lobby {
@@ -1103,6 +1108,7 @@ fn announcement_banner_stays_inside_the_chat_area() {
                         "一条很长很长的群公告，用来确认它会被截断而不是把窗口撑宽，后面还要再补一些字".into(),
                     ),
                     owner: false,
+                    pinned: None,
                 }],
             });
             app.debug_apply(UiEvent::Lobby {
@@ -1157,6 +1163,7 @@ fn image_attachment_renders_a_preview_inside_the_chat_area() {
                     muted: false,
                     announcement: None,
                     owner: false,
+                    pinned: None,
                 }],
             });
             app.debug_apply(UiEvent::Lobby {
@@ -1189,5 +1196,50 @@ fn image_attachment_renders_a_preview_inside_the_chat_area() {
 
     let preview = bounds(cx, "image-preview");
     assert_inside(&preview, "image-preview");
+    assert_inside(&bounds(cx, "chat-main"), "chat-main");
+}
+
+/// 置顶消息以横幅显示在聊天区顶部，长文本被截断。
+#[test]
+fn pinned_message_banner_stays_inside_the_chat_area() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    let room = chat_core::RoomId::new();
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| {
+            app.debug_apply(UiEvent::Conversations {
+                rooms: vec![chat_core::RoomSummary {
+                    room,
+                    kind: chat_core::RoomKind::Group,
+                    name: "置顶群".into(),
+                    member_count: 2,
+                    last_seq: 1,
+                    last_text: None,
+                    last_at: None,
+                    read_seq: 0,
+                    muted: false,
+                    announcement: None,
+                    owner: false,
+                    pinned: Some(chat_core::PinnedMessage {
+                        seq: 1,
+                        sender: "Bob".into(),
+                        text:
+                            "一条很长很长的置顶消息，用来确认它会被截断而不是把窗口撑宽，再补一些字"
+                                .into(),
+                    }),
+                }],
+            });
+            app.debug_apply(UiEvent::Lobby {
+                room,
+                name: "置顶群".into(),
+                addr: "127.0.0.1:1".into(),
+                online: 1,
+            });
+            app.debug_open_conversation(room, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert_inside(&bounds(cx, "pinned-banner"), "pinned-banner");
     assert_inside(&bounds(cx, "chat-main"), "chat-main");
 }

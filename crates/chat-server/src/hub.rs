@@ -927,6 +927,44 @@ impl Hub {
                 }
             }
 
+            ClientRequest::PinMessage { room, seq } => {
+                let Some(user) = self.user_of(conn).await else {
+                    return self.send_to(conn, ServerEvent::AuthRequired).await;
+                };
+                if !self
+                    .accounts
+                    .is_member(room, user.id)
+                    .await
+                    .unwrap_or(false)
+                {
+                    return self
+                        .send_error(conn, ErrorCode::RoomMismatch, "房间不存在")
+                        .await;
+                }
+                let pinned = match seq {
+                    None => None,
+                    Some(seq) => match self.messages.history(room, Some(seq + 1), 1).await {
+                        Ok(messages) => messages.last().map(|message| {
+                            let text = if message.recalled {
+                                "消息已撤回".to_string()
+                            } else {
+                                message.text.clone()
+                            };
+                            (message.seq, message.sender_name.clone(), text)
+                        }),
+                        Err(e) => {
+                            return self
+                                .send_error(conn, ErrorCode::Internal, &e.to_string())
+                                .await;
+                        }
+                    },
+                };
+                if let Err(e) = self.accounts.set_pinned(room, pinned).await {
+                    return self.account_error(conn, e).await;
+                }
+                self.push_room_summaries(room).await;
+            }
+
             ClientRequest::SetAnnouncement { room, text } => {
                 let Some(user) = self.user_of(conn).await else {
                     return self.send_to(conn, ServerEvent::AuthRequired).await;

@@ -849,3 +849,74 @@ async fn the_same_account_on_two_devices_shares_messages_and_read_state() {
     // 在线人数按连接算：同一个人开两个端就算两条连接
     assert_eq!(hub.online_count().await, 2);
 }
+
+/// 置顶：任何成员都能置顶，摘要里带着快照；取消后变空。
+#[tokio::test]
+async fn any_member_can_pin_and_unpin_a_message() {
+    let dir = temp_dir("pin");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+    let (alice, alice_user) = register(&hub, "alice").await;
+    let (bob, bob_user) = register(&hub, "bob").await;
+    be_friends(&alice, alice_user.id, &bob, "bob").await;
+    wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
+    wait_for(&bob, |event| matches!(event, ServerEvent::Friends { .. })).await;
+
+    alice
+        .create_group("置顶群", vec![bob_user.id])
+        .await
+        .unwrap();
+    let group = match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Rooms { rooms } if rooms.iter().any(|room| room.name == "置顶群"))
+    })
+    .await
+    {
+        ServerEvent::Rooms { rooms } => rooms
+            .into_iter()
+            .find(|room| room.name == "置顶群")
+            .unwrap()
+            .room,
+        _ => unreachable!(),
+    };
+    for (client, name) in [(&alice, "Alice"), (&bob, "Bob")] {
+        client.join(group, name).await.unwrap();
+        wait_for(client, |event| matches!(event, ServerEvent::Joined { .. })).await;
+    }
+
+    alice.send_text(group, "要置顶的话").await.unwrap();
+    let seq = match wait_for(&bob, |event| matches!(event, ServerEvent::Message { .. })).await {
+        ServerEvent::Message { message } => message.seq,
+        _ => unreachable!(),
+    };
+
+    // 普通成员也能置顶
+    bob.pin_message(group, Some(seq)).await.unwrap();
+    match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Rooms { rooms }
+            if rooms.iter().any(|room| room.room == group && room.pinned.is_some()))
+    })
+    .await
+    {
+        ServerEvent::Rooms { rooms } => {
+            let pinned = rooms
+                .iter()
+                .find(|room| room.room == group)
+                .and_then(|room| room.pinned.clone())
+                .unwrap();
+            assert_eq!(pinned.seq, seq);
+            assert_eq!(pinned.text, "要置顶的话");
+            assert_eq!(pinned.sender, "Alice");
+        }
+        _ => unreachable!(),
+    }
+
+    bob.pin_message(group, None).await.unwrap();
+    match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Rooms { rooms }
+            if rooms.iter().any(|room| room.room == group && room.pinned.is_none()))
+    })
+    .await
+    {
+        ServerEvent::Rooms { .. } => {}
+        _ => unreachable!(),
+    }
+}
