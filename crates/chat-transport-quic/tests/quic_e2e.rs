@@ -157,3 +157,76 @@ async fn transfers_attachment_over_dedicated_stream() {
     assert_eq!(downloaded, data);
     assert_eq!(sha256_hex(&downloaded), attachment.sha256);
 }
+
+/// 上传与下载都把进度报到底：单调不减，最后一次等于总字节数。
+#[tokio::test]
+async fn attachment_transfer_reports_progress_until_complete() {
+    use std::sync::Mutex;
+
+    let (server, _quic, addr, fingerprint) = start_server().await;
+    let room = server.room();
+    let sender = Client::new(Arc::new(
+        connect(addr, &fingerprint).await.expect("发送端连接失败"),
+    ));
+    let receiver = Client::new(Arc::new(
+        connect(addr, &fingerprint).await.expect("接收端连接失败"),
+    ));
+    for (client, name) in [(&sender, "Alice"), (&receiver, "Bob")] {
+        client.join(room, name).await.unwrap();
+        wait_for(client, |e| matches!(e, ServerEvent::Joined { .. })).await;
+    }
+
+    // 三个 chunk 出头，确保进度不止一次
+    let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let attachment = Attachment {
+        id: AttachmentId::new(),
+        name: "progress.bin".into(),
+        size: data.len() as u64,
+        mime: guess_mime("progress.bin").into(),
+        sha256: sha256_hex(&data),
+    };
+
+    let uploaded = Arc::new(Mutex::new(Vec::<(u64, u64)>::new()));
+    let sink = {
+        let seen = Arc::clone(&uploaded);
+        Arc::new(move |done: u64, total: u64| seen.lock().unwrap().push((done, total)))
+            as chat_core::ProgressSink
+    };
+    sender
+        .upload_with_progress(room, attachment.clone(), data.clone(), sink)
+        .await
+        .expect("上传失败");
+
+    let seen = uploaded.lock().unwrap().clone();
+    assert!(seen.len() > 1, "进度应分多次上报，实际 {}", seen.len());
+    assert!(
+        seen.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+        "进度不能倒退"
+    );
+    assert_eq!(seen.last().unwrap().0, data.len() as u64);
+
+    sender
+        .send_file(room, uuid::Uuid::new_v4(), attachment.clone())
+        .await
+        .unwrap();
+    match wait_for(&receiver, |e| matches!(e, ServerEvent::Message { .. })).await {
+        ServerEvent::Message { message } => assert!(message.attachment.is_some()),
+        _ => unreachable!(),
+    }
+
+    let downloaded = Arc::new(Mutex::new(Vec::<(u64, u64)>::new()));
+    let sink = {
+        let seen = Arc::clone(&downloaded);
+        Arc::new(move |done: u64, total: u64| seen.lock().unwrap().push((done, total)))
+            as chat_core::ProgressSink
+    };
+    let got = receiver
+        .download_with_progress(room, attachment.id, sink)
+        .await
+        .expect("下载失败");
+    assert_eq!(got, data);
+
+    let seen = downloaded.lock().unwrap().clone();
+    assert_eq!(seen.last().unwrap().0, data.len() as u64);
+    assert_eq!(seen.last().unwrap().1, data.len() as u64);
+}

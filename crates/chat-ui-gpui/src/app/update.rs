@@ -336,6 +336,21 @@ impl ChatApp {
                 self.read_seqs.clear();
                 self.status = "已登录".into();
             }
+            UiEvent::Transfer {
+                name,
+                done,
+                total,
+                uploading,
+            } => {
+                let percent = done
+                    .saturating_mul(100)
+                    .checked_div(total)
+                    .unwrap_or(100)
+                    .min(100);
+                let verb = if uploading { "上传" } else { "下载" };
+                self.status = format!("{verb} {name}：{percent}%");
+                self.status_kind = super::StatusKind::Info;
+            }
             UiEvent::SavedLogin { addr, username } => {
                 self.status = format!("本机存着 {username} 的登录，可以直接恢复");
                 self.saved_login = Some((addr, username));

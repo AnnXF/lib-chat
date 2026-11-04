@@ -63,7 +63,31 @@ pub trait Connection: Send + Sync {
     async fn download(&self, _room: RoomId, _id: AttachmentId) -> Result<Vec<u8>> {
         Err(ChatError::Protocol("该传输不支持附件".into()))
     }
+
+    /// 带进度的上传；默认实现忽略进度，直接走 [`Connection::upload`]。
+    async fn upload_with_progress(
+        &self,
+        room: RoomId,
+        attachment: Attachment,
+        data: Vec<u8>,
+        _progress: ProgressSink,
+    ) -> Result<()> {
+        self.upload(room, attachment, data).await
+    }
+
+    /// 带进度的下载；默认实现忽略进度，直接走 [`Connection::download`]。
+    async fn download_with_progress(
+        &self,
+        room: RoomId,
+        id: AttachmentId,
+        _progress: ProgressSink,
+    ) -> Result<Vec<u8>> {
+        self.download(room, id).await
+    }
 }
+
+/// 附件传输进度回调：`(已传字节, 总字节)`。
+pub type ProgressSink = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
 /// 服务端向某条连接推送事件的口子。
 ///

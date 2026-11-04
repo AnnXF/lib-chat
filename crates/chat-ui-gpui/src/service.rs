@@ -297,6 +297,13 @@ pub enum UiEvent {
     },
     /// 已退出登录。
     LoggedOut,
+    /// 附件传输进度。
+    Transfer {
+        name: String,
+        done: u64,
+        total: u64,
+        uploading: bool,
+    },
     /// 本机存着上次的登录：界面提出要不要恢复。
     SavedLogin {
         addr: String,

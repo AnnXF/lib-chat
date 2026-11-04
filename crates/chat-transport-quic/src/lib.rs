@@ -17,7 +17,9 @@ use chat_core::{
     Attachment, AttachmentId, ClientRequest, DeviceId, RoomId, RoomInfo, ServerEvent,
     MAX_ATTACHMENT_BYTES,
 };
-use chat_core::{ChatError, Connection, ConnectionAcceptor, EventStream, RequestSink, Result};
+use chat_core::{
+    ChatError, Connection, ConnectionAcceptor, EventStream, ProgressSink, RequestSink, Result,
+};
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use quinn::rustls::RootCertStore;
 use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig};
@@ -900,6 +902,17 @@ impl Connection for QuicConnection {
     }
 
     async fn upload(&self, room: RoomId, attachment: Attachment, data: Vec<u8>) -> Result<()> {
+        self.upload_with_progress(room, attachment, data, Arc::new(|_, _| {}))
+            .await
+    }
+
+    async fn upload_with_progress(
+        &self,
+        room: RoomId,
+        attachment: Attachment,
+        data: Vec<u8>,
+        progress: ProgressSink,
+    ) -> Result<()> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(ChatError::Closed);
         }
@@ -909,8 +922,12 @@ impl Connection for QuicConnection {
             .map_err(transport_err)?;
         let transfer = async {
             write_frame(&mut send, &BlobRequest::Upload { room, attachment }).await?;
+            let total = data.len() as u64;
+            let mut done = 0_u64;
             for chunk in data.chunks(BLOB_CHUNK) {
                 write_chunk(&mut send, chunk).await?;
+                done += chunk.len() as u64;
+                progress(done, total);
             }
             write_chunk(&mut send, &[]).await?;
             match read_frame::<BlobReply>(&mut recv).await? {
@@ -925,6 +942,16 @@ impl Connection for QuicConnection {
     }
 
     async fn download(&self, room: RoomId, id: AttachmentId) -> Result<Vec<u8>> {
+        self.download_with_progress(room, id, Arc::new(|_, _| {}))
+            .await
+    }
+
+    async fn download_with_progress(
+        &self,
+        room: RoomId,
+        id: AttachmentId,
+        progress: ProgressSink,
+    ) -> Result<Vec<u8>> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(ChatError::Closed);
         }
@@ -946,6 +973,7 @@ impl Connection for QuicConnection {
                             return Err(ChatError::Protocol("附件超过大小上限".into()));
                         }
                         data.extend_from_slice(&chunk);
+                        progress(data.len() as u64, size);
                     }
                     Ok(data)
                 }

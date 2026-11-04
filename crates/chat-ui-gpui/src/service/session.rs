@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use uuid::Uuid;
 
 use chat_core::{
-    Attachment, AttachmentId, MAX_ATTACHMENT_BYTES, Quote, guess_mime, sha256_hex,
+    Attachment, AttachmentId, MAX_ATTACHMENT_BYTES, ProgressSink, Quote, guess_mime, sha256_hex,
     validate_attachment,
 };
 use chat_transport_quic::QuicConnection;
@@ -715,7 +715,8 @@ impl Session {
         let events = self.events.clone();
         let room = self.target.room;
         tokio::spawn(async move {
-            if let Err(error) = send_file(&client, room, &path).await {
+            let progress = transfer_progress(&events, &path, true);
+            if let Err(error) = send_file(&client, room, &path, progress).await {
                 let _ = events
                     .send_async(UiEvent::Error(format!("发送文件失败: {error}")))
                     .await;
@@ -729,7 +730,8 @@ impl Session {
         let events = self.events.clone();
         let room = self.target.room;
         tokio::spawn(async move {
-            match save_attachment(&client, room, id, &path).await {
+            let progress = transfer_progress(&events, &path, false);
+            match save_attachment(&client, room, id, &path, progress).await {
                 Ok(()) => {
                     let _ = events
                         .send_async(UiEvent::Status(format!("已保存到 {}", path.display())))
@@ -793,7 +795,30 @@ impl Session {
 }
 
 /// 读取本地文件并作为一条文件消息发出。
-async fn send_file(client: &Client, room: RoomId, path: &Path) -> Result<(), String> {
+/// 把进度回调接到界面事件上；文件名取不到就不报进度。
+fn transfer_progress(events: &Sender<UiEvent>, path: &Path, uploading: bool) -> ProgressSink {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("附件")
+        .to_string();
+    let events = events.clone();
+    Arc::new(move |done: u64, total: u64| {
+        let _ = events.send(UiEvent::Transfer {
+            name: name.clone(),
+            done,
+            total,
+            uploading,
+        });
+    })
+}
+
+async fn send_file(
+    client: &Client,
+    room: RoomId,
+    path: &Path,
+    progress: ProgressSink,
+) -> Result<(), String> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -821,7 +846,7 @@ async fn send_file(client: &Client, room: RoomId, path: &Path) -> Result<(), Str
     };
     validate_attachment(&attachment).map_err(|e| e.to_string())?;
     client
-        .upload(room, attachment.clone(), data)
+        .upload_with_progress(room, attachment.clone(), data, progress)
         .await
         .map_err(|e| format!("上传失败: {e}"))?;
     client
@@ -836,9 +861,10 @@ async fn save_attachment(
     room: RoomId,
     id: AttachmentId,
     path: &Path,
+    progress: ProgressSink,
 ) -> Result<(), String> {
     let data = client
-        .download(room, id)
+        .download_with_progress(room, id, progress)
         .await
         .map_err(|e| format!("下载失败: {e}"))?;
     if let Some(parent) = path.parent()

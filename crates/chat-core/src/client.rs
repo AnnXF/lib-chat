@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::proto::{
     Attachment, AttachmentId, ClientRequest, Profile, Quote, RoomId, Seq, ServerEvent, UserId,
 };
-use crate::{Connection, Result};
+use crate::{Connection, ProgressSink, Result};
 
 #[derive(Clone)]
 pub struct Client {
@@ -259,6 +259,29 @@ impl Client {
     /// 下载附件内容。
     pub async fn download(&self, room: RoomId, id: AttachmentId) -> Result<Vec<u8>> {
         self.conn.download(room, id).await
+    }
+
+    /// 带进度的上传。
+    pub async fn upload_with_progress(
+        &self,
+        room: RoomId,
+        attachment: Attachment,
+        data: Vec<u8>,
+        progress: ProgressSink,
+    ) -> Result<()> {
+        self.conn
+            .upload_with_progress(room, attachment, data, progress)
+            .await
+    }
+
+    /// 带进度的下载。
+    pub async fn download_with_progress(
+        &self,
+        room: RoomId,
+        id: AttachmentId,
+        progress: ProgressSink,
+    ) -> Result<Vec<u8>> {
+        self.conn.download_with_progress(room, id, progress).await
     }
 
     pub async fn history(&self, room: RoomId, before: Option<Seq>, limit: u32) -> Result<()> {
