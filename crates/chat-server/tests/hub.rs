@@ -1312,3 +1312,51 @@ async fn favorites_keep_a_snapshot_after_recall() {
         _ => unreachable!(),
     }
 }
+
+/// 从没进过的会话收到消息，摘要里必须真的「未读」，否则角标永远不亮。
+#[tokio::test]
+async fn a_room_never_opened_reports_new_messages_as_unread() {
+    let dir = temp_dir("unread-first");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+    let (alice, alice_user) = register(&hub, "alice").await;
+    let (bob, bob_user) = register(&hub, "bob").await;
+    be_friends(&alice, alice_user.id, &bob, "bob").await;
+    wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
+    wait_for(&bob, |event| matches!(event, ServerEvent::Friends { .. })).await;
+
+    alice.open_direct(bob_user.id).await.unwrap();
+    let room = match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Rooms { rooms }
+            if rooms.iter().any(|known| known.kind == RoomKind::Direct))
+    })
+    .await
+    {
+        ServerEvent::Rooms { rooms } => {
+            rooms
+                .into_iter()
+                .find(|known| known.kind == RoomKind::Direct)
+                .unwrap()
+                .room
+        }
+        _ => unreachable!(),
+    };
+
+    // bob 发消息，alice 从没进过这个会话
+    bob.join(room, "Bob").await.unwrap();
+    wait_for(&bob, |event| matches!(event, ServerEvent::Joined { .. })).await;
+    bob.send_text(room, "第一条").await.unwrap();
+
+    match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Rooms { rooms }
+            if rooms.iter().any(|known| known.room == room && known.last_seq > 0))
+    })
+    .await
+    {
+        ServerEvent::Rooms { rooms } => {
+            let known = rooms.iter().find(|known| known.room == room).unwrap();
+            assert_eq!(known.read_seq, 0, "没读过的会话不该被当成已读");
+            assert!(known.last_seq > known.read_seq, "应当显示未读");
+        }
+        _ => unreachable!(),
+    }
+}

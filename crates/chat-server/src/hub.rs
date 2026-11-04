@@ -386,6 +386,7 @@ impl Hub {
             },
         )
         .await;
+        self.seed_read_markers(user.id).await;
         self.send_rooms(conn, user.id).await;
         self.push_friend_requests(user.id).await;
         self.send_friends_presence(conn, user.id).await;
@@ -504,18 +505,41 @@ impl Hub {
     }
 
     /// 填充每个会话的已读位置；首次没有记录时，把当前历史视为已读。
+    /// 填已读位置。没有记录一律按「一条都没读」算 —— 由 [`Hub::seed_read_markers`]
+    /// 在登录时补历史，之后到的消息才会真的显示未读。
     async fn fill_read_seqs(&self, user: UserId, rooms: &mut [RoomSummary]) {
         for room in rooms {
-            let read = match self.accounts.read_seq(user, room.room).await {
-                Ok(Some(seq)) => seq,
-                Ok(None) => {
-                    let latest = self.messages.latest_seq(room.room).await.unwrap_or(0);
-                    let _ = self.accounts.set_read_seq(user, room.room, latest).await;
-                    latest
-                }
-                Err(_) => 0,
-            };
+            let read = self
+                .accounts
+                .read_seq(user, room.room)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(0);
             room.read_seq = read.min(room.last_seq);
+        }
+    }
+
+    /// 登录时把「在此之前的历史」标成已读；登录之后到的新消息才算未读。
+    ///
+    /// 只补没有记录的会话，不覆盖已经读到的位置。
+    async fn seed_read_markers(&self, user: UserId) {
+        let Ok(rooms) = self.accounts.rooms(user).await else {
+            return;
+        };
+        for room in rooms {
+            if self
+                .accounts
+                .read_seq(user, room.room)
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                continue;
+            }
+            let latest = self.messages.latest_seq(room.room).await.unwrap_or(0);
+            let _ = self.accounts.set_read_seq(user, room.room, latest).await;
         }
     }
 
