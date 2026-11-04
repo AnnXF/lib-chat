@@ -31,6 +31,15 @@ impl ChatApp {
             })
             .is_some_and(|known| known.muted);
         let room_id = self.room.as_ref().map(|room| room.id);
+        let announcement = self
+            .room
+            .as_ref()
+            .and_then(|room| {
+                self.conversations
+                    .iter()
+                    .find(|known| known.room == room.id)
+            })
+            .and_then(|known| known.announcement.clone());
 
         // 没连上房间时不摆「加入」：那会儿点下去什么也不会发生，只会让人以为界面卡住了
         let action = match self.room.as_ref().map(|room| room.joined) {
@@ -179,6 +188,39 @@ impl ChatApp {
                     })
                     .child(action),
             )
+            .when_some(announcement, |this, text| {
+                this.child(
+                    div()
+                        .id("announcement")
+                        .test_id("announcement")
+                        .flex_none()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .px_6()
+                        .py_2()
+                        .bg(rgb(theme::FIELD))
+                        .border_b_1()
+                        .border_color(rgb(theme::BORDER))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.))
+                                .text_color(rgb(theme::ACCENT))
+                                .child("公告"),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(px(12.))
+                                .text_color(rgb(theme::MUTED))
+                                .child(text),
+                        ),
+                )
+            })
             .when(self.show_search, |this| {
                 this.child(self.render_search_panel(cx))
             })

@@ -405,6 +405,18 @@ impl ChatApp {
         let text = line.text.clone();
         let attachment = line.attachment.clone();
         let line_for_quote = line.clone();
+        // 群主可以把一条消息设为群公告
+        let can_announce = self
+            .room
+            .as_ref()
+            .and_then(|room| {
+                self.conversations
+                    .iter()
+                    .find(|known| known.room == room.id)
+            })
+            .is_some_and(|known| known.kind == chat_core::RoomKind::Group && known.owner)
+            && line.seq.is_some()
+            && !text.trim().is_empty();
 
         div()
             .id("message-menu-overlay")
@@ -445,6 +457,15 @@ impl ChatApp {
                             this.quote_message(line_for_quote.clone(), window, cx);
                         }),
                     ))
+                    .when(can_announce, |this| {
+                        let announced = line.text.clone();
+                        this.child(menu_item(
+                            "设为群公告",
+                            cx.listener(move |this, _, _, cx| {
+                                this.on_set_announcement(announced.clone(), cx);
+                            }),
+                        ))
+                    })
                     .when(line.mine, |this| {
                         let seq = line.seq;
                         let edit_text = line.text.clone();

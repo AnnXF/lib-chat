@@ -75,6 +75,12 @@ impl Client {
             .await
     }
 
+    pub async fn set_announcement(&self, room: RoomId, text: Option<String>) -> Result<()> {
+        self.conn
+            .request(ClientRequest::SetAnnouncement { room, text })
+            .await
+    }
+
     pub async fn set_muted(&self, room: RoomId, muted: bool) -> Result<()> {
         self.conn
             .request(ClientRequest::SetMuted { room, muted })

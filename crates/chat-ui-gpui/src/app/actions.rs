@@ -618,6 +618,23 @@ impl ChatApp {
         self.perform_login(false, cx);
     }
 
+    /// 把某条消息设为群公告。
+    pub(crate) fn on_set_announcement(&mut self, text: String, cx: &mut Context<Self>) {
+        let Some(room) = self.room.as_ref().map(|room| room.id) else {
+            return;
+        };
+        self.status = "已更新群公告".into();
+        self.status_kind = super::StatusKind::Info;
+        self.message_menu = None;
+        self.tell(
+            crate::service::UiCommand::SetAnnouncement {
+                room,
+                text: Some(text),
+            },
+            cx,
+        );
+    }
+
     /// 静音/取消静音当前会话。
     pub(crate) fn on_toggle_mute(&mut self, room: RoomId, muted: bool, cx: &mut Context<Self>) {
         self.status = if muted {

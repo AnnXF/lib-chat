@@ -118,6 +118,10 @@ pub struct RoomSummary {
     pub read_seq: Seq,
     /// 这个房间对我静音：不弹通知、不计未读角标，`@我` 仍然提醒。
     pub muted: bool,
+    /// 群公告；只有群聊且设置过才有值。
+    pub announcement: Option<String>,
+    /// 我是不是这个房间的群主。
+    pub owner: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,6 +213,11 @@ pub enum ClientRequest {
     /// 按用户名或昵称搜索用户，最多 20 条。
     SearchUsers {
         query: String,
+    },
+    /// 设置群公告；传 `None` 表示清空。只有群主能改。
+    SetAnnouncement {
+        room: RoomId,
+        text: Option<String>,
     },
     /// 设置某个房间是否静音。
     SetMuted {

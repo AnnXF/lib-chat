@@ -822,7 +822,9 @@ fn group_members_panel_fits_inside_the_window() {
                     last_text: None,
                     last_at: None,
                     read_seq: 0,
-                            muted: false,
+                    muted: false,
+                    announcement: None,
+                    owner: false,
                 }],
             });
             app.debug_apply(UiEvent::Lobby {
@@ -871,7 +873,9 @@ fn unread_banner_and_divider_are_rendered() {
                     last_text: Some("新消息".into()),
                     last_at: None,
                     read_seq: 0,
-                            muted: false,
+                    muted: false,
+                    announcement: None,
+                    owner: false,
                 }],
             });
             app.debug_apply(UiEvent::Lobby {
@@ -923,7 +927,9 @@ fn unread_banner_appears_before_history_loads() {
                     last_text: Some("新消息".into()),
                     last_at: None,
                     read_seq: 0,
-                            muted: false,
+                    muted: false,
+                    announcement: None,
+                    owner: false,
                 }],
             });
             app.debug_apply(UiEvent::Lobby {
@@ -976,7 +982,9 @@ fn unread_uses_server_read_position() {
                     last_text: None,
                     last_at: None,
                     read_seq: 10,
-                            muted: false,
+                    muted: false,
+                    announcement: None,
+                    owner: false,
                 }],
             });
             app.debug_apply(UiEvent::Lobby {
@@ -1008,7 +1016,9 @@ fn unread_uses_server_read_position() {
                     last_text: None,
                     last_at: None,
                     read_seq: 10,
-                            muted: false,
+                    muted: false,
+                    announcement: None,
+                    owner: false,
                 }],
             });
             app.debug_apply(UiEvent::Lobby {
@@ -1068,4 +1078,45 @@ fn friend_requests_are_listed_inside_the_contacts_sidebar() {
 
     assert_inside(&bounds(cx, "friend-requests"), "friend-requests");
     assert_inside(&bounds(cx, "contacts-body"), "contacts-body");
+}
+
+/// 群公告以一条横幅出现在聊天区顶部，长文本被截断而不是撑宽窗口。
+#[test]
+fn announcement_banner_stays_inside_the_chat_area() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    let room = chat_core::RoomId::new();
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| {
+            app.debug_apply(UiEvent::Conversations {
+                rooms: vec![chat_core::RoomSummary {
+                    room,
+                    kind: chat_core::RoomKind::Group,
+                    name: "很长的群名".into(),
+                    member_count: 3,
+                    last_seq: 0,
+                    last_text: None,
+                    last_at: None,
+                    read_seq: 0,
+                    muted: false,
+                    announcement: Some(
+                        "一条很长很长的群公告，用来确认它会被截断而不是把窗口撑宽，后面还要再补一些字".into(),
+                    ),
+                    owner: false,
+                }],
+            });
+            app.debug_apply(UiEvent::Lobby {
+                room,
+                name: "很长的群名".into(),
+                addr: "127.0.0.1:1".into(),
+                online: 1,
+            });
+            app.debug_open_conversation(room, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let banner = bounds(cx, "announcement");
+    assert_inside(&banner, "announcement");
+    assert_inside(&bounds(cx, "chat-main"), "chat-main");
 }

@@ -73,6 +73,8 @@ mod rooms {
     pub const OWNER_ID: &str = "owner_id";
     /// 单聊去重键：两个用户标识按字典序拼接；群聊为 NULL。
     pub const DIRECT_KEY: &str = "direct_key";
+    /// 群公告，为空表示没设置。
+    pub const ANNOUNCEMENT: &str = "announcement";
     pub const CREATED_AT: &str = "created_at";
 }
 
@@ -202,6 +204,21 @@ impl Accounts {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(|row| row.get::<i64, _>(0) != 0).unwrap_or(false))
+    }
+
+    /// 设置群公告；传 `None` 清空。
+    pub async fn set_announcement(
+        &self,
+        room: RoomId,
+        text: Option<String>,
+    ) -> std::result::Result<(), AccountError> {
+        let (sql, values) = Query::update()
+            .table(rooms::TABLE)
+            .value(rooms::ANNOUNCEMENT, text)
+            .and_where(Expr::col(rooms::ID).eq(room.to_string()))
+            .build(SqliteQueryBuilder);
+        bind(sqlx::query(&sql), values).execute(&self.pool).await?;
+        Ok(())
     }
 
     /// 设置静音；非成员设置无效。
@@ -831,6 +848,8 @@ impl Accounts {
                 (rooms::TABLE, rooms::KIND),
                 (rooms::TABLE, rooms::NAME),
                 (room_members::TABLE, room_members::MUTED),
+                (rooms::TABLE, rooms::ANNOUNCEMENT),
+                (rooms::TABLE, rooms::OWNER_ID),
             ])
             .from(room_members::TABLE)
             .inner_join(
@@ -870,6 +889,8 @@ impl Accounts {
                 last_at: None,
                 read_seq: 0,
                 muted: row.get::<i64, _>(3) != 0,
+                announcement: row.get::<Option<String>, _>(4),
+                owner: row.get::<Option<String>, _>(5).as_deref() == Some(&user.to_string()),
             });
         }
         Ok(result)
@@ -1154,7 +1175,13 @@ impl Accounts {
         viewer: UserId,
     ) -> std::result::Result<Option<RoomSummary>, AccountError> {
         let (sql, values) = Query::select()
-            .columns([rooms::ID, rooms::KIND, rooms::NAME])
+            .columns([
+                rooms::ID,
+                rooms::KIND,
+                rooms::NAME,
+                rooms::ANNOUNCEMENT,
+                rooms::OWNER_ID,
+            ])
             .from(rooms::TABLE)
             .and_where(Expr::col(rooms::ID).eq(room.to_string()))
             .build(SqliteQueryBuilder);
@@ -1187,6 +1214,8 @@ impl Accounts {
             last_at: None,
             read_seq: 0,
             muted: self.muted(room, viewer).await?,
+            announcement: row.get::<Option<String>, _>(3),
+            owner: row.get::<Option<String>, _>(4).as_deref() == Some(&viewer.to_string()),
         }))
     }
 
@@ -1439,6 +1468,8 @@ impl Accounts {
                 last_at: None,
                 read_seq: 0,
                 muted: false,
+                announcement: None,
+                owner: false,
             });
         }
         Ok(result)
@@ -1471,7 +1502,23 @@ const MIGRATIONS: &[Migration] = &[
         schema: v4_schema,
         raw: &[],
     },
+    Migration {
+        version: 5,
+        name: "群公告",
+        schema: v5_schema,
+        raw: &[],
+    },
 ];
+
+fn v5_schema() -> Vec<SchemaStatement> {
+    let alter = Table::alter()
+        .table(rooms::TABLE)
+        .add_column(ColumnDef::new(rooms::ANNOUNCEMENT).text())
+        .to_owned();
+    vec![SchemaStatement::TableStatement(
+        sea_query::TableStatement::Alter(alter),
+    )]
+}
 
 fn v4_schema() -> Vec<SchemaStatement> {
     let alter = Table::alter()

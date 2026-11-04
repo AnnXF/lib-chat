@@ -902,6 +902,29 @@ impl Hub {
                 }
             }
 
+            ClientRequest::SetAnnouncement { room, text } => {
+                let Some(user) = self.user_of(conn).await else {
+                    return self.send_to(conn, ServerEvent::AuthRequired).await;
+                };
+                if !self.accounts.is_owner(room, user.id).await.unwrap_or(false) {
+                    return self
+                        .send_error(conn, ErrorCode::Forbidden, "只有群主能改群公告")
+                        .await;
+                }
+                let text = text.map(|text| text.chars().take(500).collect::<String>());
+                if let Err(e) = self.accounts.set_announcement(room, text.clone()).await {
+                    return self.account_error(conn, e).await;
+                }
+                self.accounts
+                    .record_audit(
+                        &user.username,
+                        "set_announcement",
+                        &format!("房间 {room}：{}", text.unwrap_or_else(|| "清空".into())),
+                    )
+                    .await;
+                self.push_room_summaries(room).await;
+            }
+
             ClientRequest::SetMuted { room, muted } => {
                 let Some(user) = self.user_of(conn).await else {
                     return self.send_to(conn, ServerEvent::AuthRequired).await;

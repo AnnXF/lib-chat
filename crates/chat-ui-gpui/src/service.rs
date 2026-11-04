@@ -374,6 +374,11 @@ pub enum UiCommand {
     },
     /// 用上次落盘的令牌恢复登录；令牌留在服务层，界面不接触。
     Resume,
+    /// 设置群公告。
+    SetAnnouncement {
+        room: RoomId,
+        text: Option<String>,
+    },
     /// 设置某个会话是否静音。
     SetMuted {
         room: RoomId,
@@ -1136,6 +1141,7 @@ async fn run(
             }
             UiCommand::RefreshRooms
             | UiCommand::AddFriend { .. }
+            | UiCommand::SetAnnouncement { .. }
             | UiCommand::SetMuted { .. }
             | UiCommand::AcceptFriend { .. }
             | UiCommand::RejectFriend { .. }
@@ -1155,6 +1161,9 @@ async fn run(
                 let sent = match cmd {
                     UiCommand::RefreshRooms => client.list_rooms().await,
                     UiCommand::AddFriend { username } => client.add_friend(username).await,
+                    UiCommand::SetAnnouncement { room, text } => {
+                        client.set_announcement(room, text).await
+                    }
                     UiCommand::SetMuted { room, muted } => client.set_muted(room, muted).await,
                     UiCommand::AcceptFriend { user } => client.accept_friend(user).await,
                     UiCommand::RejectFriend { user } => client.reject_friend(user).await,
