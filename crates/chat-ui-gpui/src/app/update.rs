@@ -360,6 +360,9 @@ impl ChatApp {
                 self.read_seqs.clear();
                 self.status = "已登录".into();
             }
+            UiEvent::Favorites { items } => {
+                self.favorites = items;
+            }
             UiEvent::ReadCounts { room, counts } => {
                 if self.showing(room).is_some() {
                     self.read_counts = counts.into_iter().collect();

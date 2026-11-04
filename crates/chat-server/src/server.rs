@@ -272,6 +272,9 @@ impl Server {
             | ClientRequest::PinMessage { .. }
             | ClientRequest::Forward { .. }
             | ClientRequest::ForwardMultiple { .. }
+            | ClientRequest::Favorite { .. }
+            | ClientRequest::Unfavorite { .. }
+            | ClientRequest::ListFavorites
             | ClientRequest::ListRooms
             | ClientRequest::CreateGroup { .. }
             | ClientRequest::OpenDirect { .. }

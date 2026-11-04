@@ -8,8 +8,8 @@ use std::path::Path;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 use chat_core::{
-    ChatError, MemberRole, PinnedMessage, RoomId, RoomKind, RoomMember, RoomSummary, Seq, UserId,
-    UserSummary,
+    ChatError, FavoriteItem, MemberRole, PinnedMessage, RoomId, RoomKind, RoomMember, RoomSummary,
+    Seq, UserId, UserSummary,
 };
 use sea_query::{ColumnDef, Expr, Query, SchemaStatement, SqliteQueryBuilder, Table};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
@@ -45,6 +45,17 @@ mod friends {
     pub const TABLE: &str = "friends";
     pub const USER_ID: &str = "user_id";
     pub const FRIEND_ID: &str = "friend_id";
+    pub const CREATED_AT: &str = "created_at";
+}
+
+/// 收藏：正文是收藏当时的快照。
+mod favorites {
+    pub const TABLE: &str = "favorites";
+    pub const USER_ID: &str = "user_id";
+    pub const ROOM_ID: &str = "room_id";
+    pub const SEQ: &str = "seq";
+    pub const SENDER: &str = "sender";
+    pub const TEXT: &str = "text";
     pub const CREATED_AT: &str = "created_at";
 }
 
@@ -219,6 +230,102 @@ impl Accounts {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(|row| row.get::<i64, _>(0) != 0).unwrap_or(false))
+    }
+
+    /// 收藏一条消息；同一条重复收藏保留最早的那次。
+    pub async fn add_favorite(
+        &self,
+        user: UserId,
+        room: RoomId,
+        seq: Seq,
+        sender: &str,
+        text: &str,
+    ) -> std::result::Result<(), AccountError> {
+        let (sql, values) = Query::insert()
+            .into_table(favorites::TABLE)
+            .columns([
+                favorites::USER_ID,
+                favorites::ROOM_ID,
+                favorites::SEQ,
+                favorites::SENDER,
+                favorites::TEXT,
+                favorites::CREATED_AT,
+            ])
+            .values_panic([
+                user.to_string().into(),
+                room.to_string().into(),
+                seq.into(),
+                sender.to_string().into(),
+                text.to_string().into(),
+                now_secs().into(),
+            ])
+            .on_conflict(
+                sea_query::OnConflict::columns([
+                    favorites::USER_ID,
+                    favorites::ROOM_ID,
+                    favorites::SEQ,
+                ])
+                .do_nothing()
+                .to_owned(),
+            )
+            .build(SqliteQueryBuilder);
+        bind(sqlx::query(&sql), values).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn remove_favorite(
+        &self,
+        user: UserId,
+        room: RoomId,
+        seq: Seq,
+    ) -> std::result::Result<(), AccountError> {
+        let (sql, values) = Query::delete()
+            .from_table(favorites::TABLE)
+            .and_where(Expr::col(favorites::USER_ID).eq(user.to_string()))
+            .and_where(Expr::col(favorites::ROOM_ID).eq(room.to_string()))
+            .and_where(Expr::col(favorites::SEQ).eq(seq))
+            .build(SqliteQueryBuilder);
+        bind(sqlx::query(&sql), values).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// 我的收藏，最近的在最前。
+    pub async fn favorites(
+        &self,
+        user: UserId,
+    ) -> std::result::Result<Vec<FavoriteItem>, AccountError> {
+        let (sql, values) = Query::select()
+            .columns([
+                favorites::ROOM_ID,
+                favorites::SEQ,
+                favorites::SENDER,
+                favorites::TEXT,
+                favorites::CREATED_AT,
+            ])
+            .from(favorites::TABLE)
+            .and_where(Expr::col(favorites::USER_ID).eq(user.to_string()))
+            .order_by(favorites::CREATED_AT, sea_query::Order::Desc)
+            .build(SqliteQueryBuilder);
+        let rows = bind(sqlx::query(&sql), values)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let room: RoomId = row
+                .get::<String, _>(0)
+                .parse()
+                .map_err(|e| AccountError::Storage(format!("房间标识无效: {e}")))?;
+            let room_name = self.room_name(room).await?.unwrap_or_default();
+            items.push(FavoriteItem {
+                room,
+                room_name,
+                seq: row.get(1),
+                sender: row.get(2),
+                text: row.get(3),
+                at: row.get(4),
+            });
+        }
+        Ok(items)
     }
 
     /// 房间内所有成员的已读位置。
@@ -1588,7 +1695,37 @@ const MIGRATIONS: &[Migration] = &[
         schema: v6_schema,
         raw: &[],
     },
+    Migration {
+        version: 7,
+        name: "收藏",
+        schema: v7_schema,
+        raw: &[],
+    },
 ];
+
+fn v7_schema() -> Vec<SchemaStatement> {
+    let table = Table::create()
+        .table(favorites::TABLE)
+        .if_not_exists()
+        .col(ColumnDef::new(favorites::USER_ID).text().not_null())
+        .col(ColumnDef::new(favorites::ROOM_ID).text().not_null())
+        .col(ColumnDef::new(favorites::SEQ).big_integer().not_null())
+        .col(ColumnDef::new(favorites::SENDER).text().not_null())
+        .col(ColumnDef::new(favorites::TEXT).text().not_null())
+        .col(
+            ColumnDef::new(favorites::CREATED_AT)
+                .big_integer()
+                .not_null(),
+        )
+        .primary_key(
+            sea_query::Index::create()
+                .col(favorites::USER_ID)
+                .col(favorites::ROOM_ID)
+                .col(favorites::SEQ),
+        )
+        .to_owned();
+    vec![migrate::table(table)]
+}
 
 fn v6_schema() -> Vec<SchemaStatement> {
     // SQLite 一条 ALTER TABLE 只能加一列

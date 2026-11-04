@@ -249,6 +249,14 @@ impl Hub {
         }
     }
 
+    /// 把收藏列表回给当前连接。
+    async fn send_favorites(&self, conn: ConnId, user: UserId) {
+        match self.accounts.favorites(user).await {
+            Ok(items) => self.send_to(conn, ServerEvent::Favorites { items }).await,
+            Err(e) => self.account_error(conn, e).await,
+        }
+    }
+
     /// 把最近一页消息的已读人数推给房间成员。
     ///
     /// 只在有人推进已读位置时算一次，代价是一次成员读位置查询 + 一次历史查询。
@@ -1041,6 +1049,66 @@ impl Hub {
                             .await;
                     }
                 }
+            }
+
+            ClientRequest::Favorite { room, seq } => {
+                let Some(user) = self.user_of(conn).await else {
+                    return self.send_to(conn, ServerEvent::AuthRequired).await;
+                };
+                if !self
+                    .accounts
+                    .is_member(room, user.id)
+                    .await
+                    .unwrap_or(false)
+                {
+                    return self
+                        .send_error(conn, ErrorCode::RoomMismatch, "房间不存在")
+                        .await;
+                }
+                let Ok(messages) = self.messages.history(room, Some(seq + 1), 1).await else {
+                    return self
+                        .send_error(conn, ErrorCode::Internal, "读取消息失败")
+                        .await;
+                };
+                let Some(message) = messages.into_iter().next() else {
+                    return self
+                        .send_error(conn, ErrorCode::NotFound, "消息不存在")
+                        .await;
+                };
+                // 收藏存的是当时的正文，之后撤回也不影响
+                let text = if message.kind == MessageKind::File {
+                    format!(
+                        "[文件] {}",
+                        message.attachment.as_ref().map_or("", |a| &a.name)
+                    )
+                } else {
+                    message.text.clone()
+                };
+                if let Err(e) = self
+                    .accounts
+                    .add_favorite(user.id, room, seq, &message.sender_name, &text)
+                    .await
+                {
+                    return self.account_error(conn, e).await;
+                }
+                self.send_favorites(conn, user.id).await;
+            }
+
+            ClientRequest::Unfavorite { room, seq } => {
+                let Some(user) = self.user_of(conn).await else {
+                    return self.send_to(conn, ServerEvent::AuthRequired).await;
+                };
+                if let Err(e) = self.accounts.remove_favorite(user.id, room, seq).await {
+                    return self.account_error(conn, e).await;
+                }
+                self.send_favorites(conn, user.id).await;
+            }
+
+            ClientRequest::ListFavorites => {
+                let Some(user) = self.user_of(conn).await else {
+                    return self.send_to(conn, ServerEvent::AuthRequired).await;
+                };
+                self.send_favorites(conn, user.id).await;
             }
 
             ClientRequest::ForwardMultiple { from, seqs, to } => {

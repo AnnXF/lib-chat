@@ -81,6 +81,22 @@ impl Client {
             .await
     }
 
+    pub async fn favorite(&self, room: RoomId, seq: Seq) -> Result<()> {
+        self.conn
+            .request(ClientRequest::Favorite { room, seq })
+            .await
+    }
+
+    pub async fn unfavorite(&self, room: RoomId, seq: Seq) -> Result<()> {
+        self.conn
+            .request(ClientRequest::Unfavorite { room, seq })
+            .await
+    }
+
+    pub async fn list_favorites(&self) -> Result<()> {
+        self.conn.request(ClientRequest::ListFavorites).await
+    }
+
     pub async fn forward_multiple(&self, from: RoomId, seqs: Vec<Seq>, to: RoomId) -> Result<()> {
         self.conn
             .request(ClientRequest::ForwardMultiple { from, seqs, to })

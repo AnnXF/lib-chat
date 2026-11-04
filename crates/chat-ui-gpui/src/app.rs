@@ -137,6 +137,10 @@ pub struct ChatApp {
     friends: Vec<chat_core::UserSummary>,
     /// 别人发给我、还没处理的好友申请。
     friend_requests: Vec<chat_core::UserSummary>,
+    /// 我的收藏。
+    favorites: Vec<chat_core::FavoriteItem>,
+    /// 收藏面板是否展开。
+    show_favorites: bool,
     /// 当前房间每条消息的已读人数。
     read_counts: HashMap<Seq, u32>,
     /// 已解码的图片附件，按附件标识索引。
@@ -397,6 +401,8 @@ impl ChatApp {
             conversations: Vec::new(),
             friends: Vec::new(),
             friend_requests: Vec::new(),
+            favorites: Vec::new(),
+            show_favorites: false,
             read_counts: HashMap::new(),
             previews: HashMap::new(),
             nav: NavTab::Chats,

@@ -214,6 +214,12 @@ impl ChatApp {
                         ))
                     })
                     .child(button(
+                        "收藏",
+                        false,
+                        false,
+                        cx.listener(Self::on_toggle_favorites),
+                    ))
+                    .child(button(
                         "搜索",
                         false,
                         false,
@@ -332,6 +338,9 @@ impl ChatApp {
                                 .child(text),
                         ),
                 )
+            })
+            .when(self.show_favorites, |this| {
+                this.child(self.render_favorites_panel(cx))
             })
             .when(self.show_search, |this| {
                 this.child(self.render_search_panel(cx))
@@ -497,6 +506,84 @@ fn quote_bar(quote: chat_core::Quote, cx: &mut Context<ChatApp>) -> AnyElement {
 }
 
 impl ChatApp {
+    /// 收藏面板：每条收藏一行，可直接移除。
+    pub(crate) fn render_favorites_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let rows: Vec<_> = self
+            .favorites
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let room = item.room;
+                let seq = item.seq;
+                div()
+                    .id(("favorite", index))
+                    .min_h(px(36.))
+                    .px_6()
+                    .py_1()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .border_b_1()
+                    .border_color(rgb(theme::BORDER))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(theme::TEXT))
+                                    .child(item.text.clone()),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(theme::FAINT))
+                                    .child(format!("{} · {}", item.room_name, item.sender)),
+                            ),
+                    )
+                    .child(button(
+                        "移除",
+                        false,
+                        false,
+                        cx.listener(move |this, _, _, cx| {
+                            this.on_unfavorite(room, seq, cx);
+                        }),
+                    ))
+                    .into_any_element()
+            })
+            .collect();
+
+        div()
+            .id("favorites-panel")
+            .test_id("favorites-panel")
+            .flex_none()
+            .max_h(px(220.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .bg(rgb(theme::SURFACE))
+            .border_b_1()
+            .border_color(rgb(theme::BORDER))
+            .when(rows.is_empty(), |this| {
+                this.child(
+                    div()
+                        .px_6()
+                        .py_2()
+                        .text_size(px(12.))
+                        .text_color(rgb(theme::MUTED))
+                        .child("还没有收藏"),
+                )
+            })
+            .children(rows)
+            .into_any_element()
+    }
+
     /// 群成员面板：成员、角色、移出/退群/解散。
     pub(crate) fn render_members_panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let me = self.account.as_ref().map(|user| user.id);

@@ -561,6 +561,11 @@ impl ChatApp {
 
     /// 供无头测试直接打开消息菜单。
     #[cfg(any(test, feature = "ui-test"))]
+    pub fn debug_show_favorites(&mut self, cx: &mut Context<Self>) {
+        self.show_favorites = true;
+        cx.notify();
+    }
+
     pub fn debug_start_selection(&mut self, seq: Seq) {
         self.selection = Some(vec![seq]);
     }
@@ -631,6 +636,38 @@ impl ChatApp {
 
     pub(crate) fn on_login(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.perform_login(false, cx);
+    }
+
+    /// 收藏当前这条消息。
+    pub(crate) fn on_favorite(&mut self, seq: Seq, cx: &mut Context<Self>) {
+        let Some(room) = self.room.as_ref().map(|room| room.id) else {
+            return;
+        };
+        self.message_menu = None;
+        self.status = "已收藏".into();
+        self.status_kind = super::StatusKind::Info;
+        self.tell(crate::service::UiCommand::Favorite { room, seq }, cx);
+    }
+
+    /// 从收藏里移除。
+    pub(crate) fn on_unfavorite(&mut self, room: RoomId, seq: Seq, cx: &mut Context<Self>) {
+        self.status = "已取消收藏".into();
+        self.status_kind = super::StatusKind::Info;
+        self.tell(crate::service::UiCommand::Unfavorite { room, seq }, cx);
+    }
+
+    /// 展开/收起收藏面板；展开时拉一次最新列表。
+    pub(crate) fn on_toggle_favorites(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_favorites = !self.show_favorites;
+        if self.show_favorites {
+            self.tell(crate::service::UiCommand::ListFavorites, cx);
+        }
+        cx.notify();
     }
 
     /// 打开转发目标选择。

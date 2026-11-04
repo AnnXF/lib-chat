@@ -1422,3 +1422,35 @@ fn selection_bar_shows_inside_the_chat_area() {
     assert_inside(&bounds(cx, "selection-bar"), "selection-bar");
     assert_inside(&bounds(cx, "chat-main"), "chat-main");
 }
+
+/// 收藏面板：有条目时列出正文与来源，长文本被截断。
+#[test]
+fn favorites_panel_lists_items_inside_the_chat_area() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    let room = chat_core::RoomId::new();
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| {
+            app.debug_apply(UiEvent::Lobby {
+                room,
+                name: "收藏群".into(),
+                addr: "127.0.0.1:1".into(),
+                online: 1,
+            });
+            app.debug_apply(UiEvent::Favorites {
+                items: vec![chat_core::FavoriteItem {
+                    room,
+                    room_name: "一个很长很长的群名用来撑宽度".into(),
+                    seq: 1,
+                    sender: "Bob".into(),
+                    text: "一条很长很长的收藏正文，用来确认它会被截断而不是把窗口撑宽".into(),
+                    at: 0,
+                }],
+            });
+            app.debug_show_favorites(cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert_inside(&bounds(cx, "favorites-panel"), "favorites-panel");
+}

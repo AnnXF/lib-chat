@@ -524,6 +524,14 @@ impl ChatApp {
                     ))
                     .when_some(line.seq, |this, seq| {
                         this.child(menu_item(
+                            "收藏",
+                            cx.listener(move |this, _, _, cx| {
+                                this.on_favorite(seq, cx);
+                            }),
+                        ))
+                    })
+                    .when_some(line.seq, |this, seq| {
+                        this.child(menu_item(
                             "多选",
                             cx.listener(move |this, _, _, cx| {
                                 this.on_start_selection(seq, cx);

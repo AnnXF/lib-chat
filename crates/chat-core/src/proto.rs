@@ -170,6 +170,18 @@ pub struct Message {
     pub server_ts_ms: i64,
 }
 
+/// 一条收藏。正文是收藏当时的快照，消息被撤回也不影响。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FavoriteItem {
+    pub room: RoomId,
+    pub room_name: String,
+    pub seq: Seq,
+    pub sender: String,
+    pub text: String,
+    /// 收藏时间（Unix 秒）。
+    pub at: i64,
+}
+
 /// 大厅摘要：未加入房间者也能获取，不含任何消息内容。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LobbyInfo {
@@ -234,6 +246,18 @@ pub enum ClientRequest {
         seq: Seq,
         to: RoomId,
     },
+    /// 收藏一条消息（保存当时的正文快照）。
+    Favorite {
+        room: RoomId,
+        seq: Seq,
+    },
+    /// 取消收藏。
+    Unfavorite {
+        room: RoomId,
+        seq: Seq,
+    },
+    /// 列出我的收藏。
+    ListFavorites,
     /// 把多条消息合并成一条聊天记录转发。
     ForwardMultiple {
         from: RoomId,
@@ -360,6 +384,10 @@ pub enum ServerEvent {
     AuthRequired,
     Friends {
         users: Vec<UserSummary>,
+    },
+    /// 我的收藏列表。
+    Favorites {
+        items: Vec<FavoriteItem>,
     },
     /// 房间内每条消息的已读人数（只含有人读过的）。
     ReadCounts {

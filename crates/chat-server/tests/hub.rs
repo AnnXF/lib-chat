@@ -1243,3 +1243,72 @@ async fn forwarding_multiple_messages_builds_one_transcript() {
         _ => unreachable!(),
     }
 }
+
+/// 收藏：快照正文，撤回后仍然保留；重复收藏不重复记。
+#[tokio::test]
+async fn favorites_keep_a_snapshot_after_recall() {
+    let dir = temp_dir("favorite");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+    let (alice, _) = register(&hub, "alice").await;
+    let room = hub.default_room();
+    alice.join(room, "Alice").await.unwrap();
+    wait_for(&alice, |event| matches!(event, ServerEvent::Joined { .. })).await;
+
+    alice.send_text(room, "要收藏的话").await.unwrap();
+    let seq = match wait_for(&alice, |event| matches!(event, ServerEvent::Message { .. })).await {
+        ServerEvent::Message { message } => message.seq,
+        _ => unreachable!(),
+    };
+
+    alice.favorite(room, seq).await.unwrap();
+    match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Favorites { .. })
+    })
+    .await
+    {
+        ServerEvent::Favorites { items } => {
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].text, "要收藏的话");
+            assert_eq!(items[0].room, room);
+        }
+        _ => unreachable!(),
+    }
+
+    // 重复收藏不会多出一条
+    alice.favorite(room, seq).await.unwrap();
+    match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Favorites { .. })
+    })
+    .await
+    {
+        ServerEvent::Favorites { items } => assert_eq!(items.len(), 1),
+        _ => unreachable!(),
+    }
+
+    // 撤回之后收藏里还是原来的正文
+    alice.recall_message(room, seq).await.unwrap();
+    wait_for(&alice, |event| {
+        matches!(event, ServerEvent::MessageRecalled { .. })
+    })
+    .await;
+    alice.list_favorites().await.unwrap();
+    match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Favorites { .. })
+    })
+    .await
+    {
+        ServerEvent::Favorites { items } => assert_eq!(items[0].text, "要收藏的话"),
+        _ => unreachable!(),
+    }
+
+    alice.unfavorite(room, seq).await.unwrap();
+    match wait_for(
+        &alice,
+        |event| matches!(event, ServerEvent::Favorites { items } if items.is_empty()),
+    )
+    .await
+    {
+        ServerEvent::Favorites { .. } => {}
+        _ => unreachable!(),
+    }
+}

@@ -269,6 +269,10 @@ pub enum UiEvent {
     Friends {
         users: Vec<UserSummary>,
     },
+    /// 我的收藏。
+    Favorites {
+        items: Vec<chat_core::FavoriteItem>,
+    },
     /// 房间内每条消息的已读人数。
     ReadCounts {
         room: RoomId,
@@ -403,6 +407,18 @@ pub enum UiCommand {
         seq: Seq,
         to: RoomId,
     },
+    /// 收藏一条消息。
+    Favorite {
+        room: RoomId,
+        seq: Seq,
+    },
+    /// 取消收藏。
+    Unfavorite {
+        room: RoomId,
+        seq: Seq,
+    },
+    /// 拉一次收藏列表。
+    ListFavorites,
     /// 把多条消息合并转发到别的会话。
     ForwardMultiple {
         from: RoomId,
@@ -1207,6 +1223,9 @@ async fn run(
             | UiCommand::AddFriend { .. }
             | UiCommand::ForwardMessage { .. }
             | UiCommand::ForwardMultiple { .. }
+            | UiCommand::Favorite { .. }
+            | UiCommand::Unfavorite { .. }
+            | UiCommand::ListFavorites
             | UiCommand::PinMessage { .. }
             | UiCommand::SetAnnouncement { .. }
             | UiCommand::SetMuted { .. }
@@ -1234,6 +1253,9 @@ async fn run(
                     UiCommand::ForwardMultiple { from, seqs, to } => {
                         client.forward_multiple(from, seqs, to).await
                     }
+                    UiCommand::Favorite { room, seq } => client.favorite(room, seq).await,
+                    UiCommand::Unfavorite { room, seq } => client.unfavorite(room, seq).await,
+                    UiCommand::ListFavorites => client.list_favorites().await,
                     UiCommand::PinMessage { room, seq } => client.pin_message(room, seq).await,
                     UiCommand::SetAnnouncement { room, text } => {
                         client.set_announcement(room, text).await
