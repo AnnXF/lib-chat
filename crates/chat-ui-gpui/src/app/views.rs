@@ -668,13 +668,22 @@ impl ChatApp {
                             .text_color(rgb(theme::MUTED))
                             .child("先在服务端注册账号；登录后进入默认大厅"),
                     )
-                    .child(login_field("服务端地址", self.login_addr.clone()))
+                    // 内置了服务端信息就不再让人填，界面上只留账号
+                    .when(!crate::config::LOCKED, |this| {
+                        this.child(login_field("服务端地址", self.login_addr.clone()))
+                    })
                     .child(login_field("用户名", self.login_user.clone()))
                     .child(login_field("密码", self.login_password.clone()))
-                    .child(login_field(
-                        "证书指纹（自签时填，受信 CA 留空）",
-                        self.login_fingerprint.clone(),
-                    ))
+                    .when(!crate::config::LOCKED, |this| {
+                        this.child(login_field(
+                            "证书指纹（自签时填，受信 CA 留空）",
+                            self.login_fingerprint.clone(),
+                        ))
+                    })
+                    .when(crate::config::LOCKED, |this| {
+                        let addr = crate::config::SERVER_ADDR;
+                        this.child(hint(&format!("已连接 {addr}（地址与指纹由构建配置内置）")))
+                    })
                     .child(
                         div()
                             .flex()
@@ -818,6 +827,18 @@ impl ChatApp {
                     .children(rows),
             )
             .into_any_element()
+    }
+
+    /// 登录页上出现的字段标签，布局测试用来确认内置时不再显示地址与指纹。
+    pub fn debug_login_labels(&self) -> Vec<String> {
+        let mut labels = Vec::new();
+        if !crate::config::LOCKED {
+            labels.push("服务端地址".to_string());
+            labels.push("证书指纹".to_string());
+        }
+        labels.push("用户名".to_string());
+        labels.push("密码".to_string());
+        labels
     }
 
     /// 通讯录好友右键菜单。

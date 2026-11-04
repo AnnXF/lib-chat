@@ -28,6 +28,11 @@ uuid.workspace = true
 # 无头 UI 布局测试：启用 gpui 的测试平台与元素边界查询。
 ui-test = ["gpui/test-support"]
 
+[build-dependencies]
+serde = { workspace = true }
+serde_json.workspace = true
+sha2.workspace = true
+
 [dev-dependencies]
 async-trait.workspace = true
 rcgen = "0.14.10"

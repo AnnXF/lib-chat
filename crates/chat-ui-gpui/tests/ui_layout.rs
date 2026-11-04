@@ -1454,3 +1454,23 @@ fn favorites_panel_lists_items_inside_the_chat_area() {
 
     assert_inside(&bounds(cx, "favorites-panel"), "favorites-panel");
 }
+
+/// 内置了服务端信息时，登录页只剩账号密码，地址与指纹不再出现。
+#[test]
+fn login_page_hides_server_fields_when_they_are_built_in() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| app.debug_logout(cx));
+    });
+    cx.run_until_parked();
+
+    assert_inside(&bounds(cx, "login-page"), "login-page");
+    if chat_ui_gpui::config::LOCKED {
+        // 内置时整页没有地址/指纹输入框，只有账号密码
+        let labels = cx.update(|_window, cx| view.read(cx).debug_login_labels());
+        assert!(labels.iter().any(|label| label.contains("用户名")));
+        assert!(!labels.iter().any(|label| label.contains("服务端地址")));
+        assert!(!labels.iter().any(|label| label.contains("证书指纹")));
+    }
+}

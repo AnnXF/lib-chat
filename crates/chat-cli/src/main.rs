@@ -47,6 +47,7 @@ fn usage() {
     eprintln!(
         "用法:\n  \
          libchat host [--port 0] [--name 房间名]\n  \
+         libchat identity [--dir 目录]（本地开发：确保自签身份存在并打印指纹）\n  \
          libchat serve [--listen 0.0.0.0:4433] [--name 房间名] [--cert 证书链.pem --key 私钥.pem] [--data-dir 目录] [--announce 广播端口]\n  \
          libchat register --server 主机:端口 [--fingerprint SHA-256 | --ca 根证书.pem] --user 账号 --password 密码 [--name 昵称]\n  \
          libchat admin users|rooms|health|audit|gc [--data-dir 目录]\n  \
@@ -62,6 +63,7 @@ async fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("host") => host(&args[1..]).await,
         Some("serve") => serve_cmd(&args[1..]).await,
+        Some("identity") => identity_cmd(&args[1..]).await,
         Some("register") => register_cmd(&args[1..]).await,
         Some("admin") => admin_cmd(&args[1..]).await,
         Some("join") => join(&args[1..]).await,
@@ -78,6 +80,22 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// 本地开发用：确保数据目录里有自签身份，并打印指纹。
+///
+/// 客户端在构建时读这个指纹，界面就不用再让人填地址与指纹。
+async fn identity_cmd(args: &[String]) -> Result<(), AnyErr> {
+    let dir = match opt(args, "--dir") {
+        Some(path) => PathBuf::from(path),
+        None => default_data_dir()?,
+    };
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("room.identity");
+    let allow_new = !path.exists();
+    let cert = chat_transport_quic::SelfSignedCert::load_or_create(&path, allow_new)?;
+    println!("{}", cert.fingerprint());
+    Ok(())
 }
 
 async fn serve_cmd(args: &[String]) -> Result<(), AnyErr> {

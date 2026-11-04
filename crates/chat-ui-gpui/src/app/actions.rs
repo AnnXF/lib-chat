@@ -606,12 +606,24 @@ impl ChatApp {
 
 impl ChatApp {
     fn perform_login(&mut self, register: bool, cx: &mut Context<Self>) {
-        let addr = self.login_addr.read(cx).content().trim().to_string();
         let username = self.login_user.read(cx).content().trim().to_string();
         let password = self.login_password.read(cx).content().to_string();
-        let fingerprint = self.login_fingerprint.read(cx).content().trim().to_string();
-        if addr.is_empty() || username.is_empty() || password.is_empty() {
-            self.status = "地址、用户名和密码都不能为空".into();
+        // 内置了服务端信息时，地址与指纹由构建配置决定，界面上没有这两项
+        let (addr, fingerprint) = if crate::config::LOCKED {
+            crate::config::credentials(String::new(), String::new())
+        } else {
+            let addr = self.login_addr.read(cx).content().trim().to_string();
+            let fingerprint = self.login_fingerprint.read(cx).content().trim().to_string();
+            if addr.is_empty() {
+                self.status = "请填写服务端地址".into();
+                self.status_kind = super::StatusKind::Error;
+                cx.notify();
+                return;
+            }
+            crate::config::credentials(addr, fingerprint)
+        };
+        if username.is_empty() || password.is_empty() {
+            self.status = "用户名和密码都不能为空".into();
             self.status_kind = super::StatusKind::Error;
             cx.notify();
             return;
@@ -625,7 +637,7 @@ impl ChatApp {
         self.tell(
             UiCommand::Login {
                 addr,
-                fingerprint: (!fingerprint.is_empty()).then_some(fingerprint),
+                fingerprint,
                 username,
                 password,
                 register,
