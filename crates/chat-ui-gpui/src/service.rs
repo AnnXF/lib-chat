@@ -297,6 +297,12 @@ pub enum UiEvent {
     },
     /// 已退出登录。
     LoggedOut,
+    /// 图片附件的原图内容，界面据此渲染预览。
+    Preview {
+        id: AttachmentId,
+        mime: String,
+        bytes: std::sync::Arc<Vec<u8>>,
+    },
     /// 附件传输进度。
     Transfer {
         name: String,

@@ -567,9 +567,49 @@ impl Session {
         }
     }
 
+    /// 图片消息先下载到本地缓存，再交给界面渲染预览。
+    ///
+    /// 只预取小图；大图和视频仍然按需另存，免得一条消息就吃掉几十兆流量。
+    fn prefetch_preview(&self, client: &Client, message: &chat_core::Message) {
+        let Some(attachment) = &message.attachment else {
+            return;
+        };
+        if !attachment.mime.starts_with("image/") || attachment.size > MAX_PREVIEW_BYTES {
+            return;
+        }
+        let client = client.clone();
+        let events = self.events.clone();
+        let room = self.target.room;
+        let id = attachment.id;
+        let mime = attachment.mime.clone();
+        let path = preview_dir().join(&attachment.sha256);
+        tokio::spawn(async move {
+            if !path.exists() {
+                let progress: ProgressSink = Arc::new(|_, _| {});
+                if client
+                    .download_to_file(room, id, path.clone(), progress)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            if let Ok(bytes) = tokio::fs::read(&path).await {
+                let _ = events
+                    .send_async(UiEvent::Preview {
+                        id,
+                        mime,
+                        bytes: Arc::new(bytes),
+                    })
+                    .await;
+            }
+        });
+    }
+
     async fn observe(&mut self, client: &Client, event: &ServerEvent) {
         match event {
             ServerEvent::Message { message } => {
+                self.prefetch_preview(client, message);
                 self.pending
                     .retain(|(id, _, _)| *id != message.client_msg_id);
                 self.newest = self.newest.max(message.seq);
@@ -609,6 +649,9 @@ impl Session {
             ServerEvent::History {
                 messages, has_more, ..
             } => {
+                for message in messages {
+                    self.prefetch_preview(client, message);
+                }
                 self.loading_older = false;
                 self.has_older = *has_more;
                 if let Some(first) = messages.first() {
@@ -795,6 +838,17 @@ impl Session {
 }
 
 /// 读取本地文件并作为一条文件消息发出。
+/// 图片预览缓存的目录：同一份内容只下一次。
+fn preview_dir() -> PathBuf {
+    let base = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(".lib-chat").join("rooms").join("preview")
+}
+
+/// 只给不超过这个大小的图片做预览。
+const MAX_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
+
 /// 把进度回调接到界面事件上；文件名取不到就不报进度。
 fn transfer_progress(events: &Sender<UiEvent>, path: &Path, uploading: bool) -> ProgressSink {
     let name = path

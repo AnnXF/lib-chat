@@ -51,9 +51,14 @@ impl ChatApp {
         // 只渲染可见范围那几条，消息再多每帧成本也不变
         let this = cx.entity();
         let messages = list(self.list.clone(), move |ix, _window, cx| {
-            let (line, attachment) = {
+            let (line, attachment, preview) = {
                 let app = this.read(cx);
-                (app.lines[ix].clone(), app.lines[ix].attachment.clone())
+                let line = app.lines[ix].clone();
+                let attachment = line.attachment.clone();
+                let preview = attachment
+                    .as_ref()
+                    .and_then(|attachment| app.previews.get(&attachment.id).cloned());
+                (line, attachment, preview)
             };
             let save = attachment.map(|attachment| {
                 let entity = this.clone();
@@ -63,7 +68,7 @@ impl ChatApp {
                     });
                 }) as SaveHandler
             });
-            let element = render_line(&line, save);
+            let element = render_line(&line, save, preview);
 
             // 右键打开消息菜单；坐标是窗口坐标，菜单在主区上层绝对定位
             let menu_line = line.clone();

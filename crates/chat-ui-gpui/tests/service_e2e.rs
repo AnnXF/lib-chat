@@ -1493,3 +1493,52 @@ fn sends_and_receives_a_quoted_message() {
         _ => unreachable!(),
     }
 }
+
+/// 发图片会给界面上报预览：服务层自动下载并解码前的原始字节，不用手动另存。
+#[test]
+fn an_image_message_comes_with_a_preview() {
+    const PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc,
+        0xcf, 0xc0, 0x50, 0x0f, 0x00, 0x04, 0x85, 0x01, 0x80, 0x84, 0xa9, 0x8c, 0x21, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    let (_guard, beacon_port) = serial();
+    let dir = test_data_dir(beacon_port);
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("截图.png");
+    std::fs::write(&source, PNG).unwrap();
+
+    let (cmds, events) = spawn_with_data(beacon_port, Liveness::default(), dir.clone());
+    cmds.send(UiCommand::Host {
+        name: "图片房间".into(),
+    })
+    .unwrap();
+    recv_until(&events, |e| matches!(e, UiEvent::Lobby { .. }));
+    cmds.send(UiCommand::Join {
+        name: "Alice".into(),
+    })
+    .unwrap();
+    recv_until(&events, |e| matches!(e, UiEvent::Joined { .. }));
+
+    cmds.send(UiCommand::SendFile { path: source }).unwrap();
+    recv_until(&events, |e| {
+        matches!(
+            e,
+            UiEvent::Message {
+                attachment: Some(_),
+                ..
+            }
+        )
+    });
+
+    match recv_until(&events, |e| matches!(e, UiEvent::Preview { .. })) {
+        UiEvent::Preview { mime, bytes, .. } => {
+            assert_eq!(mime, "image/png");
+            assert_eq!(bytes.as_slice(), PNG);
+        }
+        other => panic!("期望预览事件，实际 {other:?}"),
+    }
+}

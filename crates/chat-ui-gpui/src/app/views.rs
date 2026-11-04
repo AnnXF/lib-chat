@@ -10,6 +10,8 @@ mod chat;
 mod header;
 mod sidebar;
 
+use std::sync::Arc;
+
 use gpui::{
     AnyElement, App, Context, Div, MouseButton, MouseDownEvent, MouseUpEvent, Window, div, list,
     prelude::*, px, rgb, rgba,
@@ -149,7 +151,29 @@ pub(crate) fn human_size(bytes: u64) -> String {
 }
 
 /// 文件消息的内容块：类型标签 + 文件名 + 大小，点一下另存。
-fn attachment_body(attachment: &Attachment, save: Option<SaveHandler>) -> AnyElement {
+fn attachment_body(
+    attachment: &Attachment,
+    save: Option<SaveHandler>,
+    preview: Option<Arc<gpui::Image>>,
+) -> AnyElement {
+    // 有解码好的图片就直接显示，没有再退回文件卡片
+    if let Some(image) = preview {
+        return div()
+            .id("image-preview")
+            .test_id("image-preview")
+            .max_w(px(320.))
+            .max_h(px(240.))
+            .rounded_xl()
+            .overflow_hidden()
+            .border_1()
+            .border_color(rgb(theme::BORDER))
+            .child(
+                gpui::img(gpui::ImageSource::Image(image))
+                    .max_w(px(320.))
+                    .max_h(px(240.)),
+            )
+            .into_any_element();
+    }
     let card = div()
         .id("file-card")
         .test_id("file-card")
@@ -237,7 +261,11 @@ fn tool_button(
 /// 一条消息。
 ///
 /// 自己发的靠右并带强调底色，别人的靠左只留文字，视觉噪声更低。
-fn render_line(line: &ChatLine, save: Option<SaveHandler>) -> AnyElement {
+fn render_line(
+    line: &ChatLine,
+    save: Option<SaveHandler>,
+    preview: Option<Arc<gpui::Image>>,
+) -> AnyElement {
     if line.unread_marker {
         return div()
             .test_id("unread-divider")
@@ -298,7 +326,7 @@ fn render_line(line: &ChatLine, save: Option<SaveHandler>) -> AnyElement {
     };
 
     let body = match &line.attachment {
-        Some(attachment) => attachment_body(attachment, save),
+        Some(attachment) => attachment_body(attachment, save, preview),
         None => {
             let mut content = div().flex().flex_col().gap_1();
             if let Some(quote) = &line.quote {
@@ -718,8 +746,10 @@ mod perf {
                 .collect();
 
             let started = Instant::now();
-            let elements: Vec<AnyElement> =
-                lines.iter().map(|line| render_line(line, None)).collect();
+            let elements: Vec<AnyElement> = lines
+                .iter()
+                .map(|line| render_line(line, None, None))
+                .collect();
             let elapsed = started.elapsed();
             println!(
                 "{count:>7} 条 → 构造元素 {elapsed:>10.2?}（{:.2}µs/条）",

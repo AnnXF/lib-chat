@@ -2,6 +2,8 @@
 //!
 //! 消息列表的改动同时维护虚拟列表的项数。
 
+use std::sync::Arc;
+
 use chat_core::{RoomId, Seq, UserId};
 
 use crate::service::{UiCommand, UiEvent};
@@ -10,6 +12,21 @@ use gpui::ListOffset;
 use chat_core::Attachment;
 
 use super::{ChatApp, ChatLine, DiscoveredRoom, HostedRoom, RoomSource, RoomView, StatusKind};
+
+/// 附件 MIME → GPUI 的解码格式；不认识的按「不是图片」处理。
+pub(crate) fn image_format(mime: &str) -> Option<gpui::ImageFormat> {
+    use gpui::ImageFormat;
+    match mime.trim().to_ascii_lowercase().as_str() {
+        "image/png" => Some(ImageFormat::Png),
+        "image/jpeg" | "image/jpg" => Some(ImageFormat::Jpeg),
+        "image/webp" => Some(ImageFormat::Webp),
+        "image/gif" => Some(ImageFormat::Gif),
+        "image/bmp" => Some(ImageFormat::Bmp),
+        "image/tiff" => Some(ImageFormat::Tiff),
+        "image/svg+xml" => Some(ImageFormat::Svg),
+        _ => None,
+    }
+}
 
 impl ChatApp {
     pub(crate) fn mark_read(&mut self, room: RoomId, seq: Seq) {
@@ -335,6 +352,14 @@ impl ChatApp {
                 self.saved_login = None;
                 self.read_seqs.clear();
                 self.status = "已登录".into();
+            }
+            UiEvent::Preview { id, mime, bytes } => {
+                if let Some(format) = image_format(&mime) {
+                    self.previews.insert(
+                        id,
+                        Arc::new(gpui::Image::from_bytes(format, bytes.as_ref().clone())),
+                    );
+                }
             }
             UiEvent::Transfer {
                 name,

@@ -1120,3 +1120,74 @@ fn announcement_banner_stays_inside_the_chat_area() {
     assert_inside(&banner, "announcement");
     assert_inside(&bounds(cx, "chat-main"), "chat-main");
 }
+
+/// 图片附件收到预览后渲染成图片而不是文件卡片，且不超出聊天区。
+#[test]
+fn image_attachment_renders_a_preview_inside_the_chat_area() {
+    const PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc,
+        0xcf, 0xc0, 0x50, 0x0f, 0x00, 0x04, 0x85, 0x01, 0x80, 0x84, 0xa9, 0x8c, 0x21, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    let room = chat_core::RoomId::new();
+    let attachment = chat_core::Attachment {
+        id: chat_core::AttachmentId::new(),
+        name: "截图.png".into(),
+        size: PNG.len() as u64,
+        mime: "image/png".into(),
+        sha256: "ab".repeat(32),
+    };
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| {
+            app.debug_apply(UiEvent::Conversations {
+                rooms: vec![chat_core::RoomSummary {
+                    room,
+                    kind: chat_core::RoomKind::Group,
+                    name: "图片群".into(),
+                    member_count: 2,
+                    last_seq: 1,
+                    last_text: Some("[文件]".into()),
+                    last_at: None,
+                    read_seq: 0,
+                    muted: false,
+                    announcement: None,
+                    owner: false,
+                }],
+            });
+            app.debug_apply(UiEvent::Lobby {
+                room,
+                name: "图片群".into(),
+                addr: "127.0.0.1:1".into(),
+                online: 1,
+            });
+            app.debug_open_conversation(room, cx);
+            app.debug_apply(UiEvent::Message {
+                room,
+                seq: 1,
+                sender_id: chat_core::UserId::new(),
+                sender: "Bob".into(),
+                at: 0,
+                text: String::new(),
+                attachment: Some(attachment.clone()),
+                quote: None,
+                recalled: false,
+            });
+            // 预览字节直接喂给界面，效果等同于服务层下载完成
+            app.debug_apply(UiEvent::Preview {
+                id: attachment.id,
+                mime: "image/png".into(),
+                bytes: std::sync::Arc::new(PNG.to_vec()),
+            });
+        });
+    });
+    cx.run_until_parked();
+
+    let preview = bounds(cx, "image-preview");
+    assert_inside(&preview, "image-preview");
+    assert_inside(&bounds(cx, "chat-main"), "chat-main");
+}

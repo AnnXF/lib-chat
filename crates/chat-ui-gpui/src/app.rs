@@ -22,9 +22,10 @@ pub mod widgets;
 
 pub use model::{ChatLine, DiscoveredRoom, HostedRoom, NavTab, RoomSource, RoomView, StatusKind};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use chat_core::{RoomId, Seq, UserId};
+use chat_core::{AttachmentId, RoomId, Seq, UserId};
 use gpui::{
     Context, Entity, ListAlignment, ListState, Pixels, Point, Render, Window, div, prelude::*, px,
     rgb,
@@ -132,6 +133,8 @@ pub struct ChatApp {
     friends: Vec<chat_core::UserSummary>,
     /// 别人发给我、还没处理的好友申请。
     friend_requests: Vec<chat_core::UserSummary>,
+    /// 已解码的图片附件，按附件标识索引。
+    previews: HashMap<AttachmentId, Arc<gpui::Image>>,
     /// 微信式左侧导航：聊天 / 通讯录 / 房间。
     nav: NavTab,
     /// 会话与好友搜索。
@@ -386,6 +389,7 @@ impl ChatApp {
             conversations: Vec::new(),
             friends: Vec::new(),
             friend_requests: Vec::new(),
+            previews: HashMap::new(),
             nav: NavTab::Chats,
             search,
         }
