@@ -60,14 +60,21 @@ impl ChatApp {
         // 只渲染可见范围那几条，消息再多每帧成本也不变
         let this = cx.entity();
         let messages = list(self.list.clone(), move |ix, _window, cx| {
-            let (line, attachment, preview) = {
+            let (line, attachment, preview, read_by) = {
                 let app = this.read(cx);
                 let line = app.lines[ix].clone();
                 let attachment = line.attachment.clone();
                 let preview = attachment
                     .as_ref()
                     .and_then(|attachment| app.previews.get(&attachment.id).cloned());
-                (line, attachment, preview)
+                // 只有自己发的群消息才显示「N 人已读」
+                let read_by = line.seq.filter(|_| line.mine).and_then(|seq| {
+                    app.read_counts
+                        .get(&seq)
+                        .copied()
+                        .filter(|count| *count > 0)
+                });
+                (line, attachment, preview, read_by)
             };
             let save = attachment.map(|attachment| {
                 let entity = this.clone();
@@ -77,7 +84,7 @@ impl ChatApp {
                     });
                 }) as SaveHandler
             });
-            let element = render_line(&line, save, preview);
+            let element = render_line(&line, save, preview, read_by);
 
             // 右键打开消息菜单；坐标是窗口坐标，菜单在主区上层绝对定位
             let menu_line = line.clone();

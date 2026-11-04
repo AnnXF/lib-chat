@@ -221,6 +221,31 @@ impl Accounts {
         Ok(row.map(|row| row.get::<i64, _>(0) != 0).unwrap_or(false))
     }
 
+    /// 房间内所有成员的已读位置。
+    pub async fn read_positions(
+        &self,
+        room: RoomId,
+    ) -> std::result::Result<Vec<Seq>, AccountError> {
+        let (sql, values) = Query::select()
+            .columns([
+                (read_markers::TABLE, read_markers::USER_ID),
+                (read_markers::TABLE, read_markers::SEQ),
+            ])
+            .from(read_markers::TABLE)
+            .inner_join(
+                room_members::TABLE,
+                Expr::col((room_members::TABLE, room_members::USER_ID))
+                    .eq(Expr::col((read_markers::TABLE, read_markers::USER_ID))),
+            )
+            .and_where(Expr::col((room_members::TABLE, room_members::ROOM_ID)).eq(room.to_string()))
+            .and_where(Expr::col((read_markers::TABLE, read_markers::ROOM_ID)).eq(room.to_string()))
+            .build(SqliteQueryBuilder);
+        let rows = bind(sqlx::query(&sql), values)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(|row| row.get::<i64, _>(1)).collect())
+    }
+
     /// 置顶或取消置顶。
     pub async fn set_pinned(
         &self,

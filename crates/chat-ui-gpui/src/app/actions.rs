@@ -561,6 +561,10 @@ impl ChatApp {
 
     /// 供无头测试直接打开消息菜单。
     #[cfg(any(test, feature = "ui-test"))]
+    pub fn debug_set_my_id(&mut self, id: UserId) {
+        self.my_id = Some(id);
+    }
+
     pub fn debug_open_forward_menu(&mut self, room: RoomId, seq: Seq, cx: &mut Context<Self>) {
         self.forward_from = Some((room, seq));
         cx.notify();

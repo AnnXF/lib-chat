@@ -357,6 +357,11 @@ impl ChatApp {
                 self.read_seqs.clear();
                 self.status = "已登录".into();
             }
+            UiEvent::ReadCounts { room, counts } => {
+                if self.showing(room).is_some() {
+                    self.read_counts = counts.into_iter().collect();
+                }
+            }
             UiEvent::Preview { id, mime, bytes } => {
                 if let Some(format) = image_format(&mime) {
                     self.previews.insert(
@@ -676,6 +681,7 @@ impl ChatApp {
     pub(crate) fn clear_lines(&mut self) {
         self.lines.clear();
         self.seen_seqs.clear();
+        self.read_counts.clear();
         self.list.reset(0);
     }
 

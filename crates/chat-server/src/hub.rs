@@ -242,6 +242,32 @@ impl Hub {
         }
     }
 
+    /// 把最近一页消息的已读人数推给房间成员。
+    ///
+    /// 只在有人推进已读位置时算一次，代价是一次成员读位置查询 + 一次历史查询。
+    async fn push_read_counts(&self, room: RoomId) {
+        const WINDOW: usize = 50;
+        let Ok(positions) = self.accounts.read_positions(room).await else {
+            return;
+        };
+        if positions.is_empty() {
+            return;
+        }
+        let Ok(messages) = self.messages.history(room, None, WINDOW).await else {
+            return;
+        };
+        let counts: Vec<(i64, u32)> = messages
+            .iter()
+            .map(|message| {
+                let readers = positions.iter().filter(|seq| **seq >= message.seq).count();
+                (message.seq, readers as u32)
+            })
+            .filter(|(_, readers)| *readers > 0)
+            .collect();
+        self.broadcast_room(room, ServerEvent::ReadCounts { room, counts })
+            .await;
+    }
+
     /// 把待处理的好友申请推给某个在线用户的所有连接。
     async fn push_friend_requests(&self, user: UserId) {
         let Ok(users) = self.accounts.friend_requests(user).await else {
@@ -1094,6 +1120,7 @@ impl Hub {
                 }
                 // 已读是按账号存的：同账号的其它设备也要看到新的已读位置
                 self.push_rooms_to(user.id).await;
+                self.push_read_counts(room).await;
             }
 
             ClientRequest::ListRooms => {

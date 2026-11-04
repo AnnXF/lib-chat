@@ -353,6 +353,11 @@ pub enum ServerEvent {
     Friends {
         users: Vec<UserSummary>,
     },
+    /// 房间内每条消息的已读人数（只含有人读过的）。
+    ReadCounts {
+        room: RoomId,
+        counts: Vec<(Seq, u32)>,
+    },
     /// 别人发给我的、还没处理的好友申请。
     FriendRequests {
         users: Vec<UserSummary>,

@@ -992,3 +992,56 @@ async fn forwarding_copies_the_message_into_another_room() {
         _ => unreachable!(),
     }
 }
+
+/// 群里的已读人数：别人读过之后，发送者能看到「几人已读」。
+#[tokio::test]
+async fn read_counts_reach_the_room_after_a_member_reads() {
+    let dir = temp_dir("read-counts");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+    let (alice, alice_user) = register(&hub, "alice").await;
+    let (bob, bob_user) = register(&hub, "bob").await;
+    be_friends(&alice, alice_user.id, &bob, "bob").await;
+    wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
+    wait_for(&bob, |event| matches!(event, ServerEvent::Friends { .. })).await;
+
+    alice
+        .create_group("计数群", vec![bob_user.id])
+        .await
+        .unwrap();
+    let group = match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Rooms { rooms } if rooms.iter().any(|room| room.name == "计数群"))
+    })
+    .await
+    {
+        ServerEvent::Rooms { rooms } => rooms
+            .into_iter()
+            .find(|room| room.name == "计数群")
+            .unwrap()
+            .room,
+        _ => unreachable!(),
+    };
+    for (client, name) in [(&alice, "Alice"), (&bob, "Bob")] {
+        client.join(group, name).await.unwrap();
+        wait_for(client, |event| matches!(event, ServerEvent::Joined { .. })).await;
+    }
+
+    alice.send_text(group, "有人读吗").await.unwrap();
+    let seq = match wait_for(&bob, |event| matches!(event, ServerEvent::Message { .. })).await {
+        ServerEvent::Message { message } => message.seq,
+        _ => unreachable!(),
+    };
+
+    bob.mark_read(group, seq).await.unwrap();
+    match wait_for(
+        &alice,
+        |event| matches!(event, ServerEvent::ReadCounts { counts, .. } if !counts.is_empty()),
+    )
+    .await
+    {
+        ServerEvent::ReadCounts { counts, .. } => {
+            let readers = counts.iter().find(|(at, _)| *at == seq).map(|(_, n)| *n);
+            assert_eq!(readers, Some(1), "只有 bob 读过");
+        }
+        _ => unreachable!(),
+    }
+}

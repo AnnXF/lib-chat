@@ -135,6 +135,8 @@ pub struct ChatApp {
     friends: Vec<chat_core::UserSummary>,
     /// 别人发给我、还没处理的好友申请。
     friend_requests: Vec<chat_core::UserSummary>,
+    /// 当前房间每条消息的已读人数。
+    read_counts: HashMap<Seq, u32>,
     /// 已解码的图片附件，按附件标识索引。
     previews: HashMap<AttachmentId, Arc<gpui::Image>>,
     /// 微信式左侧导航：聊天 / 通讯录 / 房间。
@@ -392,6 +394,7 @@ impl ChatApp {
             conversations: Vec::new(),
             friends: Vec::new(),
             friend_requests: Vec::new(),
+            read_counts: HashMap::new(),
             previews: HashMap::new(),
             nav: NavTab::Chats,
             search,

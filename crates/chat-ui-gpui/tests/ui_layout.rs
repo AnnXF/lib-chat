@@ -1303,3 +1303,59 @@ fn forward_menu_lists_other_conversations() {
 
     assert_inside(&bounds(cx, "forward-menu"), "forward-menu");
 }
+
+/// 自己发的群消息下方显示「N 人已读」。
+#[test]
+fn my_group_message_shows_read_count() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    let room = chat_core::RoomId::new();
+    let me = chat_core::UserId::new();
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| {
+            app.debug_apply(UiEvent::Conversations {
+                rooms: vec![chat_core::RoomSummary {
+                    room,
+                    kind: chat_core::RoomKind::Group,
+                    name: "计数群".into(),
+                    member_count: 3,
+                    last_seq: 1,
+                    last_text: None,
+                    last_at: None,
+                    read_seq: 0,
+                    muted: false,
+                    announcement: None,
+                    owner: false,
+                    pinned: None,
+                }],
+            });
+            app.debug_apply(UiEvent::Lobby {
+                room,
+                name: "计数群".into(),
+                addr: "127.0.0.1:1".into(),
+                online: 1,
+            });
+            app.debug_set_my_id(me);
+            app.debug_open_conversation(room, cx);
+            app.debug_apply(UiEvent::Message {
+                room,
+                seq: 1,
+                sender_id: me,
+                sender: "Me".into(),
+                at: 0,
+                text: "有人读吗".into(),
+                attachment: None,
+                quote: None,
+                recalled: false,
+                forwarded: false,
+            });
+            app.debug_apply(UiEvent::ReadCounts {
+                room,
+                counts: vec![(1, 2)],
+            });
+        });
+    });
+    cx.run_until_parked();
+
+    assert_inside(&bounds(cx, "read-count"), "read-count");
+}

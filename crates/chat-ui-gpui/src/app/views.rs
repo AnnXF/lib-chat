@@ -265,6 +265,7 @@ fn render_line(
     line: &ChatLine,
     save: Option<SaveHandler>,
     preview: Option<Arc<gpui::Image>>,
+    read_by: Option<u32>,
 ) -> AnyElement {
     if line.unread_marker {
         return div()
@@ -432,6 +433,17 @@ fn render_line(
                 }),
         )
         .child(body)
+        .when_some(read_by, |this, count| {
+            this.child(
+                div()
+                    .test_id("read-count")
+                    .mt_1()
+                    .px_1()
+                    .text_size(px(10.))
+                    .text_color(rgb(theme::FAINT))
+                    .child(format!("{count} 人已读")),
+            )
+        })
         .into_any_element()
 }
 
@@ -875,7 +887,7 @@ mod perf {
             let started = Instant::now();
             let elements: Vec<AnyElement> = lines
                 .iter()
-                .map(|line| render_line(line, None, None))
+                .map(|line| render_line(line, None, None, None))
                 .collect();
             let elapsed = started.elapsed();
             println!(

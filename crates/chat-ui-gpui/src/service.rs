@@ -267,6 +267,11 @@ pub enum UiEvent {
     Friends {
         users: Vec<UserSummary>,
     },
+    /// 房间内每条消息的已读人数。
+    ReadCounts {
+        room: RoomId,
+        counts: Vec<(Seq, u32)>,
+    },
     /// 别人发给我、还没处理的好友申请。
     FriendRequests {
         users: Vec<UserSummary>,
