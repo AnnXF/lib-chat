@@ -49,7 +49,7 @@ fn usage() {
          libchat host [--port 0] [--name 房间名]\n  \
          libchat serve [--listen 0.0.0.0:4433] [--name 房间名] [--cert 证书链.pem --key 私钥.pem] [--data-dir 目录] [--announce 广播端口]\n  \
          libchat register --server 主机:端口 [--fingerprint SHA-256 | --ca 根证书.pem] --user 账号 --password 密码 [--name 昵称]\n  \
-         libchat admin users|rooms|health|audit [--data-dir 目录]\n  \
+         libchat admin users|rooms|health|audit|gc [--data-dir 目录]\n  \
          libchat admin ban|unban --user 账号 [--data-dir 目录]\n  \
          libchat admin clear --room 房间标识 [--data-dir 目录]\n  \
          libchat join [--server 主机:端口 | --addr 主机:端口] [--fingerprint SHA-256 | --ca 根证书.pem] --user 账号 (--password 密码 | --token 令牌 | --register) [--name 昵称] [--data-dir 目录]"
@@ -478,7 +478,7 @@ async fn admin_cmd(args: &[String]) -> Result<(), AnyErr> {
     let action = args
         .first()
         .map(String::as_str)
-        .ok_or("需要 users/rooms/ban/unban/clear/health/audit")?;
+        .ok_or("需要 users/rooms/ban/unban/clear/gc/health/audit")?;
     let dir = match opt(args, "--data-dir") {
         Some(path) => PathBuf::from(path),
         None => default_data_dir()?,
@@ -538,6 +538,29 @@ async fn admin_cmd(args: &[String]) -> Result<(), AnyErr> {
                     entry.at, entry.actor, entry.action, entry.detail
                 );
             }
+        }
+        "gc" => {
+            // 只删「消息已经不引用」的附件；正在传的 .part 留着下次续传
+            let messages = chat_server::SqliteStore::open(&dir.join("messages.db")).await?;
+            let room = messages.room();
+            let referenced: std::collections::HashSet<String> =
+                messages.referenced_blobs(room).await?.into_iter().collect();
+            messages.close().await;
+
+            use chat_server::BlobStore as _;
+            let blobs = chat_server::DiskBlobs::new(dir.join("files"))?;
+            let mut removed = 0;
+            for sha in blobs.list()? {
+                if referenced.contains(&sha) {
+                    continue;
+                }
+                blobs.remove(&sha).await?;
+                removed += 1;
+            }
+            println!(
+                "已回收 {removed} 个没有消息引用的附件，保留 {} 个",
+                referenced.len()
+            );
         }
         "health" => {
             let users = accounts.admin_users().await?.len();

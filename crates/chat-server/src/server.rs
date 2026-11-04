@@ -584,6 +584,19 @@ impl Server {
     }
 
     /// 接收附件内容。只有房间成员可以上传，且大小与摘要必须与声明一致。
+    /// 开始流式接收附件。
+    pub async fn begin_upload(
+        &self,
+        conn: ConnId,
+        attachment: Attachment,
+    ) -> Result<(Box<dyn chat_core::BlobWriter>, u64)> {
+        if self.member_of(conn).await.is_none() {
+            return Err(ChatError::Protocol("未加入房间".into()));
+        }
+        validate_attachment(&attachment)?;
+        self.blobs.begin(&attachment.sha256, attachment.size).await
+    }
+
     pub async fn upload(&self, conn: ConnId, attachment: Attachment, data: Vec<u8>) -> Result<()> {
         if self.member_of(conn).await.is_none() {
             return Err(ChatError::Protocol("未加入房间".into()));

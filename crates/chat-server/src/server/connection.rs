@@ -51,6 +51,17 @@ impl RequestSink for ServerHandle {
         self.server.upload(self.conn, attachment, data).await
     }
 
+    async fn begin_upload(
+        &self,
+        room: RoomId,
+        attachment: Attachment,
+    ) -> Result<(Box<dyn chat_core::BlobWriter>, u64)> {
+        if room != self.server.room() {
+            return Err(chat_core::ChatError::Protocol("房间不存在".into()));
+        }
+        self.server.begin_upload(self.conn, attachment).await
+    }
+
     async fn download(&self, room: RoomId, id: AttachmentId) -> Result<Vec<u8>> {
         if room != self.server.room() {
             return Err(chat_core::ChatError::Protocol("房间不存在".into()));

@@ -984,6 +984,7 @@ dependencies = [
  "async-trait",
  "chat-core",
  "sea-query",
+ "sha2 0.10.9",
  "sqlx",
  "tokio",
  "uuid",

@@ -274,6 +274,30 @@ impl Client {
             .await
     }
 
+    /// 从文件流式上传。
+    pub async fn upload_file(
+        &self,
+        room: RoomId,
+        attachment: Attachment,
+        path: std::path::PathBuf,
+        progress: ProgressSink,
+    ) -> Result<()> {
+        self.conn
+            .upload_file(room, attachment, path, progress)
+            .await
+    }
+
+    /// 流式下载到文件。
+    pub async fn download_to_file(
+        &self,
+        room: RoomId,
+        id: AttachmentId,
+        path: std::path::PathBuf,
+        progress: ProgressSink,
+    ) -> Result<()> {
+        self.conn.download_to_file(room, id, path, progress).await
+    }
+
     /// 带进度的下载。
     pub async fn download_with_progress(
         &self,

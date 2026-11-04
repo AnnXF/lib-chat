@@ -142,8 +142,16 @@ enum BlobRequest {
 #[serde(tag = "t", rename_all = "snake_case")]
 enum BlobReply {
     Done,
-    Begin { size: u64 },
-    Error { message: String },
+    /// 上传就绪，告诉客户端「已经有 `have` 个字节了」，从那里接着传。
+    Ready {
+        have: u64,
+    },
+    Begin {
+        size: u64,
+    },
+    Error {
+        message: String,
+    },
 }
 
 async fn write_frame<T: serde::Serialize>(send: &mut quinn::SendStream, frame: &T) -> Result<()> {
@@ -192,6 +200,36 @@ async fn read_chunk(recv: &mut quinn::RecvStream) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     recv.read_exact(&mut buf).await.map_err(transport_err)?;
     Ok(buf)
+}
+
+/// 等服务端的最终应答；整块上传会先收到一条 `Ready`，读两次即可。
+async fn await_upload_done(recv: &mut quinn::RecvStream) -> Result<()> {
+    let mut reply = read_frame::<BlobReply>(recv).await?;
+    if matches!(reply, BlobReply::Ready { .. }) {
+        reply = read_frame::<BlobReply>(recv).await?;
+    }
+    match reply {
+        BlobReply::Done => Ok(()),
+        BlobReply::Error { message } => Err(ChatError::Protocol(message)),
+        _ => Err(ChatError::Protocol("附件上传应答异常".into())),
+    }
+}
+
+/// 直接读进复用缓冲区，省掉每块一次分配（流式下载用）。
+async fn read_chunk_raw(recv: &mut quinn::RecvStream, buffer: &mut [u8]) -> Result<usize> {
+    let mut len = [0u8; 4];
+    recv.read_exact(&mut len).await.map_err(transport_err)?;
+    let len = u32::from_be_bytes(len) as usize;
+    if len == 0 {
+        return Ok(0);
+    }
+    if len > BLOB_CHUNK * 2 || len > buffer.len() {
+        return Err(ChatError::Protocol("附件分块过大".into()));
+    }
+    recv.read_exact(&mut buffer[..len])
+        .await
+        .map_err(transport_err)?;
+    Ok(len)
 }
 
 // ---------------------------------------------------------------- 证书
@@ -706,19 +744,41 @@ async fn serve_blob_stream(
 ) -> Result<()> {
     match read_frame::<BlobRequest>(recv).await? {
         BlobRequest::Upload { room, attachment } => {
-            let mut data = Vec::with_capacity(attachment.size.min(MAX_ATTACHMENT_BYTES) as usize);
+            // 边收边写，不在内存里攒整份文件
+            let (mut writer, have) = sink.begin_upload(room, attachment.clone()).await?;
+            write_frame(send, &BlobReply::Ready { have }).await?;
+            let mut received = have;
             loop {
                 let chunk = read_chunk(recv).await?;
                 if chunk.is_empty() {
                     break;
                 }
-                if (data.len() + chunk.len()) as u64 > MAX_ATTACHMENT_BYTES {
-                    return Err(ChatError::Protocol("附件超过大小上限".into()));
+                received += chunk.len() as u64;
+                if received > MAX_ATTACHMENT_BYTES || received > attachment.size {
+                    writer.abort().await;
+                    let message = if received > MAX_ATTACHMENT_BYTES {
+                        "附件超过大小上限"
+                    } else {
+                        "附件超过声明的大小"
+                    };
+                    write_frame(
+                        send,
+                        &BlobReply::Error {
+                            message: message.to_string(),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
                 }
-                data.extend_from_slice(&chunk);
+                writer.write(&chunk).await?;
             }
-            sink.upload(room, attachment, data).await?;
-            write_frame(send, &BlobReply::Done).await?;
+            match writer.finish().await {
+                Ok(()) => write_frame(send, &BlobReply::Done).await?,
+                Err(error) => {
+                    let message = error.to_string();
+                    write_frame(send, &BlobReply::Error { message }).await?;
+                }
+            }
         }
         BlobRequest::Download { room, id } => {
             let data = sink.download(room, id).await?;
@@ -930,11 +990,7 @@ impl Connection for QuicConnection {
                 progress(done, total);
             }
             write_chunk(&mut send, &[]).await?;
-            match read_frame::<BlobReply>(&mut recv).await? {
-                BlobReply::Done => Ok(()),
-                BlobReply::Error { message } => Err(ChatError::Protocol(message)),
-                _ => Err(ChatError::Protocol("附件上传应答异常".into())),
-            }
+            await_upload_done(&mut recv).await
         };
         tokio::time::timeout(BLOB_TIMEOUT, transfer)
             .await
@@ -980,6 +1036,134 @@ impl Connection for QuicConnection {
                 BlobReply::Error { message } => Err(ChatError::Protocol(message)),
                 _ => Err(ChatError::Protocol("附件下载应答异常".into())),
             }
+        };
+        tokio::time::timeout(BLOB_TIMEOUT, transfer)
+            .await
+            .map_err(|_| ChatError::Protocol("附件下载超时".into()))?
+    }
+
+    /// 从文件流式上传：先问服务端已经有多少字节，再从那一段开始传。
+    async fn upload_file(
+        &self,
+        room: RoomId,
+        attachment: Attachment,
+        path: std::path::PathBuf,
+        progress: ProgressSink,
+    ) -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(ChatError::Closed);
+        }
+        let mut file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|e| ChatError::Storage(format!("读取文件失败: {e}")))?;
+        let (mut send, mut recv) = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.conn.open_bi())
+            .await
+            .map_err(|_| ChatError::Protocol("打开附件流超时".into()))?
+            .map_err(transport_err)?;
+        let total = attachment.size;
+        let transfer = async {
+            write_frame(
+                &mut send,
+                &BlobRequest::Upload {
+                    room,
+                    attachment: attachment.clone(),
+                },
+            )
+            .await?;
+            let have = match read_frame::<BlobReply>(&mut recv).await? {
+                BlobReply::Ready { have } => have,
+                BlobReply::Error { message } => return Err(ChatError::Protocol(message)),
+                _ => return Err(ChatError::Protocol("附件上传应答异常".into())),
+            };
+            if have > 0 {
+                file.seek(std::io::SeekFrom::Start(have))
+                    .await
+                    .map_err(|e| ChatError::Storage(format!("定位文件失败: {e}")))?;
+            }
+            progress(have, total);
+            let mut done = have;
+            let mut buffer = vec![0u8; BLOB_CHUNK];
+            loop {
+                let read = file
+                    .read(&mut buffer)
+                    .await
+                    .map_err(|e| ChatError::Storage(format!("读取文件失败: {e}")))?;
+                if read == 0 {
+                    break;
+                }
+                write_chunk(&mut send, &buffer[..read]).await?;
+                done += read as u64;
+                progress(done, total);
+            }
+            write_chunk(&mut send, &[]).await?;
+            await_upload_done(&mut recv).await
+        };
+        tokio::time::timeout(BLOB_TIMEOUT, transfer)
+            .await
+            .map_err(|_| ChatError::Protocol("附件上传超时".into()))?
+    }
+
+    /// 流式下载到文件：先写 `.part`，收全了再改名。
+    async fn download_to_file(
+        &self,
+        room: RoomId,
+        id: AttachmentId,
+        path: std::path::PathBuf,
+        progress: ProgressSink,
+    ) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(ChatError::Closed);
+        }
+        let (mut send, mut recv) = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.conn.open_bi())
+            .await
+            .map_err(|_| ChatError::Protocol("打开附件流超时".into()))?
+            .map_err(transport_err)?;
+        let part = path.with_extension("part");
+        let transfer = async {
+            write_frame(&mut send, &BlobRequest::Download { room, id }).await?;
+            let size = match read_frame::<BlobReply>(&mut recv).await? {
+                BlobReply::Begin { size } => size,
+                BlobReply::Error { message } => return Err(ChatError::Protocol(message)),
+                _ => return Err(ChatError::Protocol("附件下载应答异常".into())),
+            };
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    tokio::fs::create_dir_all(parent)
+                        .await
+                        .map_err(|e| ChatError::Storage(format!("创建目录失败: {e}")))?;
+                }
+            }
+            let mut file = tokio::fs::File::create(&part)
+                .await
+                .map_err(|e| ChatError::Storage(format!("写入文件失败: {e}")))?;
+            let mut done = 0_u64;
+            let mut buffer = vec![0u8; BLOB_CHUNK];
+            loop {
+                let chunk = read_chunk_raw(&mut recv, &mut buffer).await?;
+                if chunk == 0 {
+                    break;
+                }
+                done += chunk as u64;
+                if done > MAX_ATTACHMENT_BYTES {
+                    let _ = tokio::fs::remove_file(&part).await;
+                    return Err(ChatError::Protocol("附件超过大小上限".into()));
+                }
+                file.write_all(&buffer[..chunk])
+                    .await
+                    .map_err(|e| ChatError::Storage(format!("写入文件失败: {e}")))?;
+                progress(done, size);
+            }
+            file.flush()
+                .await
+                .map_err(|e| ChatError::Storage(format!("写入文件失败: {e}")))?;
+            drop(file);
+            tokio::fs::rename(&part, &path)
+                .await
+                .map_err(|e| ChatError::Storage(format!("保存文件失败: {e}")))
         };
         tokio::time::timeout(BLOB_TIMEOUT, transfer)
             .await

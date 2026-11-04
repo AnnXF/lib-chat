@@ -834,6 +834,7 @@ async fn send_file(
             MAX_ATTACHMENT_BYTES / 1024 / 1024
         ));
     }
+    // 摘要要先把文件读一遍算出来；传输本身是流式的，不再整份驻留内存
     let data = tokio::fs::read(path)
         .await
         .map_err(|e| format!("读取文件失败: {e}"))?;
@@ -841,12 +842,13 @@ async fn send_file(
         id: AttachmentId::new(),
         mime: guess_mime(&name).to_string(),
         name,
-        size: data.len() as u64,
+        size,
         sha256: sha256_hex(&data),
     };
+    drop(data);
     validate_attachment(&attachment).map_err(|e| e.to_string())?;
     client
-        .upload_with_progress(room, attachment.clone(), data, progress)
+        .upload_file(room, attachment.clone(), path.to_path_buf(), progress)
         .await
         .map_err(|e| format!("上传失败: {e}"))?;
     client
@@ -863,20 +865,10 @@ async fn save_attachment(
     path: &Path,
     progress: ProgressSink,
 ) -> Result<(), String> {
-    let data = client
-        .download_with_progress(room, id, progress)
+    client
+        .download_to_file(room, id, path.to_path_buf(), progress)
         .await
-        .map_err(|e| format!("下载失败: {e}"))?;
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| format!("创建目录失败: {e}"))?;
-    }
-    tokio::fs::write(path, data)
-        .await
-        .map_err(|e| format!("写入失败: {e}"))
+        .map_err(|e| format!("下载失败: {e}"))
 }
 
 #[cfg(test)]

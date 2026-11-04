@@ -74,6 +74,22 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
+    /// 库里引用到的附件摘要，回收孤儿附件用。
+    pub async fn referenced_blobs(&self, room: RoomId) -> Result<Vec<String>> {
+        let (sql, values) = Query::select()
+            .column(messages::ATTACHMENT_SHA256)
+            .distinct()
+            .from(messages::TABLE)
+            .and_where(Expr::col(messages::ROOM_ID).eq(room.to_string()))
+            .and_where(Expr::col(messages::ATTACHMENT_SHA256).is_not_null())
+            .build(SqliteQueryBuilder);
+        let rows = bind(sqlx::query(&sql), values)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(rows.iter().map(|row| row.get::<String, _>(0)).collect())
+    }
+
     /// 少于三个字符的查询：trigram 索引用不上，只能逐条比对。
     async fn search_substring(
         &self,

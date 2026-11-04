@@ -628,6 +628,30 @@ impl Hub {
         }
     }
 
+    /// 开始接收附件：先校验身份与元数据，再把写入端交给传输层。
+    async fn begin_upload(
+        &self,
+        conn: ConnId,
+        room: RoomId,
+        attachment: Attachment,
+    ) -> Result<(Box<dyn chat_core::BlobWriter>, u64)> {
+        let user = self
+            .user_of(conn)
+            .await
+            .ok_or_else(|| ChatError::Protocol("未登录".into()))?;
+        if !self
+            .accounts
+            .is_member(room, user.id)
+            .await
+            .map_err(|e| ChatError::Storage(e.to_string()))?
+        {
+            return Err(ChatError::Protocol("房间不存在".into()));
+        }
+        validate_attachment(&attachment)?;
+        // 已经完整收过的内容，写入端什么都不做，对端也不用再传
+        self.blobs.begin(&attachment.sha256, attachment.size).await
+    }
+
     async fn handle_upload(
         &self,
         conn: ConnId,
@@ -1492,6 +1516,14 @@ impl RequestSink for HubHandle {
         self.hub
             .handle_upload(self.conn, room, attachment, data)
             .await
+    }
+
+    async fn begin_upload(
+        &self,
+        room: RoomId,
+        attachment: Attachment,
+    ) -> Result<(Box<dyn chat_core::BlobWriter>, u64)> {
+        self.hub.begin_upload(self.conn, room, attachment).await
     }
 
     async fn download(&self, room: RoomId, id: AttachmentId) -> Result<Vec<u8>> {

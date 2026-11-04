@@ -84,10 +84,50 @@ pub trait Connection: Send + Sync {
     ) -> Result<Vec<u8>> {
         self.download(room, id).await
     }
+
+    /// 从文件流式上传；默认读进内存再走 [`Connection::upload_with_progress`]。
+    async fn upload_file(
+        &self,
+        room: RoomId,
+        attachment: Attachment,
+        path: std::path::PathBuf,
+        progress: ProgressSink,
+    ) -> Result<()> {
+        let data = tokio::fs::read(&path)
+            .await
+            .map_err(|e| ChatError::Storage(format!("读取文件失败: {e}")))?;
+        self.upload_with_progress(room, attachment, data, progress)
+            .await
+    }
+
+    /// 流式下载到文件；默认下到内存再写盘。
+    async fn download_to_file(
+        &self,
+        room: RoomId,
+        id: AttachmentId,
+        path: std::path::PathBuf,
+        progress: ProgressSink,
+    ) -> Result<()> {
+        let data = self.download_with_progress(room, id, progress).await?;
+        tokio::fs::write(&path, data)
+            .await
+            .map_err(|e| ChatError::Storage(format!("写入文件失败: {e}")))
+    }
 }
 
 /// 附件传输进度回调：`(已传字节, 总字节)`。
 pub type ProgressSink = Arc<dyn Fn(u64, u64) + Send + Sync>;
+
+/// 服务端接收附件时的写入端。
+///
+/// 传输层拿到它之后边读边写，不在内存里攒整份文件；
+/// `finish` 负责校验摘要并归档，中途失败就 `abort` 掉残留。
+#[async_trait::async_trait]
+pub trait BlobWriter: Send {
+    async fn write(&mut self, chunk: &[u8]) -> Result<()>;
+    async fn finish(&mut self) -> Result<()>;
+    async fn abort(&mut self);
+}
 
 /// 服务端向某条连接推送事件的口子。
 ///
@@ -164,6 +204,15 @@ pub trait RequestSink: Send + Sync {
     /// 读取附件内容。仅本房间成员可取。
     async fn download(&self, _room: RoomId, _id: AttachmentId) -> Result<Vec<u8>> {
         Err(ChatError::Protocol("该传输不支持附件".into()))
+    }
+
+    /// 开始接收附件。返回写入端与「已经收到多少字节」（断点续传用）。
+    async fn begin_upload(
+        &self,
+        _room: RoomId,
+        _attachment: Attachment,
+    ) -> Result<(Box<dyn BlobWriter>, u64)> {
+        Err(ChatError::Protocol("该传输不支持流式上传".into()))
     }
 }
 
