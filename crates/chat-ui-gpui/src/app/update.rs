@@ -209,6 +209,7 @@ impl ChatApp {
                 quote,
                 recalled,
                 forwarded,
+                merged,
             } => {
                 if self.showing(room).is_some() {
                     if self.window_active {
@@ -217,7 +218,7 @@ impl ChatApp {
                     let mentioned = self.mentions_me(&text);
                     let mut line = chat_line(
                         seq, at, sender_id, sender, text, attachment, quote, recalled, forwarded,
-                        self.my_id,
+                        merged, self.my_id,
                     );
                     line.mentioned = mentioned;
                     self.push_line(line);
@@ -251,6 +252,7 @@ impl ChatApp {
                             m.quote,
                             m.recalled,
                             m.forwarded,
+                            m.merged,
                             my_id,
                         );
                         line.mentioned = mentioned;
@@ -316,6 +318,7 @@ impl ChatApp {
                             m.quote,
                             m.recalled,
                             m.forwarded,
+                            m.merged,
                             my_id,
                         );
                         line.mentioned = mentioned;
@@ -633,6 +636,7 @@ impl ChatApp {
             quote: None,
             recalled: false,
             forwarded: false,
+            merged: 0,
             mine: false,
             mentioned: false,
             unread_marker: true,
@@ -695,6 +699,7 @@ impl ChatApp {
             quote: None,
             recalled: false,
             forwarded: false,
+            merged: 0,
             mine: false,
             mentioned: false,
             unread_marker: false,
@@ -714,6 +719,7 @@ fn chat_line(
     quote: Option<chat_core::Quote>,
     recalled: bool,
     forwarded: bool,
+    merged: u32,
     mine: Option<UserId>,
 ) -> ChatLine {
     ChatLine {
@@ -725,6 +731,7 @@ fn chat_line(
         quote,
         recalled,
         forwarded,
+        merged,
         mine: mine == Some(sender_id),
         mentioned: false,
         unread_marker: false,

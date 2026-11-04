@@ -148,6 +148,7 @@ pub struct HistoryMessage {
     pub quote: Option<Quote>,
     pub recalled: bool,
     pub forwarded: bool,
+    pub merged: u32,
 }
 
 /// 公网托管的接入信息：客户端据此决定填域名还是填指纹。
@@ -225,6 +226,7 @@ pub enum UiEvent {
         quote: Option<Quote>,
         recalled: bool,
         forwarded: bool,
+        merged: u32,
     },
     /// 取回的一页历史（比当前会话更早），界面应插到列表最前。
     History {
@@ -399,6 +401,12 @@ pub enum UiCommand {
     ForwardMessage {
         from: RoomId,
         seq: Seq,
+        to: RoomId,
+    },
+    /// 把多条消息合并转发到别的会话。
+    ForwardMultiple {
+        from: RoomId,
+        seqs: Vec<Seq>,
         to: RoomId,
     },
     /// 置顶一条消息；`seq` 为 `None` 表示取消。
@@ -1198,6 +1206,7 @@ async fn run(
             UiCommand::RefreshRooms
             | UiCommand::AddFriend { .. }
             | UiCommand::ForwardMessage { .. }
+            | UiCommand::ForwardMultiple { .. }
             | UiCommand::PinMessage { .. }
             | UiCommand::SetAnnouncement { .. }
             | UiCommand::SetMuted { .. }
@@ -1221,6 +1230,9 @@ async fn run(
                     UiCommand::AddFriend { username } => client.add_friend(username).await,
                     UiCommand::ForwardMessage { from, seq, to } => {
                         client.forward(from, seq, to).await
+                    }
+                    UiCommand::ForwardMultiple { from, seqs, to } => {
+                        client.forward_multiple(from, seqs, to).await
                     }
                     UiCommand::PinMessage { room, seq } => client.pin_message(room, seq).await,
                     UiCommand::SetAnnouncement { room, text } => {

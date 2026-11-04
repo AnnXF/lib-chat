@@ -124,6 +124,8 @@ pub struct ChatLine {
     pub(crate) recalled: bool,
     /// 从别处转发过来的消息。
     pub(crate) forwarded: bool,
+    /// 合并转发包含的条数；0 表示普通消息。
+    pub(crate) merged: u32,
     /// 是否由自己发出，决定气泡靠哪一边。
     pub(crate) mine: bool,
     /// 这条消息 @ 了当前账号。

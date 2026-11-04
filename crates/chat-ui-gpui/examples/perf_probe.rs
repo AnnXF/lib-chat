@@ -39,6 +39,7 @@ async fn history_cost() {
                         attachment: None,
                         quote: None,
                         forwarded: false,
+                        merged: 0,
                     },
                 )
                 .await
@@ -166,6 +167,7 @@ async fn message_footprint() {
                     attachment: None,
                     quote: None,
                     forwarded: false,
+                    merged: 0,
                 },
             )
             .await

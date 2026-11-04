@@ -238,6 +238,8 @@ pub struct NewMessage {
     pub quote: Option<Quote>,
     /// 是否是从别处转发过来的。
     pub forwarded: bool,
+    /// 合并转发包含的消息条数；0 表示普通消息。
+    pub merged: u32,
 }
 
 /// 消息持久化端口。服务端负责分配会话内单调序号。

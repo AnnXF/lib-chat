@@ -84,8 +84,10 @@ pub struct ChatApp {
     my_id: Option<UserId>,
     /// 消息右键菜单；`None` 表示没有打开。
     message_menu: Option<MessageMenu>,
-    /// 正在选择转发目标：源房间与消息序号。
-    forward_from: Option<(RoomId, Seq)>,
+    /// 正在选择转发目标：源房间与要转发的消息序号。
+    forward_pending: Option<(RoomId, Vec<Seq>)>,
+    /// 多选模式选中的消息序号；`None` 表示不在多选。
+    selection: Option<Vec<Seq>>,
     friend_menu: Option<FriendMenu>,
     /// 点好友后等待服务端返回单聊房间，再自动打开。
     pending_direct: Option<String>,
@@ -363,7 +365,8 @@ impl ChatApp {
             local_room_id: None,
             my_id: None,
             message_menu: None,
-            forward_from: None,
+            forward_pending: None,
+            selection: None,
             friend_menu: None,
             pending_direct: None,
             pending_group_name: None,
@@ -420,7 +423,7 @@ impl Render for ChatApp {
         let main = self.render_main(cx);
         let menu = self.message_menu.clone();
         let friend_menu = self.friend_menu.clone();
-        let forward_from = self.forward_from;
+        let forward_pending = self.forward_pending.clone();
 
         div()
             .id("app-root")
@@ -456,8 +459,8 @@ impl Render for ChatApp {
             .when_some(friend_menu, |this, menu| {
                 this.child(self.render_friend_menu(menu, cx))
             })
-            .when_some(forward_from, |this, (from, seq)| {
-                this.child(self.render_forward_menu(from, seq, cx))
+            .when_some(forward_pending, |this, (from, seqs)| {
+                this.child(self.render_forward_menu(from, seqs, cx))
             })
     }
 }

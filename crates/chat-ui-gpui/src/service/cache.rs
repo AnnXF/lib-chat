@@ -33,6 +33,7 @@ mod messages {
     pub const QUOTE_SENDER: &str = "quote_sender";
     pub const QUOTE_TEXT: &str = "quote_text";
     pub const QUOTE_SEQ: &str = "quote_seq";
+    pub const MERGED: &str = "merged";
 }
 
 mod rooms {
@@ -110,6 +111,12 @@ impl MessagesCache {
             .col(ColumnDef::new(messages::QUOTE_SENDER).text())
             .col(ColumnDef::new(messages::QUOTE_TEXT).text())
             .col(ColumnDef::new(messages::QUOTE_SEQ).big_integer())
+            .col(
+                ColumnDef::new(messages::MERGED)
+                    .integer()
+                    .not_null()
+                    .default(0),
+            )
             .primary_key(
                 sea_query::Index::create()
                     .col(messages::ROOM)
@@ -155,6 +162,7 @@ impl MessagesCache {
                     messages::QUOTE_SENDER,
                     messages::QUOTE_TEXT,
                     messages::QUOTE_SEQ,
+                    messages::MERGED,
                 ])
                 .values_panic([
                     room.to_string().into(),
@@ -172,6 +180,7 @@ impl MessagesCache {
                     quote.map(|q| q.sender.clone()).into(),
                     quote.map(|q| q.text.clone()).into(),
                     quote.and_then(|q| q.seq).into(),
+                    i64::from(message.merged).into(),
                 ])
                 .on_conflict(
                     OnConflict::columns([messages::ROOM, messages::SEQ])
@@ -246,6 +255,7 @@ impl MessagesCache {
                 messages::QUOTE_SENDER,
                 messages::QUOTE_TEXT,
                 messages::QUOTE_SEQ,
+                messages::MERGED,
             ])
             .from(messages::TABLE)
             .and_where(Expr::col(messages::ROOM).eq(room.to_string()))
@@ -272,6 +282,7 @@ impl MessagesCache {
                 text: row.get(4),
                 recalled: row.get::<i64, _>(5) != 0,
                 forwarded: false,
+                merged: row.get::<i64, _>(14) as u32,
                 attachment: row.get::<Option<String>, _>(6).map(|id| Attachment {
                     id: id.parse().unwrap_or_else(|_| AttachmentId::new()),
                     name: row.get::<Option<String>, _>(7).unwrap_or_default(),
@@ -357,6 +368,7 @@ mod tests {
             quote: None,
             recalled: false,
             forwarded: false,
+            merged: 0,
         }
     }
 

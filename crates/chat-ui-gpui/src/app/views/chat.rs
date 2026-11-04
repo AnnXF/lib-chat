@@ -85,10 +85,19 @@ impl ChatApp {
                 }) as SaveHandler
             });
             let element = render_line(&line, save, preview, read_by);
+            let seq = line.seq;
+            let selecting = this.read(cx).selection.is_some();
+            let selected = line.seq.is_some_and(|seq| {
+                this.read(cx)
+                    .selection
+                    .as_ref()
+                    .is_some_and(|picked| picked.contains(&seq))
+            });
 
             // 右键打开消息菜单；坐标是窗口坐标，菜单在主区上层绝对定位
             let menu_line = line.clone();
             let entity = this.clone();
+            let click_entity = entity.clone();
             div()
                 .w_full()
                 .on_mouse_up(
@@ -102,6 +111,17 @@ impl ChatApp {
                         });
                     },
                 )
+                .when(selecting, |this| {
+                    this.on_mouse_up(
+                        MouseButton::Left,
+                        move |_: &MouseUpEvent, _: &mut Window, cx: &mut App| {
+                            if let Some(seq) = seq {
+                                click_entity.update(cx, |app, cx| app.on_toggle_selection(seq, cx));
+                            }
+                        },
+                    )
+                })
+                .when(selected, |this| this.bg(rgb(theme::HOVER)))
                 .child(element)
                 .into_any_element()
         })
@@ -209,6 +229,44 @@ impl ChatApp {
                     })
                     .child(action),
             )
+            .when_some(self.selection.clone(), |this, picked| {
+                this.child(
+                    div()
+                        .id("selection-bar")
+                        .test_id("selection-bar")
+                        .flex_none()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        .px_6()
+                        .py_2()
+                        .bg(rgb(theme::FIELD))
+                        .border_b_1()
+                        .border_color(rgb(theme::BORDER))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(px(12.))
+                                .text_color(rgb(theme::MUTED))
+                                .child(format!("已选 {} 条消息", picked.len())),
+                        )
+                        .child(button(
+                            "合并转发",
+                            true,
+                            false,
+                            cx.listener(move |this, _, _, cx| this.on_forward_selection(cx)),
+                        ))
+                        .child(button(
+                            "取消",
+                            false,
+                            false,
+                            cx.listener(Self::on_cancel_selection),
+                        )),
+                )
+            })
             .when_some(pinned, |this, pinned| {
                 this.child(
                     div()

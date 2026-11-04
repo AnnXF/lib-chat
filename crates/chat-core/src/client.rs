@@ -81,6 +81,12 @@ impl Client {
             .await
     }
 
+    pub async fn forward_multiple(&self, from: RoomId, seqs: Vec<Seq>, to: RoomId) -> Result<()> {
+        self.conn
+            .request(ClientRequest::ForwardMultiple { from, seqs, to })
+            .await
+    }
+
     pub async fn pin_message(&self, room: RoomId, seq: Option<Seq>) -> Result<()> {
         self.conn
             .request(ClientRequest::PinMessage { room, seq })

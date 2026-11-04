@@ -165,6 +165,8 @@ pub struct Message {
     pub recalled: bool,
     /// 从别处转发过来的消息。
     pub forwarded: bool,
+    /// 合并转发：这条消息装着多少条原始消息，0 表示不是合并转发。
+    pub merged: u32,
     pub server_ts_ms: i64,
 }
 
@@ -230,6 +232,12 @@ pub enum ClientRequest {
     Forward {
         from: RoomId,
         seq: Seq,
+        to: RoomId,
+    },
+    /// 把多条消息合并成一条聊天记录转发。
+    ForwardMultiple {
+        from: RoomId,
+        seqs: Vec<Seq>,
         to: RoomId,
     },
     /// 置顶一条消息；`seq` 为 `None` 表示取消置顶。

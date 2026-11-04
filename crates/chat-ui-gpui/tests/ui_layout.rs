@@ -396,6 +396,7 @@ fn file_message_renders_inside_the_window() {
             quote: None,
             recalled: false,
             forwarded: false,
+            merged: 0,
         },
     );
 
@@ -745,6 +746,7 @@ fn quoted_message_renders_a_quote_block() {
             }),
             recalled: false,
             forwarded: false,
+            merged: 0,
         },
     );
 
@@ -902,6 +904,7 @@ fn unread_banner_and_divider_are_rendered() {
                         quote: None,
                         recalled: false,
                         forwarded: false,
+                        merged: 0,
                     })
                     .collect(),
                 has_more: false,
@@ -1187,6 +1190,7 @@ fn image_attachment_renders_a_preview_inside_the_chat_area() {
                 quote: None,
                 recalled: false,
                 forwarded: false,
+                merged: 0,
             });
             // 预览字节直接喂给界面，效果等同于服务层下载完成
             app.debug_apply(UiEvent::Preview {
@@ -1348,6 +1352,7 @@ fn my_group_message_shows_read_count() {
                 quote: None,
                 recalled: false,
                 forwarded: false,
+                merged: 0,
             });
             app.debug_apply(UiEvent::ReadCounts {
                 room,
@@ -1358,4 +1363,62 @@ fn my_group_message_shows_read_count() {
     cx.run_until_parked();
 
     assert_inside(&bounds(cx, "read-count"), "read-count");
+}
+
+/// 多选工具条出现在聊天区顶部，选中条数可见。
+#[test]
+fn selection_bar_shows_inside_the_chat_area() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    let room = chat_core::RoomId::new();
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| {
+            app.debug_apply(UiEvent::Conversations {
+                rooms: vec![chat_core::RoomSummary {
+                    room,
+                    kind: chat_core::RoomKind::Group,
+                    name: "多选群".into(),
+                    member_count: 2,
+                    last_seq: 3,
+                    last_text: None,
+                    last_at: None,
+                    read_seq: 0,
+                    muted: false,
+                    announcement: None,
+                    owner: false,
+                    pinned: None,
+                }],
+            });
+            app.debug_apply(UiEvent::Lobby {
+                room,
+                name: "多选群".into(),
+                addr: "127.0.0.1:1".into(),
+                online: 1,
+            });
+            app.debug_open_conversation(room, cx);
+            app.debug_apply(UiEvent::History {
+                room,
+                messages: (1..=3)
+                    .map(|seq| chat_ui_gpui::service::HistoryMessage {
+                        seq,
+                        sender_id: chat_core::UserId::new(),
+                        sender: "Bob".into(),
+                        at: 0,
+                        text: format!("消息 {seq}"),
+                        attachment: None,
+                        quote: None,
+                        recalled: false,
+                        forwarded: false,
+                        merged: 0,
+                    })
+                    .collect(),
+                has_more: false,
+            });
+            app.debug_start_selection(2);
+        });
+    });
+    cx.run_until_parked();
+
+    assert_inside(&bounds(cx, "selection-bar"), "selection-bar");
+    assert_inside(&bounds(cx, "chat-main"), "chat-main");
 }

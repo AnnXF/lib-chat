@@ -351,7 +351,19 @@ fn render_line(
                         .child(format!("{}：{}", quote.sender, quote.text)),
                 );
             }
-            if line.forwarded {
+            if line.merged > 0 {
+                content = content.child(
+                    div()
+                        .test_id("message-merged")
+                        .text_size(px(11.))
+                        .text_color(if line.mine {
+                            rgba(0xffffffaa)
+                        } else {
+                            rgb(theme::ACCENT)
+                        })
+                        .child(format!("聊天记录 · {} 条", line.merged)),
+                );
+            } else if line.forwarded {
                 content = content.child(
                     div()
                         .test_id("message-forwarded")
@@ -510,6 +522,14 @@ impl ChatApp {
                             this.quote_message(line_for_quote.clone(), window, cx);
                         }),
                     ))
+                    .when_some(line.seq, |this, seq| {
+                        this.child(menu_item(
+                            "多选",
+                            cx.listener(move |this, _, _, cx| {
+                                this.on_start_selection(seq, cx);
+                            }),
+                        ))
+                    })
                     .when_some(line.seq, |this, seq| {
                         this.child(menu_item(
                             "转发",
@@ -708,7 +728,7 @@ impl ChatApp {
     pub(crate) fn render_forward_menu(
         &self,
         from: RoomId,
-        seq: Seq,
+        seqs: Vec<Seq>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let targets: Vec<_> = self
@@ -722,6 +742,7 @@ impl ChatApp {
             .enumerate()
             .map(|(index, room)| {
                 let to = room.room;
+                let seqs = seqs.clone();
                 let label = if room.kind == chat_core::RoomKind::Direct {
                     format!("单聊 · {}", room.name)
                 } else {
@@ -741,7 +762,7 @@ impl ChatApp {
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            this.on_forward_to(from, seq, to, cx);
+                            this.on_forward_to(from, seqs.clone(), to, cx);
                         }),
                     )
                     .into_any_element()
@@ -877,6 +898,7 @@ mod perf {
                     quote: None,
                     recalled: false,
                     forwarded: false,
+                    merged: 0,
                     mine: i % 2 == 0,
                     mentioned: false,
                     unread_marker: false,

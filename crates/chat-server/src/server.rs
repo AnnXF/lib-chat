@@ -271,6 +271,7 @@ impl Server {
             | ClientRequest::SetAnnouncement { .. }
             | ClientRequest::PinMessage { .. }
             | ClientRequest::Forward { .. }
+            | ClientRequest::ForwardMultiple { .. }
             | ClientRequest::ListRooms
             | ClientRequest::CreateGroup { .. }
             | ClientRequest::OpenDirect { .. }
@@ -412,6 +413,7 @@ impl Server {
                             attachment: None,
                             quote,
                             forwarded: false,
+                            merged: 0,
                         },
                     )
                     .await
@@ -486,6 +488,7 @@ impl Server {
                             attachment: Some(attachment),
                             quote: None,
                             forwarded: false,
+                            merged: 0,
                         },
                     )
                     .await

@@ -1158,3 +1158,88 @@ async fn room_summaries_are_coalesced_under_a_burst() {
         "{burst} 条消息只应推少量摘要，实际 {summaries} 次"
     );
 }
+
+/// 合并转发：多条消息压成一条聊天记录，带条数与逐行正文。
+#[tokio::test]
+async fn forwarding_multiple_messages_builds_one_transcript() {
+    let dir = temp_dir("forward-many");
+    let hub = Hub::open_with_limit(&dir, "大厅", f64::INFINITY, f64::INFINITY)
+        .await
+        .unwrap();
+    let (alice, alice_user) = register(&hub, "alice").await;
+    let (bob, bob_user) = register(&hub, "bob").await;
+    be_friends(&alice, alice_user.id, &bob, "bob").await;
+    wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
+    wait_for(&bob, |event| matches!(event, ServerEvent::Friends { .. })).await;
+
+    alice
+        .create_group("来源群", vec![bob_user.id])
+        .await
+        .unwrap();
+    let group = match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Rooms { rooms } if rooms.iter().any(|room| room.name == "来源群"))
+    })
+    .await
+    {
+        ServerEvent::Rooms { rooms } => rooms
+            .into_iter()
+            .find(|room| room.name == "来源群")
+            .unwrap()
+            .room,
+        _ => unreachable!(),
+    };
+    alice.open_direct(bob_user.id).await.unwrap();
+    let direct = match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Rooms { rooms } if rooms.iter().any(|room| room.kind == RoomKind::Direct))
+    })
+    .await
+    {
+        ServerEvent::Rooms { rooms } => rooms
+            .into_iter()
+            .find(|room| room.kind == RoomKind::Direct)
+            .unwrap()
+            .room,
+        _ => unreachable!(),
+    };
+
+    for (client, name) in [(&alice, "Alice"), (&bob, "Bob")] {
+        client.join(group, name).await.unwrap();
+        wait_for(client, |event| matches!(event, ServerEvent::Joined { .. })).await;
+    }
+    let mut seqs = Vec::new();
+    for text in ["第一句", "第二句"] {
+        alice.send_text(group, text).await.unwrap();
+        match wait_for(&bob, |event| matches!(event, ServerEvent::Message { .. })).await {
+            ServerEvent::Message { message } => seqs.push(message.seq),
+            _ => unreachable!(),
+        }
+    }
+
+    for (client, name) in [(&alice, "Alice"), (&bob, "Bob")] {
+        client.join(direct, name).await.unwrap();
+        wait_for(client, |event| matches!(event, ServerEvent::Joined { .. })).await;
+    }
+
+    alice
+        .forward_multiple(group, seqs.clone(), direct)
+        .await
+        .unwrap();
+    match wait_for(
+        &bob,
+        |event| matches!(event, ServerEvent::Message { message } if message.merged > 0),
+    )
+    .await
+    {
+        ServerEvent::Message { message } => {
+            assert_eq!(message.merged, 2);
+            assert!(message.forwarded);
+            assert!(
+                message.text.contains("Alice：第一句"),
+                "实际：{}",
+                message.text
+            );
+            assert!(message.text.contains("Alice：第二句"));
+        }
+        _ => unreachable!(),
+    }
+}

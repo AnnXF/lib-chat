@@ -12,7 +12,7 @@ use chat_core::{
     sha256_hex, validate_attachment, Attachment, AttachmentId, ChatError, ClientRequest,
     Connection, ConnectionAcceptor, DeviceId, ErrorCode, EventStream, LagFlag, LobbyInfo,
     MemberRole, MessageKind, MessageStore, NewMessage, Quote, RequestSink, Result, RoomId,
-    RoomInfo, RoomKind, RoomSummary, ServerEvent, UserId, UserSummary, EVENT_QUEUE_CAPACITY,
+    RoomInfo, RoomKind, RoomSummary, Seq, ServerEvent, UserId, UserSummary, EVENT_QUEUE_CAPACITY,
 };
 use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 
@@ -20,6 +20,8 @@ use crate::accounts::{AccountError, Accounts, FriendRequest};
 use crate::store::{BlobStore, DiskBlobs, SqliteStore};
 
 const MAX_TEXT_BYTES: usize = 8 * 1024;
+/// 一次合并转发最多带多少条，避免 transcript 无限长。
+const MAX_MERGED_MESSAGES: usize = 50;
 /// 每条连接的消息令牌桶：突发 100 条，之后每秒回 20 条。
 /// 人手打字远低于这个速度，批量粘贴或脚本刷屏会被挡住。
 const SEND_BURST: f64 = 100.0;
@@ -1012,6 +1014,7 @@ impl Hub {
                     attachment: source.attachment,
                     quote: None,
                     forwarded: true,
+                    merged: 0,
                 };
                 let _publish = self.publish.lock().await;
                 match self.messages.append(to, msg).await {
@@ -1032,6 +1035,95 @@ impl Hub {
                             self.push_room_summaries(to).await;
                         }
                     }
+                    Err(e) => {
+                        return self
+                            .send_error(conn, ErrorCode::Internal, &e.to_string())
+                            .await;
+                    }
+                }
+            }
+
+            ClientRequest::ForwardMultiple { from, seqs, to } => {
+                let Some(user) = self.user_of(conn).await else {
+                    return self.send_to(conn, ServerEvent::AuthRequired).await;
+                };
+                for room in [from, to] {
+                    if !self
+                        .accounts
+                        .is_member(room, user.id)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        return self
+                            .send_error(conn, ErrorCode::RoomMismatch, "房间不存在")
+                            .await;
+                    }
+                }
+                let mut picked: Vec<Seq> = seqs.into_iter().collect();
+                picked.sort_unstable();
+                picked.dedup();
+                picked.truncate(MAX_MERGED_MESSAGES);
+                let mut transcript = String::new();
+                let mut merged = 0_u32;
+                for seq in picked {
+                    let Ok(messages) = self.messages.history(from, Some(seq + 1), 1).await else {
+                        continue;
+                    };
+                    let Some(message) = messages.into_iter().next() else {
+                        continue;
+                    };
+                    if message.recalled {
+                        continue;
+                    }
+                    let body = if message.kind == MessageKind::File {
+                        format!(
+                            "[文件] {}",
+                            message.attachment.as_ref().map_or("", |a| &a.name)
+                        )
+                    } else {
+                        message.text.clone()
+                    };
+                    transcript.push_str(&format!("{}：{}\n", message.sender_name, body));
+                    merged += 1;
+                }
+                if merged == 0 {
+                    return self
+                        .send_error(conn, ErrorCode::NotFound, "没有可转发的消息")
+                        .await;
+                }
+                let name = self
+                    .display_name_of(conn)
+                    .await
+                    .unwrap_or_else(|| user.display_name.clone());
+                let msg = NewMessage {
+                    client_msg_id: uuid::Uuid::new_v4(),
+                    sender: user.id,
+                    sender_name: name,
+                    kind: MessageKind::Text,
+                    text: transcript.trim_end().to_string(),
+                    attachment: None,
+                    quote: None,
+                    forwarded: true,
+                    merged,
+                };
+                let _publish = self.publish.lock().await;
+                match self.messages.append(to, msg).await {
+                    Ok(result) if result.inserted => {
+                        crate::obs::message_appended(
+                            &to.to_string(),
+                            result.message.seq,
+                            &user.username,
+                        );
+                        self.broadcast_room(
+                            to,
+                            ServerEvent::Message {
+                                message: result.message,
+                            },
+                        )
+                        .await;
+                        self.push_room_summaries(to).await;
+                    }
+                    Ok(_) => {}
                     Err(e) => {
                         return self
                             .send_error(conn, ErrorCode::Internal, &e.to_string())
@@ -1405,6 +1497,7 @@ impl Hub {
                     attachment: None,
                     quote: quote.map(sanitize_quote),
                     forwarded: false,
+                    merged: 0,
                 };
                 match self.messages.append(room, msg).await {
                     Ok(result) => {
@@ -1518,6 +1611,7 @@ impl Hub {
                     attachment: Some(attachment),
                     quote: None,
                     forwarded: false,
+                    merged: 0,
                 };
                 match self.messages.append(room, msg).await {
                     Ok(result) if result.inserted => {

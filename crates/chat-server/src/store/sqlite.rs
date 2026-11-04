@@ -37,6 +37,8 @@ mod messages {
     pub const QUOTE_SEQ: &str = "quote_seq";
     pub const RECALLED_AT: &str = "recalled_at";
     pub const FORWARDED: &str = "forwarded";
+    /// 合并转发包含的条数；0 表示普通消息。
+    pub const MERGED: &str = "merged";
 }
 
 /// `room_meta` 表：单行，记着本库属于哪个房间。
@@ -50,7 +52,7 @@ mod room_meta {
 const ROOM_ROW: i32 = 1;
 
 /// 读消息时统一选出的列，顺序与 [`row_to_message`] 的下标一一对应。
-const MESSAGE_COLUMNS: [&str; 17] = [
+const MESSAGE_COLUMNS: [&str; 18] = [
     messages::SEQ,
     messages::MSG_ID,
     messages::SENDER,
@@ -68,6 +70,7 @@ const MESSAGE_COLUMNS: [&str; 17] = [
     messages::QUOTE_SEQ,
     messages::RECALLED_AT,
     messages::FORWARDED,
+    messages::MERGED,
 ];
 
 pub struct SqliteStore {
@@ -252,6 +255,7 @@ impl MessageStore for SqliteStore {
                 quote: msg.quote,
                 recalled: false,
                 forwarded: msg.forwarded,
+                merged: msg.merged,
                 server_ts_ms: now_ms(),
             };
 
@@ -275,6 +279,7 @@ impl MessageStore for SqliteStore {
                     messages::QUOTE_TEXT,
                     messages::QUOTE_SEQ,
                     messages::FORWARDED,
+                    messages::MERGED,
                 ])
                 .values_panic([
                     stored.room.to_string().into(),
@@ -294,6 +299,7 @@ impl MessageStore for SqliteStore {
                     stored.quote.as_ref().map(|q| q.text.clone()).into(),
                     stored.quote.as_ref().and_then(|q| q.seq).into(),
                     i64::from(stored.forwarded).into(),
+                    i64::from(stored.merged).into(),
                 ])
                 .build(SqliteQueryBuilder);
 
@@ -564,6 +570,7 @@ fn row_to_message(room: RoomId, row: &sqlx::sqlite::SqliteRow) -> Result<Message
         quote: row_to_quote(row),
         recalled: row.get::<Option<i64>, _>(15).is_some(),
         forwarded: row.get::<i64, _>(16) != 0,
+        merged: row.get(17),
         server_ts_ms: row.get(6),
     })
 }
@@ -670,6 +677,12 @@ fn v1_schema() -> Vec<SchemaStatement> {
                 .not_null()
                 .default(0),
         )
+        .col(
+            ColumnDef::new(messages::MERGED)
+                .integer()
+                .not_null()
+                .default(0),
+        )
         .primary_key(Index::create().col(messages::ROOM_ID).col(messages::SEQ))
         .to_owned();
 
@@ -754,6 +767,7 @@ mod tests {
             attachment: None,
             quote: None,
             forwarded: false,
+            merged: 0,
         }
     }
 
@@ -896,6 +910,7 @@ mod search_tests {
             attachment: None,
             quote: None,
             forwarded: false,
+            merged: 0,
         }
     }
 

@@ -1028,6 +1028,7 @@ mod tests {
             quote: None,
             recalled: false,
             forwarded: false,
+            merged: 0,
             server_ts_ms: 0,
         }
     }

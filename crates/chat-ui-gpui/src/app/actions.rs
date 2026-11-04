@@ -561,12 +561,16 @@ impl ChatApp {
 
     /// 供无头测试直接打开消息菜单。
     #[cfg(any(test, feature = "ui-test"))]
+    pub fn debug_start_selection(&mut self, seq: Seq) {
+        self.selection = Some(vec![seq]);
+    }
+
     pub fn debug_set_my_id(&mut self, id: UserId) {
         self.my_id = Some(id);
     }
 
     pub fn debug_open_forward_menu(&mut self, room: RoomId, seq: Seq, cx: &mut Context<Self>) {
-        self.forward_from = Some((room, seq));
+        self.forward_pending = Some((room, vec![seq]));
         cx.notify();
     }
 
@@ -580,6 +584,7 @@ impl ChatApp {
             quote: None,
             recalled: false,
             forwarded: false,
+            merged: 0,
             mine: false,
             mentioned: false,
             unread_marker: false,
@@ -634,7 +639,55 @@ impl ChatApp {
             return;
         };
         self.message_menu = None;
-        self.forward_from = Some((room, seq));
+        self.forward_pending = Some((room, vec![seq]));
+        cx.notify();
+    }
+
+    /// 进入多选模式，并把当前这条先选上。
+    pub(crate) fn on_start_selection(&mut self, seq: Seq, cx: &mut Context<Self>) {
+        self.message_menu = None;
+        self.selection = Some(vec![seq]);
+        cx.notify();
+    }
+
+    /// 多选模式下点一条消息：选中或取消。
+    pub(crate) fn on_toggle_selection(&mut self, seq: Seq, cx: &mut Context<Self>) {
+        let Some(selection) = self.selection.as_mut() else {
+            return;
+        };
+        if let Some(at) = selection.iter().position(|picked| *picked == seq) {
+            selection.remove(at);
+        } else {
+            selection.push(seq);
+            selection.sort_unstable();
+        }
+        cx.notify();
+    }
+
+    /// 退出多选。
+    pub(crate) fn on_cancel_selection(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selection = None;
+        cx.notify();
+    }
+
+    /// 把选中的多条消息合并转发。
+    pub(crate) fn on_forward_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(room) = self.room.as_ref().map(|room| room.id) else {
+            return;
+        };
+        let Some(seqs) = self.selection.take() else {
+            return;
+        };
+        if seqs.is_empty() {
+            cx.notify();
+            return;
+        }
+        self.forward_pending = Some((room, seqs));
         cx.notify();
     }
 
@@ -644,25 +697,35 @@ impl ChatApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.forward_from = None;
+        self.forward_pending = None;
         cx.notify();
     }
 
-    /// 把消息转发到选中的会话。
+    /// 把消息转发到选中的会话；多条走合并转发。
     pub(crate) fn on_forward_to(
         &mut self,
         from: RoomId,
-        seq: Seq,
+        seqs: Vec<Seq>,
         to: RoomId,
         cx: &mut Context<Self>,
     ) {
-        self.forward_from = None;
-        self.status = "已转发".into();
+        self.forward_pending = None;
+        self.selection = None;
+        self.status = if seqs.len() > 1 {
+            format!("已合并转发 {} 条", seqs.len())
+        } else {
+            "已转发".into()
+        };
         self.status_kind = super::StatusKind::Info;
-        self.tell(
-            crate::service::UiCommand::ForwardMessage { from, seq, to },
-            cx,
-        );
+        let command = match seqs.as_slice() {
+            [seq] => crate::service::UiCommand::ForwardMessage {
+                from,
+                seq: *seq,
+                to,
+            },
+            _ => crate::service::UiCommand::ForwardMultiple { from, seqs, to },
+        };
+        self.tell(command, cx);
     }
 
     /// 置顶/取消置顶一条消息。
@@ -1099,6 +1162,7 @@ mod tests {
             quote: None,
             recalled: false,
             forwarded: false,
+            merged: 0,
             mine: false,
             mentioned: false,
             unread_marker: false,
