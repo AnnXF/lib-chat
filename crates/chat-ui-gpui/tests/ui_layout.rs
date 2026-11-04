@@ -1474,3 +1474,35 @@ fn login_page_hides_server_fields_when_they_are_built_in() {
         assert!(!labels.iter().any(|label| label.contains("证书指纹")));
     }
 }
+
+/// 会话有未读时，列表里要出现红色角标。
+#[test]
+fn unread_conversation_shows_a_badge() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    let room = chat_core::RoomId::new();
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| {
+            app.debug_apply(UiEvent::Conversations {
+                rooms: vec![chat_core::RoomSummary {
+                    room,
+                    kind: chat_core::RoomKind::Group,
+                    name: "未读群".into(),
+                    member_count: 3,
+                    last_seq: 3,
+                    last_text: Some("三条新消息".into()),
+                    last_at: None,
+                    read_seq: 0,
+                    muted: false,
+                    announcement: None,
+                    owner: false,
+                    pinned: None,
+                }],
+            });
+            app.debug_nav(NavTab::Chats, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert_inside(&bounds(cx, "unread-badge"), "unread-badge");
+}

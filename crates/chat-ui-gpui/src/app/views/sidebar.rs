@@ -1143,6 +1143,8 @@ fn conversation_item(
         )
         .child(if unread > 0 {
             div()
+                .id("unread-badge")
+                .test_id("unread-badge")
                 .min_w(px(18.))
                 .h(px(18.))
                 .px_1()
