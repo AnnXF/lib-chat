@@ -270,6 +270,7 @@ impl Server {
             | ClientRequest::SetMuted { .. }
             | ClientRequest::SetAnnouncement { .. }
             | ClientRequest::PinMessage { .. }
+            | ClientRequest::Forward { .. }
             | ClientRequest::ListRooms
             | ClientRequest::CreateGroup { .. }
             | ClientRequest::OpenDirect { .. }
@@ -410,6 +411,7 @@ impl Server {
                             text: text.to_string(),
                             attachment: None,
                             quote,
+                            forwarded: false,
                         },
                     )
                     .await
@@ -483,6 +485,7 @@ impl Server {
                             text: String::new(),
                             attachment: Some(attachment),
                             quote: None,
+                            forwarded: false,
                         },
                     )
                     .await

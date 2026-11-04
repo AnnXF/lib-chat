@@ -271,6 +271,7 @@ impl MessagesCache {
                 at: row.get(3),
                 text: row.get(4),
                 recalled: row.get::<i64, _>(5) != 0,
+                forwarded: false,
                 attachment: row.get::<Option<String>, _>(6).map(|id| Attachment {
                     id: id.parse().unwrap_or_else(|_| AttachmentId::new()),
                     name: row.get::<Option<String>, _>(7).unwrap_or_default(),
@@ -355,6 +356,7 @@ mod tests {
             attachment: None,
             quote: None,
             recalled: false,
+            forwarded: false,
         }
     }
 

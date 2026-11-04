@@ -38,6 +38,7 @@ async fn history_cost() {
                         text: format!("这是第 {i} 条消息，长度大约二十来个字"),
                         attachment: None,
                         quote: None,
+                        forwarded: false,
                     },
                 )
                 .await
@@ -164,6 +165,7 @@ async fn message_footprint() {
                     text: format!("这是第 {i} 条消息，长度大约二十来个字"),
                     attachment: None,
                     quote: None,
+                    forwarded: false,
                 },
             )
             .await

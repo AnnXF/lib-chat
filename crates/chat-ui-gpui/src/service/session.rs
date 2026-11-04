@@ -1027,6 +1027,7 @@ mod tests {
             attachment: None,
             quote: None,
             recalled: false,
+            forwarded: false,
             server_ts_ms: 0,
         }
     }

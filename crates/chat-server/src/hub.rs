@@ -927,6 +927,76 @@ impl Hub {
                 }
             }
 
+            ClientRequest::Forward { from, seq, to } => {
+                let Some(user) = self.user_of(conn).await else {
+                    return self.send_to(conn, ServerEvent::AuthRequired).await;
+                };
+                for room in [from, to] {
+                    if !self
+                        .accounts
+                        .is_member(room, user.id)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        return self
+                            .send_error(conn, ErrorCode::RoomMismatch, "房间不存在")
+                            .await;
+                    }
+                }
+                let source = match self.messages.history(from, Some(seq + 1), 1).await {
+                    Ok(messages) => messages.into_iter().next(),
+                    Err(e) => {
+                        return self
+                            .send_error(conn, ErrorCode::Internal, &e.to_string())
+                            .await;
+                    }
+                };
+                let Some(source) = source.filter(|message| !message.recalled) else {
+                    return self
+                        .send_error(conn, ErrorCode::NotFound, "这条消息已经不存在")
+                        .await;
+                };
+                let name = self
+                    .display_name_of(conn)
+                    .await
+                    .unwrap_or_else(|| user.display_name.clone());
+                let msg = NewMessage {
+                    client_msg_id: uuid::Uuid::new_v4(),
+                    sender: user.id,
+                    sender_name: name,
+                    kind: source.kind,
+                    text: source.text,
+                    attachment: source.attachment,
+                    quote: None,
+                    forwarded: true,
+                };
+                let _publish = self.publish.lock().await;
+                match self.messages.append(to, msg).await {
+                    Ok(result) => {
+                        if result.inserted {
+                            crate::obs::message_appended(
+                                &to.to_string(),
+                                result.message.seq,
+                                &user.username,
+                            );
+                            self.broadcast_room(
+                                to,
+                                ServerEvent::Message {
+                                    message: result.message,
+                                },
+                            )
+                            .await;
+                            self.push_room_summaries(to).await;
+                        }
+                    }
+                    Err(e) => {
+                        return self
+                            .send_error(conn, ErrorCode::Internal, &e.to_string())
+                            .await;
+                    }
+                }
+            }
+
             ClientRequest::PinMessage { room, seq } => {
                 let Some(user) = self.user_of(conn).await else {
                     return self.send_to(conn, ServerEvent::AuthRequired).await;
@@ -1290,6 +1360,7 @@ impl Hub {
                     text: text.to_string(),
                     attachment: None,
                     quote: quote.map(sanitize_quote),
+                    forwarded: false,
                 };
                 match self.messages.append(room, msg).await {
                     Ok(result) => {
@@ -1381,6 +1452,7 @@ impl Hub {
                     text: String::new(),
                     attachment: Some(attachment),
                     quote: None,
+                    forwarded: false,
                 };
                 match self.messages.append(room, msg).await {
                     Ok(result) if result.inserted => {

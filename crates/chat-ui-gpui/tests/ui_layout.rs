@@ -395,6 +395,7 @@ fn file_message_renders_inside_the_window() {
             }),
             quote: None,
             recalled: false,
+            forwarded: false,
         },
     );
 
@@ -743,6 +744,7 @@ fn quoted_message_renders_a_quote_block() {
                 seq: Some(0),
             }),
             recalled: false,
+            forwarded: false,
         },
     );
 
@@ -899,6 +901,7 @@ fn unread_banner_and_divider_are_rendered() {
                         attachment: None,
                         quote: None,
                         recalled: false,
+                        forwarded: false,
                     })
                     .collect(),
                 has_more: false,
@@ -1183,6 +1186,7 @@ fn image_attachment_renders_a_preview_inside_the_chat_area() {
                 attachment: Some(attachment.clone()),
                 quote: None,
                 recalled: false,
+                forwarded: false,
             });
             // 预览字节直接喂给界面，效果等同于服务层下载完成
             app.debug_apply(UiEvent::Preview {
@@ -1242,4 +1246,60 @@ fn pinned_message_banner_stays_inside_the_chat_area() {
 
     assert_inside(&bounds(cx, "pinned-banner"), "pinned-banner");
     assert_inside(&bounds(cx, "chat-main"), "chat-main");
+}
+
+/// 转发浮层列出其它会话，长名字不撑宽窗口。
+#[test]
+fn forward_menu_lists_other_conversations() {
+    let mut app_cx = TestAppContext::single();
+    let (view, cx) = open_window(&mut app_cx);
+    let room = chat_core::RoomId::new();
+    let other = chat_core::RoomId::new();
+    cx.update(|_window, cx| {
+        view.update(cx, |app, cx| {
+            app.debug_apply(UiEvent::Conversations {
+                rooms: vec![
+                    chat_core::RoomSummary {
+                        room,
+                        kind: chat_core::RoomKind::Group,
+                        name: "当前群".into(),
+                        member_count: 2,
+                        last_seq: 0,
+                        last_text: None,
+                        last_at: None,
+                        read_seq: 0,
+                        muted: false,
+                        announcement: None,
+                        owner: false,
+                        pinned: None,
+                    },
+                    chat_core::RoomSummary {
+                        room: other,
+                        kind: chat_core::RoomKind::Direct,
+                        name: "一个很长很长的单聊名字用来撑宽度".into(),
+                        member_count: 2,
+                        last_seq: 0,
+                        last_text: None,
+                        last_at: None,
+                        read_seq: 0,
+                        muted: false,
+                        announcement: None,
+                        owner: false,
+                        pinned: None,
+                    },
+                ],
+            });
+            app.debug_apply(UiEvent::Lobby {
+                room,
+                name: "当前群".into(),
+                addr: "127.0.0.1:1".into(),
+                online: 1,
+            });
+            app.debug_open_conversation(room, cx);
+            app.debug_open_forward_menu(room, 1, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert_inside(&bounds(cx, "forward-menu"), "forward-menu");
 }

@@ -920,3 +920,75 @@ async fn any_member_can_pin_and_unpin_a_message() {
         _ => unreachable!(),
     }
 }
+
+/// 转发：把群里的消息复制到单聊，双方都能收到，正文与附件照搬。
+#[tokio::test]
+async fn forwarding_copies_the_message_into_another_room() {
+    let dir = temp_dir("forward");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+    let (alice, alice_user) = register(&hub, "alice").await;
+    let (bob, bob_user) = register(&hub, "bob").await;
+    be_friends(&alice, alice_user.id, &bob, "bob").await;
+    wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
+    wait_for(&bob, |event| matches!(event, ServerEvent::Friends { .. })).await;
+
+    alice
+        .create_group("来源群", vec![bob_user.id])
+        .await
+        .unwrap();
+    let group = match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Rooms { rooms } if rooms.iter().any(|room| room.name == "来源群"))
+    })
+    .await
+    {
+        ServerEvent::Rooms { rooms } => rooms
+            .into_iter()
+            .find(|room| room.name == "来源群")
+            .unwrap()
+            .room,
+        _ => unreachable!(),
+    };
+    alice.open_direct(bob_user.id).await.unwrap();
+
+    let direct = match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Rooms { rooms } if rooms.iter().any(|room| room.kind == RoomKind::Direct))
+    })
+    .await
+    {
+        ServerEvent::Rooms { rooms } => rooms
+            .into_iter()
+            .find(|room| room.kind == RoomKind::Direct)
+            .unwrap()
+            .room,
+        _ => unreachable!(),
+    };
+
+    for (client, name) in [(&alice, "Alice"), (&bob, "Bob")] {
+        client.join(group, name).await.unwrap();
+        wait_for(client, |event| matches!(event, ServerEvent::Joined { .. })).await;
+    }
+    alice.send_text(group, "要转发的话").await.unwrap();
+    let seq = match wait_for(&bob, |event| matches!(event, ServerEvent::Message { .. })).await {
+        ServerEvent::Message { message } => message.seq,
+        _ => unreachable!(),
+    };
+
+    for (client, name) in [(&alice, "Alice"), (&bob, "Bob")] {
+        client.join(direct, name).await.unwrap();
+        wait_for(client, |event| matches!(event, ServerEvent::Joined { .. })).await;
+    }
+    alice.forward(group, seq, direct).await.unwrap();
+    match wait_for(
+        &bob,
+        |event| matches!(event, ServerEvent::Message { message } if message.forwarded),
+    )
+    .await
+    {
+        ServerEvent::Message { message } => {
+            assert_eq!(message.room, direct);
+            assert_eq!(message.text, "要转发的话");
+            assert_eq!(message.sender, alice_user.id, "转发者是发送者");
+        }
+        _ => unreachable!(),
+    }
+}

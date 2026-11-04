@@ -208,6 +208,7 @@ impl ChatApp {
                 attachment,
                 quote,
                 recalled,
+                forwarded,
             } => {
                 if self.showing(room).is_some() {
                     if self.window_active {
@@ -215,7 +216,8 @@ impl ChatApp {
                     }
                     let mentioned = self.mentions_me(&text);
                     let mut line = chat_line(
-                        seq, at, sender_id, sender, text, attachment, quote, recalled, self.my_id,
+                        seq, at, sender_id, sender, text, attachment, quote, recalled, forwarded,
+                        self.my_id,
                     );
                     line.mentioned = mentioned;
                     self.push_line(line);
@@ -248,6 +250,7 @@ impl ChatApp {
                             m.attachment,
                             m.quote,
                             m.recalled,
+                            m.forwarded,
                             my_id,
                         );
                         line.mentioned = mentioned;
@@ -312,6 +315,7 @@ impl ChatApp {
                             m.attachment,
                             m.quote,
                             m.recalled,
+                            m.forwarded,
                             my_id,
                         );
                         line.mentioned = mentioned;
@@ -623,6 +627,7 @@ impl ChatApp {
             attachment: None,
             quote: None,
             recalled: false,
+            forwarded: false,
             mine: false,
             mentioned: false,
             unread_marker: true,
@@ -683,6 +688,7 @@ impl ChatApp {
             attachment: None,
             quote: None,
             recalled: false,
+            forwarded: false,
             mine: false,
             mentioned: false,
             unread_marker: false,
@@ -701,6 +707,7 @@ fn chat_line(
     attachment: Option<Attachment>,
     quote: Option<chat_core::Quote>,
     recalled: bool,
+    forwarded: bool,
     mine: Option<UserId>,
 ) -> ChatLine {
     ChatLine {
@@ -711,6 +718,7 @@ fn chat_line(
         attachment,
         quote,
         recalled,
+        forwarded,
         mine: mine == Some(sender_id),
         mentioned: false,
         unread_marker: false,

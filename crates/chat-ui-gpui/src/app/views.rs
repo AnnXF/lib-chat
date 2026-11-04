@@ -21,7 +21,7 @@ use crate::app::FriendMenu;
 
 use crate::app::theme;
 
-use chat_core::Attachment;
+use chat_core::{Attachment, RoomId, Seq};
 
 use super::{ChatApp, ChatLine, DiscoveredRoom, HostedRoom, MessageMenu, RoomSource, StatusKind};
 
@@ -350,6 +350,19 @@ fn render_line(
                         .child(format!("{}：{}", quote.sender, quote.text)),
                 );
             }
+            if line.forwarded {
+                content = content.child(
+                    div()
+                        .test_id("message-forwarded")
+                        .text_size(px(11.))
+                        .text_color(if line.mine {
+                            rgba(0xffffffaa)
+                        } else {
+                            rgb(theme::FAINT)
+                        })
+                        .child("转发的消息"),
+                );
+            }
             content = content.child(div().child(line.text.clone()));
 
             let bubble = div()
@@ -485,6 +498,14 @@ impl ChatApp {
                             this.quote_message(line_for_quote.clone(), window, cx);
                         }),
                     ))
+                    .when_some(line.seq, |this, seq| {
+                        this.child(menu_item(
+                            "转发",
+                            cx.listener(move |this, _, _, cx| {
+                                this.on_forward_message(seq, cx);
+                            }),
+                        ))
+                    })
                     .when_some(line.seq, |this, seq| {
                         let pinned = self
                             .room
@@ -671,6 +692,93 @@ fn login_field(label: &str, input: impl IntoElement) -> AnyElement {
 }
 
 impl ChatApp {
+    /// 转发目标选择：列出除当前会话外的所有会话。
+    pub(crate) fn render_forward_menu(
+        &self,
+        from: RoomId,
+        seq: Seq,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let targets: Vec<_> = self
+            .conversations
+            .iter()
+            .filter(|room| room.room != from)
+            .cloned()
+            .collect();
+        let rows: Vec<_> = targets
+            .into_iter()
+            .enumerate()
+            .map(|(index, room)| {
+                let to = room.room;
+                let label = if room.kind == chat_core::RoomKind::Direct {
+                    format!("单聊 · {}", room.name)
+                } else {
+                    format!("群聊 · {}", room.name)
+                };
+                div()
+                    .id(("forward-target", index))
+                    .h(px(36.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .truncate()
+                    .text_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::HOVER)))
+                    .child(label)
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.on_forward_to(from, seq, to, cx);
+                        }),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        div()
+            .id("forward-menu-overlay")
+            .absolute()
+            .inset_0()
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_close_forward_menu))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_close_forward_menu))
+            .child(
+                div()
+                    .id("forward-menu")
+                    .test_id("forward-menu")
+                    .absolute()
+                    .top(px(80.))
+                    .left(px(120.))
+                    .w(px(240.))
+                    .max_h(px(320.))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .py_1()
+                    .rounded_lg()
+                    .bg(rgb(theme::FIELD))
+                    .border_1()
+                    .border_color(rgb(theme::BORDER_STRONG))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        |_: &MouseDownEvent, _: &mut Window, cx: &mut App| cx.stop_propagation(),
+                    )
+                    .child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .text_size(px(11.))
+                            .text_color(rgb(theme::FAINT))
+                            .child("转发到"),
+                    )
+                    .when(rows.is_empty(), |this| {
+                        this.child(div().px_3().py_2().text_size(px(12.)).child("没有别的会话"))
+                    })
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
     /// 通讯录好友右键菜单。
     pub(crate) fn render_friend_menu(
         &self,
@@ -756,6 +864,7 @@ mod perf {
                     attachment: None,
                     quote: None,
                     recalled: false,
+                    forwarded: false,
                     mine: i % 2 == 0,
                     mentioned: false,
                     unread_marker: false,

@@ -147,6 +147,7 @@ pub struct HistoryMessage {
     pub attachment: Option<Attachment>,
     pub quote: Option<Quote>,
     pub recalled: bool,
+    pub forwarded: bool,
 }
 
 /// 公网托管的接入信息：客户端据此决定填域名还是填指纹。
@@ -223,6 +224,7 @@ pub enum UiEvent {
         attachment: Option<Attachment>,
         quote: Option<Quote>,
         recalled: bool,
+        forwarded: bool,
     },
     /// 取回的一页历史（比当前会话更早），界面应插到列表最前。
     History {
@@ -388,6 +390,12 @@ pub enum UiCommand {
     },
     /// 用上次落盘的令牌恢复登录；令牌留在服务层，界面不接触。
     Resume,
+    /// 把一条消息转发到别的会话。
+    ForwardMessage {
+        from: RoomId,
+        seq: Seq,
+        to: RoomId,
+    },
     /// 置顶一条消息；`seq` 为 `None` 表示取消。
     PinMessage {
         room: RoomId,
@@ -1184,6 +1192,7 @@ async fn run(
             }
             UiCommand::RefreshRooms
             | UiCommand::AddFriend { .. }
+            | UiCommand::ForwardMessage { .. }
             | UiCommand::PinMessage { .. }
             | UiCommand::SetAnnouncement { .. }
             | UiCommand::SetMuted { .. }
@@ -1205,6 +1214,9 @@ async fn run(
                 let sent = match cmd {
                     UiCommand::RefreshRooms => client.list_rooms().await,
                     UiCommand::AddFriend { username } => client.add_friend(username).await,
+                    UiCommand::ForwardMessage { from, seq, to } => {
+                        client.forward(from, seq, to).await
+                    }
                     UiCommand::PinMessage { room, seq } => client.pin_message(room, seq).await,
                     UiCommand::SetAnnouncement { room, text } => {
                         client.set_announcement(room, text).await

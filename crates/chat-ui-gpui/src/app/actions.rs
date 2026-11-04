@@ -561,6 +561,11 @@ impl ChatApp {
 
     /// 供无头测试直接打开消息菜单。
     #[cfg(any(test, feature = "ui-test"))]
+    pub fn debug_open_forward_menu(&mut self, room: RoomId, seq: Seq, cx: &mut Context<Self>) {
+        self.forward_from = Some((room, seq));
+        cx.notify();
+    }
+
     pub fn debug_open_message_menu(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
         let line = ChatLine {
             seq: Some(1),
@@ -570,6 +575,7 @@ impl ChatApp {
             attachment: None,
             quote: None,
             recalled: false,
+            forwarded: false,
             mine: false,
             mentioned: false,
             unread_marker: false,
@@ -616,6 +622,43 @@ impl ChatApp {
 
     pub(crate) fn on_login(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.perform_login(false, cx);
+    }
+
+    /// 打开转发目标选择。
+    pub(crate) fn on_forward_message(&mut self, seq: Seq, cx: &mut Context<Self>) {
+        let Some(room) = self.room.as_ref().map(|room| room.id) else {
+            return;
+        };
+        self.message_menu = None;
+        self.forward_from = Some((room, seq));
+        cx.notify();
+    }
+
+    pub(crate) fn on_close_forward_menu(
+        &mut self,
+        _: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.forward_from = None;
+        cx.notify();
+    }
+
+    /// 把消息转发到选中的会话。
+    pub(crate) fn on_forward_to(
+        &mut self,
+        from: RoomId,
+        seq: Seq,
+        to: RoomId,
+        cx: &mut Context<Self>,
+    ) {
+        self.forward_from = None;
+        self.status = "已转发".into();
+        self.status_kind = super::StatusKind::Info;
+        self.tell(
+            crate::service::UiCommand::ForwardMessage { from, seq, to },
+            cx,
+        );
     }
 
     /// 置顶/取消置顶一条消息。
@@ -1051,6 +1094,7 @@ mod tests {
             attachment: None,
             quote: None,
             recalled: false,
+            forwarded: false,
             mine: false,
             mentioned: false,
             unread_marker: false,

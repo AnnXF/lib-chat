@@ -53,6 +53,7 @@ impl MessageStore for InMemoryStore {
             attachment: msg.attachment.clone(),
             quote: msg.quote.clone(),
             recalled: false,
+            forwarded: msg.forwarded,
             server_ts_ms: now_ms(),
         };
         if let Some(attachment) = &stored.attachment {

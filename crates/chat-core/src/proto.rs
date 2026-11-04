@@ -163,6 +163,8 @@ pub struct Message {
     pub quote: Option<Quote>,
     /// 已撤回：正文与附件都已清空，但仍占着这个序号。
     pub recalled: bool,
+    /// 从别处转发过来的消息。
+    pub forwarded: bool,
     pub server_ts_ms: i64,
 }
 
@@ -223,6 +225,12 @@ pub enum ClientRequest {
     /// 按用户名或昵称搜索用户，最多 20 条。
     SearchUsers {
         query: String,
+    },
+    /// 把一条消息转发到另一个会话。
+    Forward {
+        from: RoomId,
+        seq: Seq,
+        to: RoomId,
     },
     /// 置顶一条消息；`seq` 为 `None` 表示取消置顶。
     PinMessage {

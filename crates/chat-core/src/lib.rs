@@ -236,6 +236,8 @@ pub struct NewMessage {
     pub text: String,
     pub attachment: Option<Attachment>,
     pub quote: Option<Quote>,
+    /// 是否是从别处转发过来的。
+    pub forwarded: bool,
 }
 
 /// 消息持久化端口。服务端负责分配会话内单调序号。
