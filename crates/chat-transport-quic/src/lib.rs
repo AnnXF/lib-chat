@@ -202,6 +202,18 @@ async fn read_chunk(recv: &mut quinn::RecvStream) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// 进程内固定的设备标识：服务启动时从磁盘恢复，未设置则随机生成。
+static DEVICE: std::sync::OnceLock<DeviceId> = std::sync::OnceLock::new();
+
+/// 指定本进程连接时使用的设备标识；应在建连前调用一次。
+pub fn set_device_id(device: DeviceId) {
+    let _ = DEVICE.set(device);
+}
+
+fn device_id() -> DeviceId {
+    *DEVICE.get_or_init(DeviceId::new)
+}
+
 /// 等服务端的最终应答；整块上传会先收到一条 `Ready`，读两次即可。
 async fn await_upload_done(recv: &mut quinn::RecvStream) -> Result<()> {
     let mut reply = read_frame::<BlobReply>(recv).await?;
@@ -875,7 +887,7 @@ async fn handshake(
         .map_err(|_| ChatError::Protocol("打开请求流超时".into()))?
         .map_err(transport_err)?;
 
-    let device = DeviceId::new();
+    let device = device_id();
     write_frame(
         &mut send,
         &ClientFrame::Hello {

@@ -551,6 +551,7 @@ impl Hub {
         }
     }
 
+    /// 房间在线人数：按连接计数，与 README 的语义一致。
     async fn presence(&self, room: RoomId) -> u32 {
         self.conns
             .read()
@@ -979,9 +980,12 @@ impl Hub {
                     .set_read_seq(user.id, room, seq.min(latest))
                     .await
                 {
-                    self.send_error(conn, ErrorCode::Internal, &e.to_string())
+                    return self
+                        .send_error(conn, ErrorCode::Internal, &e.to_string())
                         .await;
                 }
+                // 已读是按账号存的：同账号的其它设备也要看到新的已读位置
+                self.push_rooms_to(user.id).await;
             }
 
             ClientRequest::ListRooms => {

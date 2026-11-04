@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 const FILE: &str = "session.json";
+const DEVICE_FILE: &str = "device.id";
 const TEMP: &str = "session.json.tmp";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +37,20 @@ pub(super) fn save(dir: &Path, login: &SavedLogin) -> std::io::Result<()> {
 pub(super) fn load(dir: &Path) -> Option<SavedLogin> {
     let raw = std::fs::read(path(dir)).ok()?;
     serde_json::from_slice(&raw).ok()
+}
+
+/// 读本机的设备标识；没有就生成一个并落盘，重启之后还是同一个。
+pub(super) fn load_or_create_device(dir: &Path) -> chat_core::DeviceId {
+    let path = dir.join(DEVICE_FILE);
+    if let Ok(text) = std::fs::read_to_string(&path)
+        && let Ok(device) = text.trim().parse()
+    {
+        return device;
+    }
+    let device = chat_core::DeviceId::new();
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(&path, device.to_string());
+    device
 }
 
 pub(super) fn clear(dir: &Path) {
@@ -96,6 +111,18 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_device_id_survives_a_restart() {
+        let dir = dir("device");
+        let first = load_or_create_device(&dir);
+        // 再读一次相当于重启，必须是同一个
+        assert_eq!(load_or_create_device(&dir), first);
+        // 文件坏掉时换一个新的，仍然可用
+        std::fs::write(dir.join(DEVICE_FILE), b"not-a-uuid").unwrap();
+        let _ = load_or_create_device(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

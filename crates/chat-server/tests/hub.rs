@@ -798,3 +798,54 @@ async fn only_the_owner_can_set_the_group_announcement() {
         _ => unreachable!(),
     }
 }
+
+/// 同一账号在另一台设备登录：消息互通，已读位置共享。
+#[tokio::test]
+async fn the_same_account_on_two_devices_shares_messages_and_read_state() {
+    let dir = temp_dir("multi-device");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+    let (phone, user) = register(&hub, "alice").await;
+
+    // 第二台设备：同一账号另开一条连接
+    let laptop = Client::new(hub.connect(DeviceId::new()).await);
+    laptop.login("alice", "password123").await.unwrap();
+    wait_for(&laptop, |event| {
+        matches!(event, ServerEvent::Authenticated { .. })
+    })
+    .await;
+
+    let room = hub.default_room();
+    for client in [&phone, &laptop] {
+        client.join(room, "Alice").await.unwrap();
+        wait_for(client, |event| matches!(event, ServerEvent::Joined { .. })).await;
+    }
+
+    // 手机上发，电脑上应该收到
+    phone.send_text(room, "两边都看得到").await.unwrap();
+    match wait_for(&laptop, |event| {
+        matches!(event, ServerEvent::Message { .. })
+    })
+    .await
+    {
+        ServerEvent::Message { message } => {
+            assert_eq!(message.text, "两边都看得到");
+            assert_eq!(message.sender, user.id);
+        }
+        _ => unreachable!(),
+    }
+
+    // 电脑上读了，手机拿到的会话摘要里 read_seq 也要跟上
+    laptop.mark_read(room, 1).await.unwrap();
+    match wait_for(&phone, |event| {
+        matches!(event, ServerEvent::Rooms { rooms }
+            if rooms.iter().any(|known| known.room == room && known.read_seq == 1))
+    })
+    .await
+    {
+        ServerEvent::Rooms { .. } => {}
+        _ => unreachable!(),
+    }
+
+    // 在线人数按连接算：同一个人开两个端就算两条连接
+    assert_eq!(hub.online_count().await, 2);
+}

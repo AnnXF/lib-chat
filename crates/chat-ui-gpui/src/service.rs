@@ -10,6 +10,7 @@
 //! | [`discovery`] | 局域网房间发现与人数探测 |
 //! | [`remote`] | 公网地址簿：保存地址、周期探测 |
 
+mod cache;
 mod discovery;
 mod hosting;
 mod protocol;
@@ -508,6 +509,14 @@ pub fn spawn_with_data(
     (cmd_tx, ev_rx)
 }
 
+/// 打开会话时先铺出来的本地缓存条数。
+const CACHED_PAGE: usize = 50;
+
+/// 服务层诊断输出：缓存这类非致命错误写到这里，不影响主流程。
+pub(crate) fn log(message: &str) {
+    eprintln!("[chat-service] {message}");
+}
+
 /// 消息库所在目录：`$HOME/.lib-chat/rooms`，家目录不可用时退回临时目录。
 fn default_data_dir() -> PathBuf {
     let base = std::env::var_os("HOME")
@@ -966,6 +975,9 @@ async fn run(
     liveness: Liveness,
     data_dir: PathBuf,
 ) {
+    // 设备标识固定下来：同一台机器重连后仍是同一台设备
+    chat_transport_quic::set_device_id(session_store::load_or_create_device(&data_dir));
+    cache::init(&data_dir);
     let rooms = DiscoveredRooms::default();
     tokio::spawn(browse_loop(
         events.clone(),
@@ -1122,6 +1134,19 @@ async fn run(
                     let _ = events.send_async(UiEvent::Error("请先登录".into())).await;
                     continue;
                 };
+                // 先把本地缓存摆出来，联网补齐之前也有内容可看
+                if let Some(cache) = cache::shared() {
+                    let cached = cache.load(room, CACHED_PAGE).await;
+                    if !cached.is_empty() {
+                        let _ = events
+                            .send_async(UiEvent::History {
+                                room,
+                                messages: cached,
+                                has_more: false,
+                            })
+                            .await;
+                    }
+                }
                 let auth = Auth::Resume(current.token.clone());
                 match open_session(
                     &current.addr,

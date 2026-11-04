@@ -610,6 +610,7 @@ impl Session {
         match event {
             ServerEvent::Message { message } => {
                 self.prefetch_preview(client, message);
+                cache_messages(&self.events, self.target.room, vec![message.clone()]);
                 self.pending
                     .retain(|(id, _, _)| *id != message.client_msg_id);
                 self.newest = self.newest.max(message.seq);
@@ -652,6 +653,7 @@ impl Session {
                 for message in messages {
                     self.prefetch_preview(client, message);
                 }
+                cache_messages(&self.events, self.target.room, messages.clone());
                 self.loading_older = false;
                 self.has_older = *has_more;
                 if let Some(first) = messages.first() {
@@ -665,6 +667,7 @@ impl Session {
             ServerEvent::Sync {
                 messages, has_more, ..
             } => {
+                cache_messages(&self.events, self.target.room, messages.clone());
                 self.syncing = false;
                 if let Some(last) = messages.last() {
                     self.cursor = self.cursor.max(last.seq);
@@ -673,6 +676,23 @@ impl Session {
                 }
             }
             // 服务端丢过事件：按本地游标补齐，并把会话摘要重新拉一次。
+            ServerEvent::MessageRecalled { room, seq } => {
+                if let Some(cache) = cache::shared() {
+                    let cache = Arc::clone(&cache);
+                    let room = *room;
+                    let seq = *seq;
+                    tokio::spawn(async move { cache.apply_recall(room, seq).await });
+                }
+            }
+            ServerEvent::MessageEdited { message } => {
+                if let Some(cache) = cache::shared() {
+                    let cache = Arc::clone(&cache);
+                    let room = message.room;
+                    let seq = message.seq;
+                    let text = message.text.clone();
+                    tokio::spawn(async move { cache.apply_edit(room, seq, &text).await });
+                }
+            }
             ServerEvent::Lag => {
                 self.syncing = false;
                 self.request_sync(client, true).await;
@@ -838,6 +858,19 @@ impl Session {
 }
 
 /// 读取本地文件并作为一条文件消息发出。
+/// 把消息写进本地缓存；写失败只记一行日志，不打断会话。
+fn cache_messages(events: &Sender<UiEvent>, room: RoomId, messages: Vec<chat_core::Message>) {
+    let _ = events;
+    let Some(cache) = cache::shared() else {
+        return;
+    };
+    if messages.is_empty() {
+        return;
+    }
+    let history: Vec<HistoryMessage> = messages.into_iter().map(to_history_message).collect();
+    tokio::spawn(async move { cache.save(room, &history).await });
+}
+
 /// 图片预览缓存的目录：同一份内容只下一次。
 fn preview_dir() -> PathBuf {
     let base = std::env::var_os("HOME")

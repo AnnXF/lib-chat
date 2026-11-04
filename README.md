@@ -196,6 +196,10 @@ LIBCHAT_CA_FILE=./ca.pem cargo run -p chat-ui-gpui
 | `~/.lib-chat/rooms/room-public.identity` | 公网自签证书与私钥 |
 | `~/.lib-chat/rooms/known-rooms.json` | 固定过的房间指纹 |
 | `~/.lib-chat/rooms/servers.json` | 公网地址簿 |
+| `~/.lib-chat/rooms/session.json` | 上次登录的地址、指纹与令牌（0600） |
+| `~/.lib-chat/rooms/device.id` | 本机设备标识，重连沿用 |
+| `~/.lib-chat/rooms/client-cache.db` | 本地消息缓存（每房间最近 200 条） |
+| `~/.lib-chat/rooms/preview/` | 图片预览缓存，按 SHA-256 命名 |
 | `~/.lib-chat/libchat-ui.log` | 界面诊断日志 |
 
 ## 界面快捷键与右键菜单
