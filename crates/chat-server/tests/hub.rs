@@ -1045,3 +1045,50 @@ async fn read_counts_reach_the_room_after_a_member_reads() {
         _ => unreachable!(),
     }
 }
+
+/// `@全体` 由群主发出时通知房间里的每个人，普通成员发不出去。
+#[tokio::test]
+async fn only_the_owner_can_mention_everyone() {
+    let dir = temp_dir("at-all");
+    let hub = Hub::open(&dir, "大厅").await.unwrap();
+    let (alice, alice_user) = register(&hub, "alice").await;
+    let (bob, bob_user) = register(&hub, "bob").await;
+    be_friends(&alice, alice_user.id, &bob, "bob").await;
+    wait_for(&alice, |event| matches!(event, ServerEvent::Friends { .. })).await;
+    wait_for(&bob, |event| matches!(event, ServerEvent::Friends { .. })).await;
+
+    alice
+        .create_group("通知群", vec![bob_user.id])
+        .await
+        .unwrap();
+    let group = match wait_for(&alice, |event| {
+        matches!(event, ServerEvent::Rooms { rooms } if rooms.iter().any(|room| room.name == "通知群"))
+    })
+    .await
+    {
+        ServerEvent::Rooms { rooms } => rooms
+            .into_iter()
+            .find(|room| room.name == "通知群")
+            .unwrap()
+            .room,
+        _ => unreachable!(),
+    };
+    for (client, name) in [(&alice, "Alice"), (&bob, "Bob")] {
+        client.join(group, name).await.unwrap();
+        wait_for(client, |event| matches!(event, ServerEvent::Joined { .. })).await;
+    }
+
+    alice.send_text(group, "@全体 今晚发版").await.unwrap();
+    wait_for(&bob, |event| matches!(event, ServerEvent::Mention { .. })).await;
+
+    // 普通成员发 @全体 不该有推送
+    bob.send_text(group, "@全体 我说了算").await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(ServerEvent::Mention { .. })) =
+            tokio::time::timeout(Duration::from_millis(100), alice.next_event()).await
+        {
+            panic!("普通成员不应触发 @全体");
+        }
+    }
+}

@@ -1412,6 +1412,27 @@ impl Hub {
                                     }
                                 }
                             }
+                            // @全体 只有群主能用，一次通知房间里的所有人
+                            if mention_text.contains("@全体")
+                                && self.accounts.is_owner(room, from.id).await.unwrap_or(false)
+                            {
+                                let members = self
+                                    .accounts
+                                    .members_with_roles(room)
+                                    .await
+                                    .unwrap_or_default();
+                                for member in members {
+                                    if member.user.id != from.id {
+                                        self.send_mention(
+                                            room,
+                                            &from,
+                                            &mention_text,
+                                            member.user.id,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
                             self.push_room_summaries(room).await;
                         } else {
                             self.send_to(
